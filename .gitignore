@@ -1,0 +1,34 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.egg-info/
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Runtime artifacts
+ipi_pipeline.db
+*.db
+results/
+data_slots/
+
+# Temp event / debug files
+/tmp/ipi_demo.db
+/tmp/ipi_events.jsonl
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# Local tooling
+.claude/
+.pytest_cache/
