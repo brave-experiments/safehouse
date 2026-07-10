@@ -1471,6 +1471,11 @@ def pipeline_env(pipeline: str) -> list[tuple[str, str]]:
     return list(_PIPELINE_ENV.get(pipeline, []))
 
 
+def pipeline_needs_google(pipeline: str) -> bool:
+    """True if `pipeline` requires a Google access token (Gmail/Calendar)."""
+    return any(var == "GOOGLE_ACCESS_TOKEN" for var, _ in pipeline_env(pipeline))
+
+
 def get_universal_spec() -> DemoSpec:
     """Return the universal DemoSpec that auto-adapts to any pipeline."""
     return _UNIVERSAL_SPEC

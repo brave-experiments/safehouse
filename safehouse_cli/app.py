@@ -183,22 +183,20 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
     set_tracer(MultiTracer(console_tracer, sink))
 
     google_token = cfg.google_token or ""
-    try:
-        for var, hint in _tracer_mod.pipeline_env(pipeline):
-            if var != "GOOGLE_ACCESS_TOKEN":
-                continue
+    if _tracer_mod.pipeline_needs_google(pipeline):
+        try:
             if google_provider is not None:
                 google_token = google_provider.get_access_token()
-            if not google_token:
-                raise ConfigError(f"{var} is not set.  {hint}")
-    except ConfigError as exc:
-        elapsed = time.monotonic() - t0
-        sink.close()
-        return RunResult(ExitCode.CONFIG_ERROR, "error", {"reason": str(exc)}, session, elapsed)
-    except CredentialError as exc:
-        elapsed = time.monotonic() - t0
-        sink.close()
-        return RunResult(ExitCode.CREDENTIAL_ERROR, "error", {"reason": str(exc)}, session, elapsed)
+        except CredentialError as exc:
+            elapsed = time.monotonic() - t0
+            sink.close()
+            return RunResult(ExitCode.CREDENTIAL_ERROR, "error", {"reason": str(exc)}, session, elapsed)
+        if not google_token:
+            hint = next(h for v, h in _tracer_mod.pipeline_env(pipeline) if v == "GOOGLE_ACCESS_TOKEN")
+            elapsed = time.monotonic() - t0
+            sink.close()
+            return RunResult(ExitCode.CONFIG_ERROR, "error",
+                             {"reason": f"GOOGLE_ACCESS_TOKEN is not set.  {hint}"}, session, elapsed)
 
     # ── Dry run ────────────────────────────────────────────────────────
     if cfg.dry_run:

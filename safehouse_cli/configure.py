@@ -24,8 +24,11 @@ _OAUTH_SCOPES = [
 
 
 def _prompt(label: str, current, *, secret: bool = False) -> str | None:
+    # Secrets show set/unset; non-secrets show the actual value so the user
+    # can see what pressing Enter will keep.
+    shown = ("set" if current else "unset") if secret else (current if current not in (None, "") else "unset")
     reader = getpass if secret else input
-    val = reader(f"  {label} [{'set' if current else 'unset'}] (Enter to keep): ").strip()
+    val = reader(f"  {label} [{shown}] (Enter to keep): ").strip()
     return val or (str(current) if current is not None else None)
 
 
@@ -67,6 +70,7 @@ def run_configure(argv: list[str]) -> int:
     p = argparse.ArgumentParser(
         prog="safehouse configure",
         description="Set up ~/.safehouse/config.toml (Anthropic key, Google token, defaults).",
+        epilog="Note: hand-added TOML comments are not preserved when the file is saved.",
     )
     p.add_argument("--show", action="store_true",
                    help="print current settings with secrets redacted")
@@ -94,13 +98,16 @@ def run_configure(argv: list[str]) -> int:
     if mode not in _GOOGLE_AUTH_CHOICES:
         print(f"error: auth must be one of {_GOOGLE_AUTH_CHOICES}", file=sys.stderr)
         return 2
+    # Capture current values BEFORE clearing, so "Enter to keep" preserves them;
+    # clearing still drops the other modes' stale fields.
+    cur_token, cur_cmd = google.get("access_token"), google.get("token_command")
     google["auth"] = mode
     google["access_token"] = google["token_command"] = None
     if mode == "static":
         print("  Mint a token at https://developers.google.com/oauthplayground")
-        google["access_token"] = _prompt("Google access token", google.get("access_token"), secret=True)
+        google["access_token"] = _prompt("Google access token", cur_token, secret=True)
     elif mode == "token_command":
-        google["token_command"] = _prompt("Token command", google.get("token_command"))
+        google["token_command"] = _prompt("Token command", cur_cmd)
     else:
         if (rc := _configure_oauth(path)):
             return rc
@@ -124,7 +131,8 @@ def run_configure(argv: list[str]) -> int:
     else:
         defaults["timeout"] = None
 
-    _settings.write_config(
-        {"anthropic": anthropic, "google": google, "defaults": defaults}, path)
+    # Update into the loaded dict so any hand-added sections/keys are preserved.
+    data["anthropic"], data["google"], data["defaults"] = anthropic, google, defaults
+    _settings.write_config(data, path)
     print(f"\nSaved {path}")
     return 0

@@ -71,9 +71,15 @@ def test_build_unknown_auth():
 
 # ── OAuth refresh (google-auth faked) ─────────────────────────────────
 
-def _install_fake_google(monkeypatch, *, valid, refresh_error=None,
+def _install_fake_google(monkeypatch, *, valid, refresh_error=None, error_kind="refresh",
                          refreshed_json='{"token": "new"}', token="fresh-token"):
-    class RefreshError(Exception):
+    class GoogleAuthError(Exception):
+        pass
+
+    class RefreshError(GoogleAuthError):
+        pass
+
+    class TransportError(GoogleAuthError):
         pass
 
     class Credentials:
@@ -85,33 +91,42 @@ def _install_fake_google(monkeypatch, *, valid, refresh_error=None,
             return cls()
 
         def refresh(self, request):
-            if refresh_error:
-                raise RefreshError(refresh_error)
+            if refresh_error is not None:
+                raise (TransportError if error_kind == "transport" else RefreshError)(refresh_error)
             self.token = token
 
         def to_json(self):
             return refreshed_json
 
+    exc = types.ModuleType("google.auth.exceptions")
+    exc.GoogleAuthError, exc.RefreshError, exc.TransportError = (
+        GoogleAuthError, RefreshError, TransportError)
+    cred = types.ModuleType("google.oauth2.credentials"); cred.Credentials = Credentials
+    req = types.ModuleType("google.auth.transport.requests"); req.Request = type("Request", (), {})
     mods = {
         "google": types.ModuleType("google"),
         "google.oauth2": types.ModuleType("google.oauth2"),
-        "google.oauth2.credentials": types.ModuleType("google.oauth2.credentials"),
+        "google.oauth2.credentials": cred,
         "google.auth": types.ModuleType("google.auth"),
         "google.auth.transport": types.ModuleType("google.auth.transport"),
-        "google.auth.transport.requests": types.ModuleType("google.auth.transport.requests"),
-        "google.auth.exceptions": types.ModuleType("google.auth.exceptions"),
+        "google.auth.transport.requests": req,
+        "google.auth.exceptions": exc,
     }
-    mods["google.oauth2.credentials"].Credentials = Credentials
-    mods["google.auth.transport.requests"].Request = type("Request", (), {})
-    mods["google.auth.exceptions"].RefreshError = RefreshError
     for name, mod in mods.items():
         monkeypatch.setitem(sys.modules, name, mod)
 
 
+def _creds(tmp_path, content="{}"):
+    """Write a 0600 credentials fixture and return its path."""
+    p = tmp_path / "google_credentials.json"
+    p.write_text(content)
+    p.chmod(0o600)
+    return p
+
+
 def test_oauth_refresh_persists_new_json(tmp_path, monkeypatch):
     _install_fake_google(monkeypatch, valid=False, refreshed_json='{"token": "new"}')
-    creds = tmp_path / "google_credentials.json"
-    creds.write_text('{"stale": true}')
+    creds = _creds(tmp_path, '{"stale": true}')
     token = OAuthRefreshProvider(creds).get_access_token()
     assert token == "fresh-token"
     assert creds.read_text() == '{"token": "new"}'          # refreshed JSON persisted
@@ -120,25 +135,35 @@ def test_oauth_refresh_persists_new_json(tmp_path, monkeypatch):
 
 def test_oauth_valid_skips_refresh(tmp_path, monkeypatch):
     _install_fake_google(monkeypatch, valid=True, token="cached")
-    creds = tmp_path / "google_credentials.json"
-    creds.write_text('{"ok": true}')
+    creds = _creds(tmp_path, '{"ok": true}')
     assert OAuthRefreshProvider(creds).get_access_token() == "cached"
     assert creds.read_text() == '{"ok": true}'              # unchanged
 
 
 def test_oauth_invalid_grant_hint(tmp_path, monkeypatch):
     _install_fake_google(monkeypatch, valid=False, refresh_error="invalid_grant: bad")
-    creds = tmp_path / "google_credentials.json"
-    creds.write_text("{}")
     with pytest.raises(CredentialError, match="Re-mint in the OAuth Playground"):
-        OAuthRefreshProvider(creds).get_access_token()
+        OAuthRefreshProvider(_creds(tmp_path)).get_access_token()
 
 
 def test_oauth_invalid_rapt_hint(tmp_path, monkeypatch):
     _install_fake_google(monkeypatch, valid=False, refresh_error="invalid_rapt")
-    creds = tmp_path / "google_credentials.json"
-    creds.write_text("{}")
     with pytest.raises(CredentialError, match="invalid_rapt"):
+        OAuthRefreshProvider(_creds(tmp_path)).get_access_token()
+
+
+def test_oauth_transport_error_maps_to_credential_error(tmp_path, monkeypatch):
+    _install_fake_google(monkeypatch, valid=False, refresh_error="network down",
+                         error_kind="transport")
+    with pytest.raises(CredentialError, match="Google auth failed"):
+        OAuthRefreshProvider(_creds(tmp_path)).get_access_token()
+
+
+def test_oauth_lax_perms_rejected(tmp_path, monkeypatch):
+    _install_fake_google(monkeypatch, valid=True)
+    creds = _creds(tmp_path)
+    creds.chmod(0o644)
+    with pytest.raises(CredentialError, match="chmod 600"):
         OAuthRefreshProvider(creds).get_access_token()
 
 
@@ -150,7 +175,20 @@ def test_oauth_missing_file(tmp_path, monkeypatch):
 
 @pytest.mark.skipif(_HAS_GOOGLE, reason="google-auth is installed")
 def test_oauth_missing_dependency(tmp_path):
-    creds = tmp_path / "google_credentials.json"
-    creds.write_text("{}")
     with pytest.raises(CredentialError, match=r"safehouse\[google\]"):
-        OAuthRefreshProvider(creds).get_access_token()
+        OAuthRefreshProvider(_creds(tmp_path)).get_access_token()
+
+
+# ── FIX-2: token_command works keyless; token reaches the header, not Tier-2 ──
+
+def test_token_command_reaches_header_not_subagent(monkeypatch):
+    from safehouse.runner import _google_auth_headers, _subagent_env
+    from safehouse_cli.settings import Settings
+    sentinel = "ya29.SENTINEL_TOKEN_XYZ"                     # GOOGLE_ACCESS_TOKEN cleared by conftest
+    provider = build_provider(Settings(google_auth="token_command",
+                                       google_token_command=f"printf %s {sentinel}"))
+    token = provider.get_access_token()
+    assert token == sentinel                                 # keyless token_command resolves
+    assert _google_auth_headers(token) == {"Authorization": f"Bearer {sentinel}"}
+    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
+    assert not any(sentinel in v for v in _subagent_env().values())   # never in Tier-2 env

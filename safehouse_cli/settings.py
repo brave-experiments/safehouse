@@ -39,6 +39,12 @@ def _has_secret(data: dict) -> bool:
                if isinstance(body, dict) for k in SECRET_KEYS)
 
 
+def assert_private(path: Path) -> None:
+    """Raise ConfigError if a secret-bearing file is group/world-accessible."""
+    if path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
+        raise ConfigError(f"{path} is group/world-accessible.  Fix with:  chmod 600 {path}")
+
+
 def load_raw(path: Path | None = None) -> dict:
     """Parse the config file, or {} if absent. Raises ConfigError on bad TOML or lax perms."""
     path = path or config_path()
@@ -49,9 +55,8 @@ def load_raw(path: Path | None = None) -> dict:
             data = tomllib.load(f)
     except (tomllib.TOMLDecodeError, OSError) as exc:
         raise ConfigError(f"cannot read config {path}: {exc}") from exc
-    if _has_secret(data) and path.stat().st_mode & (stat.S_IRWXG | stat.S_IRWXO):
-        raise ConfigError(f"{path} holds secrets but is group/world-accessible.  "
-                          f"Fix with:  chmod 600 {path}")
+    if _has_secret(data):
+        assert_private(path)
     return data
 
 

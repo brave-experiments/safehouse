@@ -13,7 +13,7 @@ from pathlib import Path
 from typing import Protocol
 
 from .config import ConfigError
-from .settings import write_credentials_json
+from .settings import assert_private, write_credentials_json
 
 
 class CredentialError(Exception):
@@ -63,7 +63,7 @@ class OAuthRefreshProvider:
 
     def get_access_token(self) -> str:
         try:
-            from google.auth.exceptions import RefreshError
+            from google.auth.exceptions import GoogleAuthError, RefreshError
             from google.auth.transport.requests import Request
             from google.oauth2.credentials import Credentials
         except ImportError as exc:
@@ -73,12 +73,18 @@ class OAuthRefreshProvider:
         if not self._path.exists():
             raise CredentialError(
                 f"{self._path} not found.  Run `safehouse configure` and choose oauth.")
+        try:
+            assert_private(self._path)          # secrets: refresh_token + client_secret
+        except ConfigError as exc:
+            raise CredentialError(str(exc)) from exc
         creds = Credentials.from_authorized_user_file(str(self._path))
         if not creds.valid:
             try:
                 creds.refresh(Request())
             except RefreshError as exc:
                 raise CredentialError(_refresh_hint(str(exc))) from exc
+            except GoogleAuthError as exc:            # network/transport/other auth failure
+                raise CredentialError(f"Google auth failed during refresh: {exc}") from exc
             write_credentials_json(json.loads(creds.to_json()), self._path)
         return creds.token
 
