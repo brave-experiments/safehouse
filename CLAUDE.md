@@ -57,6 +57,9 @@ All output from `safehouse/` goes through `trace.emit()`. `print()` belongs only
 ### 5 — `_DRIVER_ROUTING_FIELDS` must cover every driver tool
 A driver tool absent from `_DRIVER_ROUTING_FIELDS` gets an empty routing-key list — the routing lock is **silently skipped**. This is a security regression, not a runtime error. `test_registry_drift.py::test_every_driver_tool_has_routing_lock` catches it.
 
+### 6 — Credential isolation
+Credentials are resolved in the CLI layer and passed into core as explicit parameters. They must never appear in a slot, label, task string, trace event payload, or any Tier 1/2 sub-agent input or environment. The Tier-2 `claude -p` sub-agent runs with an allowlisted env (`runner._subagent_env`) — adding a credential to that allowlist is a regression.
+
 ---
 
 ## Adding a Tier 3 Driver Tool — Complete Checklist

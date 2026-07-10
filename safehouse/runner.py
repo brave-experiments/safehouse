@@ -177,6 +177,20 @@ def _ensure_tz(ts: str) -> str:
 
 # ── Sub-agent spawner ──────────────────────────────────────────────────
 
+# Non-secret vars the Tier-2 sub-agent needs; ANTHROPIC_*/CLAUDE_* added in _subagent_env.
+_SUBAGENT_ENV_KEEP = frozenset({
+    "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR",
+    "LANG", "LC_ALL", "LC_CTYPE",
+    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
+})
+
+
+def _subagent_env() -> dict[str, str]:
+    """Allowlisted env for the Tier-2 sub-agent — drops GOOGLE_ACCESS_TOKEN et al."""
+    return {k: v for k, v in os.environ.items()
+            if k in _SUBAGENT_ENV_KEEP or k.startswith(("ANTHROPIC_", "CLAUDE_"))}
+
+
 def _claude_subagent(system: str, user: str, *, timeout: int = 300) -> str:
     """
     Spawn an isolated Claude Code sub-agent: claude -p --tools "".
@@ -186,7 +200,9 @@ def _claude_subagent(system: str, user: str, *, timeout: int = 300) -> str:
 
     Security: user content (slot data, which may be (U,priv)) is passed via
     stdin — NOT as a positional argv argument — so it does not appear in ps
-    output or /proc/*/cmdline and is not subject to ARG_MAX limits.
+    output or /proc/*/cmdline and is not subject to ARG_MAX limits. The child
+    runs with an allowlisted environment (_subagent_env) so ambient credentials
+    such as GOOGLE_ACCESS_TOKEN never reach it.
 
     --system-prompt intentionally replaces Claude's entire default system
     prompt (including default tool guidance) — correct for isolated processors
@@ -201,6 +217,7 @@ def _claude_subagent(system: str, user: str, *, timeout: int = 300) -> str:
          "--dangerously-skip-permissions"],
         stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
         text=True, bufsize=1,
+        env=_subagent_env(),
     )
 
     # Write stdin on a thread: if the child starts streaming stdout before it
