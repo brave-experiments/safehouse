@@ -12,6 +12,7 @@ permission check).
 from __future__ import annotations
 
 import contextlib
+import json
 import os
 import stat
 import tempfile
@@ -57,40 +58,62 @@ def load_raw(path: Path | None = None) -> dict:
 @dataclass(frozen=True)
 class Settings:
     """Env+file-resolved credentials and run defaults. CLI flags override these later."""
-    anthropic_api_key: str | None   = None
-    google_token:      str | None   = None
-    demo_recipient:    str | None   = None
-    approve:           str | None   = None
-    timeout:           float | None = None
+    anthropic_api_key:       str | None   = None
+    google_token:            str | None   = None
+    google_auth:             str          = "static"
+    google_token_command:    str | None   = None
+    google_credentials_path: Path | None  = None
+    demo_recipient:          str | None   = None
+    approve:                 str | None   = None
+    timeout:                 float | None = None
 
 
 def load_settings(path: Path | None = None, env: dict | None = None) -> Settings:
     env  = os.environ if env is None else env
     data = load_raw(path)
     google, defaults = data.get("google", {}), data.get("defaults", {})
+    env_token = env.get("GOOGLE_ACCESS_TOKEN", "").strip()
+    if env_token:                                    # an env token forces static mode
+        google_auth, google_token, token_command = "static", env_token, None
+    else:
+        google_auth   = google.get("auth", "static")
+        google_token  = google.get("access_token")
+        token_command = google.get("token_command")
     return Settings(
-        anthropic_api_key = env.get("ANTHROPIC_API_KEY", "").strip() or data.get("anthropic", {}).get("api_key"),
-        google_token      = env.get("GOOGLE_ACCESS_TOKEN", "").strip() or google.get("access_token"),
-        demo_recipient    = env.get("DEMO_RECIPIENT", "").strip() or defaults.get("demo_recipient"),
-        approve           = defaults.get("approve"),
-        timeout           = defaults.get("timeout"),
+        anthropic_api_key       = env.get("ANTHROPIC_API_KEY", "").strip() or data.get("anthropic", {}).get("api_key"),
+        google_token            = google_token,
+        google_auth             = google_auth,
+        google_token_command    = token_command,
+        google_credentials_path = (path or config_path()).parent / "google_credentials.json",
+        demo_recipient          = env.get("DEMO_RECIPIENT", "").strip() or defaults.get("demo_recipient"),
+        approve                 = defaults.get("approve"),
+        timeout                 = defaults.get("timeout"),
     )
 
 
-def write_config(data: dict, path: Path | None = None) -> None:
-    """Atomically write config (file 0600, dir 0700)."""
-    path = path or config_path()
+def _atomic_write(path: Path, write_fn) -> None:
+    """Write via tempfile + os.replace; result is 0600, parent dir 0700."""
     path.parent.mkdir(mode=0o700, parents=True, exist_ok=True)
-    # tomli_w cannot serialize None; drop empty values and empty sections.
-    data = {s: kept for s, body in data.items()
-            if (kept := {k: v for k, v in body.items() if v is not None and v != ""})}
     fd, tmp = tempfile.mkstemp(dir=path.parent)
     try:
         with os.fdopen(fd, "wb") as f:
-            tomli_w.dump(data, f)
+            write_fn(f)
         os.chmod(tmp, 0o600)
         os.replace(tmp, path)
     except BaseException:
         with contextlib.suppress(OSError):
             os.unlink(tmp)
         raise
+
+
+def write_config(data: dict, path: Path | None = None) -> None:
+    """Atomically write config.toml (0600), dropping empty values/sections (tomli_w rejects None)."""
+    path = path or config_path()
+    data = {s: kept for s, body in data.items()
+            if (kept := {k: v for k, v in body.items() if v is not None and v != ""})}
+    _atomic_write(path, lambda f: tomli_w.dump(data, f))
+
+
+def write_credentials_json(data: dict, path: Path) -> None:
+    """Atomically write an authorized-user credentials JSON (0600)."""
+    _atomic_write(path, lambda f: f.write(json.dumps(data).encode()))

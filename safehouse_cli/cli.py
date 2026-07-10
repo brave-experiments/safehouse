@@ -11,11 +11,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import sys
 from pathlib import Path
 
 from .app import ExitCode, RunResult, run_task
 from .config import ApprovalMode, ConfigError, RunConfig, split_command
+from .credentials import build_provider
+from .settings import load_settings
 from .interaction import (
     AutoApproveConfirmer,
     Confirmer,
@@ -50,10 +53,19 @@ def main() -> None:
             sys.exit(ExitCode.CONFIG_ERROR)
 
     try:
-        cfg = RunConfig.from_args(rest)
+        settings = load_settings()
+        cfg = RunConfig.from_args(rest, settings)
+        google_provider = build_provider(settings)
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(ExitCode.CONFIG_ERROR)
+
+    # Materialize the resolved Anthropic key so the Tier-2 `claude -p` sub-agent
+    # (which reads ANTHROPIC_API_KEY from its allowlisted env) gets it even when
+    # it came from the config file. The Google token is never bridged — the
+    # sub-agent env allowlist drops it regardless.
+    if settings.anthropic_api_key:
+        os.environ["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
 
     confirmer = _select_confirmer(cfg)
 
@@ -73,7 +85,7 @@ def main() -> None:
             # the final JSON object. tee_streams restores the real stdout on exit.
             sys.stdout = sys.stderr
         try:
-            result = asyncio.run(run_task(cfg, confirmer))
+            result = asyncio.run(run_task(cfg, confirmer, google_provider))
         except KeyboardInterrupt:
             print("\n  interrupted", file=sys.stderr, flush=True)
             sys.exit(ExitCode.INTERRUPTED)

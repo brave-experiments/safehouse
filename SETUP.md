@@ -39,6 +39,20 @@ All tasks that touch email or calendar authenticate against the Gmail and Google
 
 Access tokens expire after roughly one hour. If a task fails with `401 Unauthorized`, mint a new token and re-export `GOOGLE_ACCESS_TOKEN`.
 
+### Auth modes (`safehouse configure`)
+
+`safehouse configure` stores your Google auth choice in `~/.safehouse/config.toml`. Three modes trade convenience against setup cost:
+
+| Mode | How it works | Re-auth cadence |
+|---|---|---|
+| `static` | Paste an access token (see below). Simplest. | Re-mint + reconfigure every ~1 hour. |
+| `token_command` | A command whose stdout is a fresh token (e.g. `oauth2l`, or your own script). | Whatever your broker does. **Not** `gcloud auth print-access-token` — those tokens cannot carry Gmail/Calendar scopes (`403 insufficient scopes`). |
+| `oauth` | Refresh-token flow; `safehouse` refreshes automatically via `google-auth` (`pip install 'safehouse[google]'`). | See the expiry reality below. |
+
+**Refresh-token expiry reality (consumer Gmail):** an OAuth app in "Testing" status issues refresh tokens that expire after **7 days**, so `oauth` mode means a weekly re-mint + `safehouse configure`. Publishing to Production with the restricted `gmail.modify` scope requires Google verification — not viable for personal use. Google **Workspace "Internal"** apps are exempt from the 7-day limit. There is no "authorize once, forever" for consumer Gmail.
+
+For `oauth` mode, mint the refresh token in the Playground with **your own OAuth credentials** (gear → "Use your own OAuth credentials") — the default shared client revokes refresh tokens after 24h. The client must be type **Web application** with redirect URI exactly `https://developers.google.com/oauthplayground`. Then run `safehouse configure`, choose `oauth`, and paste the refresh token, client_id, and client_secret (stored in `~/.safehouse/google_credentials.json`, `chmod 600` — never in `config.toml`).
+
 ### Mint a token with the OAuth Playground
 
 1. Open the [OAuth 2.0 Playground](https://developers.google.com/oauthplayground).
@@ -229,6 +243,7 @@ Exit codes are stable and script-safe:
 | `3` | Planning failed — the planner rejected the task |
 | `4` | Policy violation — an IronFlow safety gate blocked the run. Worth monitoring separately from generic failures |
 | `5` | Confirmation required — a headless run reached a step that needs human approval |
+| `6` | Credential error — the Google token could not be resolved (token_command failed, or the OAuth refresh token expired/was revoked). Re-run `safehouse configure` |
 | `130` | Interrupted (Ctrl-C) |
 
 Note that `--dry-run` still invokes the planner, so it requires `ANTHROPIC_API_KEY` (and the detected pipeline's env vars) even though nothing executes. Exit codes `5` and `130` terminate before the result object is written; on those codes, read stderr rather than expecting JSON on stdout.

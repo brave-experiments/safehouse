@@ -28,7 +28,10 @@ def _write(path, data, mode=0o600):
 
 def test_absent_file_is_empty(tmp_path):
     s = S.load_settings(path=tmp_path / "nope.toml", env={})
-    assert s == S.Settings()
+    assert s.anthropic_api_key is None
+    assert s.google_token is None
+    assert s.demo_recipient is None
+    assert s.google_auth == "static"
 
 
 def test_malformed_toml_raises(tmp_path):

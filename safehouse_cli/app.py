@@ -29,6 +29,7 @@ from safehouse.slots import SlotStore
 from safehouse.trace import emit, set_tracer, EvStaticPlan, MultiTracer
 
 from .config import ConfigError, RunConfig
+from .credentials import CredentialError, GoogleTokenProvider
 from .interaction import Confirmer, ConfirmationRequired
 from .logging_io import Session, JsonlTraceSink
 
@@ -47,6 +48,7 @@ class ExitCode(IntEnum):
     PLANNING_FAILED       = 3
     POLICY_VIOLATION      = 4   # IronFlow violation: distinct, monitorable outcome
     CONFIRMATION_REQUIRED = 5
+    CREDENTIAL_ERROR      = 6   # Google credential resolution failed (bad command, expired refresh)
     INTERRUPTED           = 130
 
 
@@ -129,7 +131,8 @@ async def _recover_recipient(
 
 # ── Orchestrator ──────────────────────────────────────────────────────
 
-async def run_task(cfg: RunConfig, confirmer: Confirmer) -> RunResult:
+async def run_task(cfg: RunConfig, confirmer: Confirmer,
+                   google_provider: GoogleTokenProvider | None = None) -> RunResult:
     """
     Full pipeline: plan → env check → execute → result.
 
@@ -179,17 +182,23 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer) -> RunResult:
     sink.rename(session.jsonl_path)
     set_tracer(MultiTracer(console_tracer, sink))
 
+    google_token = cfg.google_token or ""
     try:
         for var, hint in _tracer_mod.pipeline_env(pipeline):
-            if var == "GOOGLE_ACCESS_TOKEN" and not cfg.google_token:
+            if var != "GOOGLE_ACCESS_TOKEN":
+                continue
+            if google_provider is not None:
+                google_token = google_provider.get_access_token()
+            if not google_token:
                 raise ConfigError(f"{var} is not set.  {hint}")
     except ConfigError as exc:
         elapsed = time.monotonic() - t0
         sink.close()
-        return RunResult(
-            ExitCode.CONFIG_ERROR, "error",
-            {"reason": str(exc)}, session, elapsed,
-        )
+        return RunResult(ExitCode.CONFIG_ERROR, "error", {"reason": str(exc)}, session, elapsed)
+    except CredentialError as exc:
+        elapsed = time.monotonic() - t0
+        sink.close()
+        return RunResult(ExitCode.CREDENTIAL_ERROR, "error", {"reason": str(exc)}, session, elapsed)
 
     # ── Dry run ────────────────────────────────────────────────────────
     if cfg.dry_run:
@@ -217,7 +226,7 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer) -> RunResult:
     ))
 
     try:
-        driver_kwargs = {"confirm_slot": confirmer.confirm_slot, "google_token": cfg.google_token}
+        driver_kwargs = {"confirm_slot": confirmer.confirm_slot, "google_token": google_token}
         if cfg.timeout_s is not None:
             result = await asyncio.wait_for(
                 driver_run(cfg.task, plan, store, policy, **driver_kwargs),
