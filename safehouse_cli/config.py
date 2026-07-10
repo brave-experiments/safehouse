@@ -36,6 +36,18 @@ class ConfigError(Exception):
     """Raised by RunConfig.from_args() on bad configuration."""
 
 
+def _version_string() -> str:
+    """`safehouse X.Y.Z (Python A.B.C, platform)` — version from installed metadata."""
+    import importlib.metadata
+    import platform
+    return (f"safehouse {importlib.metadata.version('safehouse')} "
+            f"(Python {platform.python_version()}, {sys.platform})")
+
+
+# Deferred CLI features (do not re-propose ad hoc): shell completions, --quiet,
+# User-Agent version headers.
+
+
 @dataclass(frozen=True)
 class RunConfig:
     """
@@ -74,15 +86,27 @@ class RunConfig:
             settings = load_settings()
         p = argparse.ArgumentParser(
             prog="safehouse",
+            formatter_class=argparse.RawDescriptionHelpFormatter,
             description=(
                 "IPI-resistant pipeline — provide any task, "
                 "the pipeline type is auto-detected from the plan."
             ),
-            epilog="Subcommands: run (default), configure. "
-                   "Bare flags imply 'run' (e.g. `safehouse --task ...`).",
+            epilog=(
+                "Examples:\n"
+                '  safehouse "fetch these articles and email me a briefing: <url>"\n'
+                '  safehouse --dry-run "reply to the latest email from alice@corp.com"\n'
+                '  safehouse --non-interactive --approve deny --json "..."   # CI form\n'
+                "  echo \"...\" | safehouse run -                            # task from stdin\n"
+                "\n"
+                "Subcommands: run (default), configure.  Bare flags/text imply 'run'.\n"
+                "See SETUP.md for full documentation."
+            ),
         )
-        p.add_argument("--task", required=True,
-                       help="Task string to execute")
+        p.add_argument("--version", "-V", action="version", version=_version_string())
+        p.add_argument("task_pos", nargs="?", metavar="TASK",
+                       help="Task to execute (use '-' to read the task from stdin)")
+        p.add_argument("--task",
+                       help="Task to execute (alternative to the positional TASK)")
         p.add_argument("--recipient",
                        help="Recipient email (overrides DEMO_RECIPIENT)")
         p.add_argument("--pause", action="store_true",
@@ -108,8 +132,22 @@ class RunConfig:
 
         args = p.parse_args(argv)
 
-        # Resolve interactive flag.
-        interactive = not args.non_interactive and sys.stdin.isatty()
+        # Resolve the task: exactly one of positional TASK / --task.
+        if args.task_pos and args.task:
+            raise ConfigError("provide the task once — positional or --task, not both")
+        task = args.task_pos or args.task
+        if not task:
+            raise ConfigError('provide a task:  safehouse "..."  or  --task "..."')
+        task_from_stdin = False
+        if task == "-":
+            if sys.stdin.isatty():
+                raise ConfigError("reading task from stdin ('-') but stdin is a terminal")
+            task = sys.stdin.read().rstrip("\n")
+            task_from_stdin = True
+
+        # Resolve interactive flag. A task read from stdin has consumed stdin,
+        # so interactive prompts are impossible.
+        interactive = not args.non_interactive and sys.stdin.isatty() and not task_from_stdin
 
         # Resolve approval mode.
         if args.auto_approve:
@@ -150,7 +188,7 @@ class RunConfig:
             recipient = settings.demo_recipient
 
         return cls(
-            task         = args.task,
+            task         = task,
             recipient    = recipient,
             pause        = args.pause,
             approval     = approval,

@@ -195,13 +195,13 @@ export GOOGLE_ACCESS_TOKEN=ya29...           # Gmail / Calendar; scopes: gmail.m
 export DEMO_RECIPIENT=you@example.com        # optional — where emailed output goes
 ```
 
-Run a task:
+Run a task (the task is a positional argument; `--task` still works):
 
 ```bash
-safehouse --task "Fetch these articles and email a briefing: <url1> <url2>"
-safehouse --task "Reply to the latest email from sender@example.com"
-safehouse --task "Find flights LHR→LIS on 2026-08-01, hotel 3 nights, email the best combination"
-safehouse --task "Read the meeting request from alice@corp.com and schedule 30 min next week"
+safehouse "Fetch these articles and email a briefing: <url1> <url2>"
+safehouse "Reply to the latest email from sender@example.com"
+safehouse "Find flights LHR→LIS on 2026-08-01, hotel 3 nights, email the best combination"
+safehouse "Read the meeting request from alice@corp.com and schedule 30 min next week"
 ```
 
 The pipeline type is detected from the validated plan. Tasks outside the supported tool set are rejected at planning time before any external call is made.

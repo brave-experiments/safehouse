@@ -12,6 +12,7 @@ import sys
 from getpass import getpass
 
 from . import settings as _settings
+from .config import _version_string
 from .settings import SECRET_KEYS
 
 _APPROVE_CHOICES = ("interactive", "auto", "deny")
@@ -69,9 +70,11 @@ def _configure_oauth(config_path) -> int:
 def run_configure(argv: list[str]) -> int:
     p = argparse.ArgumentParser(
         prog="safehouse configure",
-        description="Set up ~/.safehouse/config.toml (Anthropic key, Google token, defaults).",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        description="Set up the safehouse config file (Anthropic key, Google token, defaults).",
         epilog="Note: hand-added TOML comments are not preserved when the file is saved.",
     )
+    p.add_argument("--version", "-V", action="version", version=_version_string())
     p.add_argument("--show", action="store_true",
                    help="print current settings with secrets redacted")
     args = p.parse_args(argv)

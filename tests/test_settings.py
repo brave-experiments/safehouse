@@ -135,3 +135,83 @@ def test_runconfig_invalid_file_approve_raises(tmp_path):
     settings = _settings_from(tmp_path, {"defaults": {"approve": "bogus"}})
     with pytest.raises(ConfigError, match="invalid approve"):
         RunConfig.from_args(["--task", "t", "--non-interactive"], settings=settings)
+
+
+# ── PR-G: task resolution (positional / --task / stdin) ───────────────
+
+def test_positional_task():
+    assert RunConfig.from_args(["do the thing"], settings=S.Settings()).task == "do the thing"
+
+
+def test_flag_task_still_works():
+    assert RunConfig.from_args(["--task", "x"], settings=S.Settings()).task == "x"
+
+
+def test_both_positional_and_flag_rejected():
+    with pytest.raises(ConfigError, match="not both"):
+        RunConfig.from_args(["a", "--task", "b"], settings=S.Settings())
+
+
+def test_no_task_rejected():
+    with pytest.raises(ConfigError, match="provide a task"):
+        RunConfig.from_args([], settings=S.Settings())
+
+
+def test_task_from_stdin(monkeypatch):
+    import io
+    monkeypatch.setattr("sys.stdin", io.StringIO("task from stdin\n"))
+    cfg = RunConfig.from_args(["-"], settings=S.Settings())
+    assert cfg.task == "task from stdin"      # trailing newline stripped
+    assert cfg.interactive is False           # stdin consumed → non-interactive
+
+
+def test_stdin_dash_rejected_on_tty(monkeypatch):
+    import io
+
+    class _TTY(io.StringIO):
+        def isatty(self):
+            return True
+
+    monkeypatch.setattr("sys.stdin", _TTY("x"))
+    with pytest.raises(ConfigError, match="stdin is a terminal"):
+        RunConfig.from_args(["-"], settings=S.Settings())
+
+
+def test_version_string():
+    from safehouse_cli.config import _version_string
+    assert _version_string().startswith("safehouse 0.1.0")
+
+
+# ── PR-G: XDG config-path resolution ──────────────────────────────────
+
+def test_config_path_env_override(tmp_path, monkeypatch):
+    monkeypatch.setenv("SAFEHOUSE_CONFIG", str(tmp_path / "c.toml"))
+    assert S.config_path() == tmp_path / "c.toml"
+
+
+def test_config_path_legacy_when_present(tmp_path, monkeypatch):
+    monkeypatch.delenv("SAFEHOUSE_CONFIG", raising=False)
+    home = tmp_path / "home"
+    (home / ".safehouse").mkdir(parents=True)
+    legacy = home / ".safehouse" / "config.toml"
+    legacy.write_text("")
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    assert S.config_path() == legacy
+
+
+def test_config_path_xdg_default(tmp_path, monkeypatch):
+    monkeypatch.delenv("SAFEHOUSE_CONFIG", raising=False)
+    monkeypatch.delenv("XDG_CONFIG_HOME", raising=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    assert S.config_path() == home / ".config" / "safehouse" / "config.toml"
+
+
+def test_config_path_xdg_env(tmp_path, monkeypatch):
+    monkeypatch.delenv("SAFEHOUSE_CONFIG", raising=False)
+    home = tmp_path / "home"
+    home.mkdir()
+    monkeypatch.setattr("pathlib.Path.home", lambda: home)
+    monkeypatch.setenv("XDG_CONFIG_HOME", str(tmp_path / "xdg"))
+    assert S.config_path() == tmp_path / "xdg" / "safehouse" / "config.toml"

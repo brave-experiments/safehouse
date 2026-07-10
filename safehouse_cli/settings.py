@@ -26,9 +26,15 @@ from .config import ConfigError
 
 
 def config_path() -> Path:
-    """Config file path — SAFEHOUSE_CONFIG override, else ~/.safehouse/config.toml."""
+    """Resolve the config path: SAFEHOUSE_CONFIG > existing ~/.safehouse > XDG default."""
     override = os.environ.get("SAFEHOUSE_CONFIG")
-    return Path(override) if override else Path.home() / ".safehouse" / "config.toml"
+    if override:
+        return Path(override)
+    legacy = Path.home() / ".safehouse" / "config.toml"
+    if legacy.exists():                                   # back-compat for existing installs
+        return legacy
+    base = os.environ.get("XDG_CONFIG_HOME") or (Path.home() / ".config")
+    return Path(base) / "safehouse" / "config.toml"
 
 
 SECRET_KEYS = ("api_key", "access_token")
@@ -75,6 +81,7 @@ class Settings:
 
 def load_settings(path: Path | None = None, env: dict | None = None) -> Settings:
     env  = os.environ if env is None else env
+    path = path or config_path()            # resolve once (avoids a second legacy-path stat)
     data = load_raw(path)
     google, defaults = data.get("google", {}), data.get("defaults", {})
     env_token = env.get("GOOGLE_ACCESS_TOKEN", "").strip()
@@ -89,7 +96,7 @@ def load_settings(path: Path | None = None, env: dict | None = None) -> Settings
         google_token            = google_token,
         google_auth             = google_auth,
         google_token_command    = token_command,
-        google_credentials_path = (path or config_path()).parent / "google_credentials.json",
+        google_credentials_path = path.parent / "google_credentials.json",
         demo_recipient          = env.get("DEMO_RECIPIENT", "").strip() or defaults.get("demo_recipient"),
         approve                 = defaults.get("approve"),
         timeout                 = defaults.get("timeout"),

@@ -85,13 +85,18 @@ Repeat steps 1–6. The Playground remembers authorized scopes for the session, 
 
 ## Configuration
 
-The recommended way is `safehouse configure`, which stores settings in
-`~/.safehouse/config.toml` (created `chmod 600`):
+The recommended way is `safehouse configure`, which stores settings in the
+config file (created `chmod 600`) and prints its path:
 
 ```bash
 safehouse configure          # prompts for API key, Google token, and defaults
 safehouse configure --show   # print current settings (secrets redacted)
 ```
+
+Config path resolution: `$SAFEHOUSE_CONFIG` if set, else `~/.safehouse/config.toml`
+if it already exists (back-compat), else `$XDG_CONFIG_HOME/safehouse/config.toml`
+(default `~/.config/safehouse/config.toml`) for fresh installs. `google_credentials.json`
+(oauth mode) sits next to whichever `config.toml` is in use.
 
 Precedence is **CLI flag > environment variable > config file** — env vars
 still work and override the file, which is convenient for CI and containers
@@ -122,10 +127,13 @@ export DEMO_RECIPIENT=you@example.com
 Describe the task in plain language. SafeHouse plans it against a fixed, validated tool set and detects the pipeline type from the resulting plan. The tool set is intentionally closed: every step is schema-validated and policy-gated before any I/O. Tasks that cannot be expressed with the supported tools are rejected at planning time with exit code `3`:
 
 ```bash
-safehouse --task "..."
+safehouse "..."                 # task as a positional argument (primary form)
+safehouse --task "..."          # equivalent; --task is kept for back-compat
+safehouse run - < task.txt      # read the task from stdin (or: echo "..." | safehouse run -)
 ```
 
-No mode or pipeline flag is needed.
+No mode or pipeline flag is needed. `safehouse --version` prints the version;
+`safehouse configure` manages credentials (see Configuration above).
 
 ### Example tasks
 
