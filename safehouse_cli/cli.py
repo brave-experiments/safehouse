@@ -15,7 +15,7 @@ import sys
 from pathlib import Path
 
 from .app import ExitCode, RunResult, run_task
-from .config import ApprovalMode, ConfigError, RunConfig
+from .config import ApprovalMode, ConfigError, RunConfig, split_command
 from .interaction import (
     AutoApproveConfirmer,
     Confirmer,
@@ -40,8 +40,17 @@ def _select_confirmer(cfg: RunConfig) -> Confirmer:
 
 
 def main() -> None:
+    command, rest = split_command(sys.argv[1:])
+    if command == "configure":
+        from .configure import run_configure
+        try:
+            sys.exit(run_configure(rest))
+        except ConfigError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            sys.exit(ExitCode.CONFIG_ERROR)
+
     try:
-        cfg = RunConfig.from_args()
+        cfg = RunConfig.from_args(rest)
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(ExitCode.CONFIG_ERROR)

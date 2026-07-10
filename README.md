@@ -181,7 +181,13 @@ uv run pytest tests/ -v               # no API key required
 
 No uv? Use the stdlib `venv` instead — point at 3.12+ explicitly and upgrade pip first: `python3.12 -m venv .venv && source .venv/bin/activate && python -m pip install --upgrade pip && pip install -e ".[dev]"`.
 
-Configure credentials (full OAuth walkthrough in [SETUP.md](SETUP.md)):
+Configure credentials once — writes `~/.safehouse/config.toml` (`chmod 600`):
+
+```bash
+safehouse configure          # prompts for API key, Google token, defaults
+```
+
+Env vars still work and override the file (handy for CI). Full walkthrough in [SETUP.md](SETUP.md):
 
 ```bash
 export ANTHROPIC_API_KEY=sk-ant-...          # planner + processors

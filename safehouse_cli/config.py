@@ -1,24 +1,26 @@
 """
 config.py — RunConfig and environment resolution for safehouse_cli.
 
-Design decisions (intentional, do not "fix"):
-  - No config-file format (YAML/TOML runtime config). Env vars + CLI flags
-    are the right surface at this scale; adding a config file would duplicate
-    flag semantics without adding value.
+Design decisions:
+  - Credentials and run defaults resolve with precedence CLI flag > env var >
+    ~/.safehouse/config.toml (see settings.py). The earlier env-vars-only
+    design was superseded once hourly Google-token expiry made a persistent
+    config file worth its keep.
   - ApprovalMode is an enum so exhaustive matching is possible without string
     comparison across modules.
-  - require_env raises ConfigError (not sys.exit) so callers own the error path;
-    cli.py maps it to exit code 2. This makes app.py testable without subprocess.
 """
 
 from __future__ import annotations
 
 import argparse
-import os
 import sys
 from dataclasses import dataclass
 from enum import Enum
 from pathlib import Path
+from typing import TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .settings import Settings
 
 
 _PROJECT_DIR = Path(__file__).parent.parent
@@ -31,20 +33,7 @@ class ApprovalMode(Enum):
 
 
 class ConfigError(Exception):
-    """Raised by RunConfig.from_args() or require_env() on bad configuration."""
-
-
-def require_env(var: str, hint: str) -> str:
-    """
-    Return the stripped value of env var `var`, or raise ConfigError.
-
-    cli.py maps ConfigError → exit code 2. This replaces the old _require_env()
-    which called print() + sys.exit() directly (untestable).
-    """
-    val = os.environ.get(var, "").strip()
-    if not val:
-        raise ConfigError(f"{var} is not set.  {hint}")
-    return val
+    """Raised by RunConfig.from_args() on bad configuration."""
 
 
 @dataclass(frozen=True)
@@ -65,9 +54,12 @@ class RunConfig:
     results_dir:    Path
     interactive:    bool              # default sys.stdin.isatty(); --non-interactive forces False
     timeout_s:      float | None      # --timeout SECONDS; None = no ceiling
+    anthropic_api_key: str | None     # resolved: env > config file
+    google_token:      str | None     # resolved: env > config file
 
     @classmethod
-    def from_args(cls, argv: list[str] | None = None) -> "RunConfig":
+    def from_args(cls, argv: list[str] | None = None,
+                  settings: "Settings | None" = None) -> "RunConfig":
         """
         Parse argv (or sys.argv[1:]) into a RunConfig.
 
@@ -77,11 +69,17 @@ class RunConfig:
           - recipient = --recipient > DEMO_RECIPIENT env (both stripped).
           - --auto-approve is a hidden alias for --approve auto (deprecated).
         """
+        if settings is None:
+            from .settings import load_settings
+            settings = load_settings()
         p = argparse.ArgumentParser(
+            prog="safehouse",
             description=(
                 "IPI-resistant pipeline — provide any task, "
                 "the pipeline type is auto-detected from the plan."
             ),
+            epilog="Subcommands: run (default), configure. "
+                   "Bare flags imply 'run' (e.g. `safehouse --task ...`).",
         )
         p.add_argument("--task", required=True,
                        help="Task string to execute")
@@ -119,6 +117,13 @@ class RunConfig:
             approval = ApprovalMode.AUTO_FIRST_SLOT
         elif args.approve is not None:
             approval = ApprovalMode(args.approve)
+        elif settings.approve is not None:
+            try:
+                approval = ApprovalMode(settings.approve)
+            except ValueError:
+                raise ConfigError(
+                    f"invalid approve in config: {settings.approve!r} "
+                    "(expected interactive, auto, or deny)") from None
         elif interactive:
             approval = ApprovalMode.INTERACTIVE
         else:
@@ -141,8 +146,8 @@ class RunConfig:
         recipient: str | None = None
         if args.recipient:
             recipient = args.recipient.strip() or None
-        elif env_r := os.environ.get("DEMO_RECIPIENT", "").strip():
-            recipient = env_r
+        elif settings.demo_recipient:
+            recipient = settings.demo_recipient
 
         return cls(
             task         = args.task,
@@ -153,5 +158,14 @@ class RunConfig:
             json_output  = args.json_output,
             results_dir  = args.results_dir,
             interactive  = interactive,
-            timeout_s    = args.timeout_s,
+            timeout_s    = args.timeout_s if args.timeout_s is not None else settings.timeout,
+            anthropic_api_key = settings.anthropic_api_key,
+            google_token      = settings.google_token,
         )
+
+
+def split_command(argv: list[str]) -> tuple[str, list[str]]:
+    """Route argv to a subcommand. Bare flags imply `run` (back-compat)."""
+    if argv and argv[0] in ("run", "configure"):
+        return argv[0], argv[1:]
+    return "run", argv

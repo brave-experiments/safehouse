@@ -17,7 +17,6 @@ Invariants (do not change without updating tests):
 from __future__ import annotations
 
 import asyncio
-import os
 import time
 from dataclasses import dataclass
 from enum import IntEnum
@@ -29,7 +28,7 @@ from safehouse.planner import generate_plan, PlanValidationError
 from safehouse.slots import SlotStore
 from safehouse.trace import emit, set_tracer, EvStaticPlan, MultiTracer
 
-from .config import RunConfig, require_env
+from .config import ConfigError, RunConfig
 from .interaction import Confirmer, ConfirmationRequired
 from .logging_io import Session, JsonlTraceSink
 
@@ -150,20 +149,16 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer) -> RunResult:
 
     operator_context = build_operator_context(cfg)
 
-    # Credentials resolved once at the CLI boundary (config file arrives in a later PR).
-    anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
-    google_token      = os.environ.get("GOOGLE_ACCESS_TOKEN", "").strip()
-
     # ── Banner (human-facing; suppressed under --json via cli.py) ──────
     # Banner/intro printing is done in cli.py before calling run_task so
     # that app.py contains no direct print-for-humans.
 
     # ── Planning ───────────────────────────────────────────────────────
     try:
-        plan = generate_plan(cfg.task, operator_context=operator_context, api_key=anthropic_api_key)
+        plan = generate_plan(cfg.task, operator_context=operator_context, api_key=cfg.anthropic_api_key)
     except PlanValidationError as exc:
         try:
-            plan = await _recover_recipient(exc, cfg, confirmer, operator_context, api_key=anthropic_api_key)
+            plan = await _recover_recipient(exc, cfg, confirmer, operator_context, api_key=cfg.anthropic_api_key)
         except PlanValidationError as exc2:
             elapsed = time.monotonic() - t0
             sink.close()
@@ -186,8 +181,9 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer) -> RunResult:
 
     try:
         for var, hint in _tracer_mod.pipeline_env(pipeline):
-            require_env(var, hint)
-    except Exception as exc:
+            if var == "GOOGLE_ACCESS_TOKEN" and not cfg.google_token:
+                raise ConfigError(f"{var} is not set.  {hint}")
+    except ConfigError as exc:
         elapsed = time.monotonic() - t0
         sink.close()
         return RunResult(
@@ -221,7 +217,7 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer) -> RunResult:
     ))
 
     try:
-        driver_kwargs = {"confirm_slot": confirmer.confirm_slot, "google_token": google_token}
+        driver_kwargs = {"confirm_slot": confirmer.confirm_slot, "google_token": cfg.google_token}
         if cfg.timeout_s is not None:
             result = await asyncio.wait_for(
                 driver_run(cfg.task, plan, store, policy, **driver_kwargs),

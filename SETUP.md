@@ -71,7 +71,17 @@ Repeat steps 1–6. The Playground remembers authorized scopes for the session, 
 
 ## Configuration
 
-Set these once, in your shell profile or a `.env` file:
+The recommended way is `safehouse configure`, which stores settings in
+`~/.safehouse/config.toml` (created `chmod 600`):
+
+```bash
+safehouse configure          # prompts for API key, Google token, and defaults
+safehouse configure --show   # print current settings (secrets redacted)
+```
+
+Precedence is **CLI flag > environment variable > config file** — env vars
+still work and override the file, which is convenient for CI and containers
+(they never touch the config file, so its permission check does not apply):
 
 ```bash
 # Required for all tasks

@@ -68,7 +68,7 @@ import pytest
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
-from safehouse_cli.config import ApprovalMode, ConfigError, RunConfig, require_env
+from safehouse_cli.config import ApprovalMode, ConfigError, RunConfig
 from safehouse_cli.interaction import (
     AutoApproveConfirmer,
     ConfirmationRequired,
