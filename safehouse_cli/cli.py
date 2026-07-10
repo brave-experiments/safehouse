@@ -74,7 +74,7 @@ def main() -> None:
         _tracer_mod.banner(_tracer_mod.get_universal_spec().task_banner)
         for line in cfg.task.splitlines():
             print(f"  {line}")
-        _tracer_mod.ironflow_intro()
+        _tracer_mod.ironflow_intro(cfg.interactive)
 
     transcript_path: Path | None = None
     result: RunResult | None = None

@@ -119,8 +119,8 @@ def _label_axes(label_str: str) -> tuple[str, str]:
 # 2. IRONFLOW INTRO BANNER
 # ══════════════════════════════════════════════════════════════════════
 
-def _ironflow_intro() -> None:
-    """Print the Brave-SafeHouse / IronFlow opening banner, then wait for the user."""
+def _ironflow_intro(interactive: bool = True) -> None:
+    """Print the Brave-SafeHouse / IronFlow opening banner; pause for Enter only when interactive."""
     w = _w()
     print(flush=True)
     print(f"{'█'*w}", flush=True)
@@ -138,8 +138,9 @@ def _ironflow_intro() -> None:
         print(f"    {roman:<4} {principle.value}", flush=True)
     print(flush=True)
     print(f"{'═'*w}", flush=True)
-    input("  Ready? Press Enter to continue…")
-    print()   # Enter keypress bypasses _Tee; force newline into log file
+    if interactive:                       # never block on non-tty/headless (EOFError)
+        input("  Ready? Press Enter to continue…")
+        print()   # Enter keypress bypasses _Tee; force newline into log file
     print(f"{'═'*w}\n", flush=True)
 
 
@@ -1461,9 +1462,9 @@ def banner(title: str) -> None:
     _banner(title)
 
 
-def ironflow_intro() -> None:
-    """Print the Brave-SafeHouse / IronFlow opening banner."""
-    _ironflow_intro()
+def ironflow_intro(interactive: bool = True) -> None:
+    """Print the Brave-SafeHouse / IronFlow opening banner (pauses for Enter only when interactive)."""
+    _ironflow_intro(interactive)
 
 
 def pipeline_env(pipeline: str) -> list[tuple[str, str]]:
