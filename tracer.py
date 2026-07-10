@@ -1093,7 +1093,7 @@ _EMAIL_SPEC = DemoSpec(
     session_prefix="email",
     required_env=[("GOOGLE_ACCESS_TOKEN",
                    "Get one from https://developers.google.com/oauthplayground\n"
-                   "  Scopes required: gmail.readonly + gmail.send\n"
+                   "  Scopes required: gmail.modify + gmail.send\n"
                    "  See SETUP.md for step-by-step instructions.")],
     default_task=None,   # --task is required for this demo
     event_handlers={
@@ -1234,7 +1234,7 @@ def _meeting_on_scheduled(t: _DemoTracer, ev: EvMeetingScheduled) -> None:
 #     routing (attendee, event_title, reply_subject) pre-committed (T,pub) before step 0
 #
 # Required env:
-#   GOOGLE_ACCESS_TOKEN — always required (scopes: calendar.readonly + gmail.send
+#   GOOGLE_ACCESS_TOKEN — always required (scopes: calendar + gmail.send
 #                         + gmail.readonly for meeting path)
 #   DEMO_RECIPIENT      — only for the default calendar-summary task;
 #                         not needed when --task is provided.
@@ -1338,8 +1338,8 @@ _CALENDAR_SPEC = DemoSpec(
     session_prefix="calendar",
     required_env=[
         ("GOOGLE_ACCESS_TOKEN",
-         "Get one via:  export GOOGLE_ACCESS_TOKEN=$(gcloud auth print-access-token)\n"
-         "  Scopes required: calendar.readonly + gmail.readonly + gmail.send"),
+         "Get one from https://developers.google.com/oauthplayground\n"
+         "  Scopes required: calendar + gmail.readonly + gmail.send"),
     ],
     default_task=_calendaring_default_task,
     event_handlers={
@@ -1433,23 +1433,16 @@ def detect_pipeline(tools: set[str]) -> str:
 # Required env vars per detected pipeline.
 # All pipelines now use Gmail (Resend removed), so every pipeline that sends email
 # requires GOOGLE_ACCESS_TOKEN.  Empty list means no vars beyond ANTHROPIC_API_KEY.
-_GMAIL_TOKEN_REQ = ("GOOGLE_ACCESS_TOKEN",
-                    "Get one from https://developers.google.com/oauthplayground\n"
-                    "  Scopes required: gmail.send (+ gmail.readonly and/or calendar\n"
-                    "  for email/calendar pipelines — see SETUP.md for full scope list).")
+def _gmail_req(scopes: str) -> tuple[str, str]:
+    return ("GOOGLE_ACCESS_TOKEN",
+            "Get one from https://developers.google.com/oauthplayground\n"
+            f"  Scopes required: {scopes}")
+
 _PIPELINE_ENV: dict[str, list[tuple[str, str]]] = {
-    "briefing":  [_GMAIL_TOKEN_REQ],
-    "trip":      [_GMAIL_TOKEN_REQ],
-    "email": [
-        ("GOOGLE_ACCESS_TOKEN",
-         "Get one from https://developers.google.com/oauthplayground\n"
-         "  Scopes required: gmail.readonly + gmail.send"),
-    ],
-    "calendar": [
-        ("GOOGLE_ACCESS_TOKEN",
-         "Get one via:  export GOOGLE_ACCESS_TOKEN=$(gcloud auth print-access-token)\n"
-         "  Scopes required: calendar.readonly + gmail.readonly + gmail.send"),
-    ],
+    "briefing":  [_gmail_req("gmail.send")],
+    "trip":      [_gmail_req("gmail.send")],
+    "email":     [_gmail_req("gmail.modify + gmail.send")],
+    "calendar":  [_gmail_req("calendar + gmail.readonly + gmail.send")],
 }
 
 # ══════════════════════════════════════════════════════════════════════
