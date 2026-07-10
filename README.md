@@ -171,11 +171,15 @@ The key difference: prompt-based defences must win every adversarial exchange. S
 
 Requires Python 3.12+ (security floor: CVE-2023-24329 in `urlsplit`).
 
+Recommended, with [uv](https://docs.astral.sh/uv/) — fetches Python 3.12 automatically, no system interpreter needed:
+
 ```bash
-python3 -m venv .venv && source .venv/bin/activate
-pip install -e ".[dev]"
-python3 -m pytest tests/ -v          # no API key required
+uv venv --python 3.12 && source .venv/bin/activate
+uv pip install -e ".[dev]"
+uv run pytest tests/ -v               # no API key required
 ```
+
+No uv? Use the stdlib `venv` instead — point at 3.12+ explicitly and upgrade pip first: `python3.12 -m venv .venv && source .venv/bin/activate && python -m pip install --upgrade pip && pip install -e ".[dev]"`.
 
 Configure credentials (full OAuth walkthrough in [SETUP.md](SETUP.md)):
 

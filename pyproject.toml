@@ -1,3 +1,9 @@
+[build-system]
+# PEP 660 editable installs (`pip install -e .`) require setuptools >= 64.
+# Declaring the backend explicitly prevents pip's legacy-fallback error.
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
 [project]
 name = "safehouse"
 version = "0.1.0"

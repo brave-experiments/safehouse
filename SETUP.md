@@ -11,18 +11,27 @@ SafeHouse is a prompt-injection-resistant agent pipeline. This guide covers inst
 
 ## Installation
 
+The recommended way is [uv](https://docs.astral.sh/uv/), which downloads a matching Python 3.12 and builds the venv in one step — no system interpreter or manual pip upgrade needed:
+
 ```bash
-python3 -m venv .venv
+uv venv --python 3.12
 source .venv/bin/activate
-pip install -e .
+uv pip install -e ".[dev]"    # drop [dev] if you don't need the tests
+uv run pytest tests/ -v       # no API keys required
 ```
 
-For development, install the dev extras and run the unit tests (no API keys required):
+Note: uv-created venvs don't ship `pip` by default — use `uv pip install ...` for further installs.
+
+No uv? Use the stdlib `venv` — but point at Python 3.12+ explicitly (bare `python3` is often older) and upgrade pip first, since editable installs need pip >= 21.3:
 
 ```bash
+python3.12 -m venv .venv
+source .venv/bin/activate
+python -m pip install --upgrade pip
 pip install -e ".[dev]"
-python3 -m pytest tests/ -v
 ```
+
+If `python3.12` is not found, install it first (macOS: `brew install python@3.12`).
 
 ## Google access token (Gmail + Calendar)
 
