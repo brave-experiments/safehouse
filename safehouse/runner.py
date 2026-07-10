@@ -315,10 +315,9 @@ _GCAL_V3         = "https://www.googleapis.com/calendar/v3"
 _GCAL_REST_BASE  = f"{_GCAL_V3}/calendars"   # kept for driver.py import compat
 
 
-def _google_auth_headers() -> dict[str, str]:
-    """Return a Bearer auth header dict for the GOOGLE_ACCESS_TOKEN env var, or {} if unset."""
-    token = os.environ.get("GOOGLE_ACCESS_TOKEN", "")
-    return {"Authorization": f"Bearer {token}"} if token else {}
+def _google_auth_headers(google_token: str = "") -> dict[str, str]:
+    """Return a Bearer auth header dict for google_token, or {} if unset."""
+    return {"Authorization": f"Bearer {google_token}"} if google_token else {}
 
 
 def _find_mime_part(part: dict, mime_type: str) -> str:
@@ -390,6 +389,8 @@ async def run_mcp_email_search(
     filter_params: dict,
     writer:        SlotWriter,
     policy:        IronFlow,
+    *,
+    google_token:  str = "",
 ) -> dict:
     """
     Fetch messages via Gmail REST API — operator code only, no LLM.
@@ -403,10 +404,10 @@ async def run_mcp_email_search(
     thread the outgoing reply correctly. Comes from the Gmail API (operator code),
     not from the email body, so the caller may treat it as (T,pub).
 
-    Auth: GOOGLE_ACCESS_TOKEN env var (gmail.readonly scope required).
+    Auth: google_token (gmail.readonly scope required).
     The From address MUST NOT reach any routing field without driver validation.
     """
-    auth  = _google_auth_headers()
+    auth  = _google_auth_headers(google_token)
     limit = int(filter_params.get("limit", 1))
 
     # Build Gmail search query from supported filter fields.
@@ -503,6 +504,8 @@ async def run_mcp_calendar_search(
     filter_params: dict,
     writer:        SlotWriter,
     policy:        IronFlow,
+    *,
+    google_token:  str = "",
 ) -> None:
     """
     Fetch calendar events via Google Calendar REST API — operator code only, no LLM.
@@ -517,11 +520,11 @@ async def run_mcp_calendar_search(
       maxResults  — max events to return (default: 10)
       q           — free-text search query
 
-    Auth: GOOGLE_ACCESS_TOKEN env var (calendar.readonly scope required).
+    Auth: google_token (calendar.readonly scope required).
     Event titles, descriptions, and attendee lists are ALL (U,priv) — untrusted
     content that cannot reach any routing field without explicit declassification.
     """
-    auth        = _google_auth_headers()
+    auth        = _google_auth_headers(google_token)
     base_params: dict = {"singleEvents": "true", "orderBy": "startTime"}
     for key in ("timeMin", "timeMax", "maxResults", "q"):
         if key in filter_params:

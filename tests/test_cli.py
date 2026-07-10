@@ -247,7 +247,7 @@ def test_recover_recipient_retries_with_augmented_context(monkeypatch) -> None:
 
     good_plan = {"steps": [{"tool": "send_summary", "args": {}}]}
 
-    def _fake_generate_plan(task, operator_context="", registry=None):
+    def _fake_generate_plan(task, operator_context="", registry=None, api_key=None):
         nonlocal call_count
         call_count += 1
         assert "prompted@example.com" in operator_context

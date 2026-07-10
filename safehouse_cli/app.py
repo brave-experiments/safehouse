@@ -17,6 +17,7 @@ Invariants (do not change without updating tests):
 from __future__ import annotations
 
 import asyncio
+import os
 import time
 from dataclasses import dataclass
 from enum import IntEnum
@@ -100,6 +101,7 @@ async def _recover_recipient(
     cfg: RunConfig,
     confirmer: Confirmer,
     operator_context: str,
+    api_key: str | None = None,
 ) -> dict:
     """
     One-shot recovery when the planner rejects a task due to a missing recipient.
@@ -123,7 +125,7 @@ async def _recover_recipient(
         ) from exc
 
     augmented = (operator_context + f"\nrecipient: {prompted}").strip()
-    return generate_plan(cfg.task, operator_context=augmented)
+    return generate_plan(cfg.task, operator_context=augmented, api_key=api_key)
 
 
 # ── Orchestrator ──────────────────────────────────────────────────────
@@ -148,16 +150,20 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer) -> RunResult:
 
     operator_context = build_operator_context(cfg)
 
+    # Credentials resolved once at the CLI boundary (config file arrives in a later PR).
+    anthropic_api_key = os.environ.get("ANTHROPIC_API_KEY")
+    google_token      = os.environ.get("GOOGLE_ACCESS_TOKEN", "").strip()
+
     # ── Banner (human-facing; suppressed under --json via cli.py) ──────
     # Banner/intro printing is done in cli.py before calling run_task so
     # that app.py contains no direct print-for-humans.
 
     # ── Planning ───────────────────────────────────────────────────────
     try:
-        plan = generate_plan(cfg.task, operator_context=operator_context)
+        plan = generate_plan(cfg.task, operator_context=operator_context, api_key=anthropic_api_key)
     except PlanValidationError as exc:
         try:
-            plan = await _recover_recipient(exc, cfg, confirmer, operator_context)
+            plan = await _recover_recipient(exc, cfg, confirmer, operator_context, api_key=anthropic_api_key)
         except PlanValidationError as exc2:
             elapsed = time.monotonic() - t0
             sink.close()
@@ -215,7 +221,7 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer) -> RunResult:
     ))
 
     try:
-        driver_kwargs = {"confirm_slot": confirmer.confirm_slot}
+        driver_kwargs = {"confirm_slot": confirmer.confirm_slot, "google_token": google_token}
         if cfg.timeout_s is not None:
             result = await asyncio.wait_for(
                 driver_run(cfg.task, plan, store, policy, **driver_kwargs),

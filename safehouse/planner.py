@@ -72,7 +72,6 @@ It never sees slot content — structurally immune to IPI.
 """
 
 from __future__ import annotations
-import functools
 import json
 import re
 from dataclasses import dataclass, field
@@ -97,9 +96,8 @@ class PlanValidationError(ValueError):
         self.field = field
 
 
-@functools.lru_cache(maxsize=1)
-def _get_client() -> anthropic.Anthropic:
-    return anthropic.Anthropic()
+def _get_client(api_key: str | None = None) -> anthropic.Anthropic:
+    return anthropic.Anthropic(api_key=api_key)
 
 
 _PLANNER_MODEL      = "claude-sonnet-4-6"
@@ -810,6 +808,7 @@ def generate_plan(
     operator_context: str                         = "",
     registry:         ToolRegistry | None         = None,
     *,
+    api_key:          str | None                  = None,
     client:           anthropic.Anthropic | None  = None,
 ) -> dict:
     """
@@ -818,7 +817,7 @@ def generate_plan(
     operator_context: trusted operator-supplied defaults (e.g. recipient, subject)
                       appended to the system prompt as OPERATOR DEFAULTS.
     registry:         provider registry used in Phases 1+2; defaults to DEFAULT_REGISTRY.
-    client:           Anthropic client; defaults to _get_client() (cached singleton).
+    client:           Anthropic client; defaults to _get_client(api_key).
                       Pass an explicit client in tests to avoid real API calls.
 
     Design note: the planner runs once, single-shot, with no retry on validation failure.
@@ -829,7 +828,7 @@ def generate_plan(
     """
     if registry is None:
         registry = DEFAULT_REGISTRY
-    _llm = client or _get_client()
+    _llm = client or _get_client(api_key)
 
     system = build_planner_system_prompt(registry, operator_context=operator_context)
     # SENSITIVE: system prompt includes operator_context which may contain personal emails.

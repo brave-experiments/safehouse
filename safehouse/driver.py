@@ -58,7 +58,6 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-import os
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import date
@@ -100,14 +99,8 @@ _BODY_FLOW_FIELD = FlowField(
 
 @dataclass(frozen=True)
 class ProviderConfig:
-    """Immutable snapshot of email-provider credentials, read once in run()."""
+    """Immutable snapshot of email-provider credentials."""
     google_token: str
-
-    @classmethod
-    def from_env(cls) -> "ProviderConfig":
-        return cls(
-            google_token = os.environ.get("GOOGLE_ACCESS_TOKEN", "").strip(),
-        )
 
 
 class GmailSendError(RuntimeError):
@@ -490,7 +483,7 @@ async def _handle_mcp_email_search(args: dict, ctx: _StepContext) -> tuple[str, 
     spec = fetcher_spec(f"mcp_email_search_{slot_id}", Capability(args["capability"]), url=api_url)
 
     async def _run(w: SlotWriter) -> None:
-        thread_meta = await run_mcp_email_search(spec, filter_p, w, policy)
+        thread_meta = await run_mcp_email_search(spec, filter_p, w, policy, google_token=ctx.config.google_token)
         if thread_meta.get("thread_id"):
             # thread_id is a Gmail API envelope field (provider-assigned), not sender-controlled —
             # promoting to (T,pub) is safe here.
@@ -514,7 +507,7 @@ async def _handle_mcp_calendar_search(args: dict, ctx: _StepContext) -> tuple[st
         {"api_url": api_url, "filter": filter_p, "slot_id": slot_id,
          "note": "operator code → Google Calendar REST API (no LLM)"},
         "McpCalendarSearch",
-        lambda w: run_mcp_calendar_search(spec, filter_p, w, policy),
+        lambda w: run_mcp_calendar_search(spec, filter_p, w, policy, google_token=ctx.config.google_token),
     )
 
 
@@ -1005,6 +998,7 @@ _DRIVER_ROUTING_FIELDS: dict[str, list[str]] = {
 async def run(
     task: str, plan: dict, store: SlotStore, policy: IronFlow,
     *,
+    google_token: str = "",
     confirm_slot: Callable[[list[dict]], Awaitable[int]] = _default_confirm_slot,
 ) -> dict:
     """
@@ -1023,7 +1017,7 @@ async def run(
         return _pipeline_error("manifest has no steps", policy, store)
 
     driver = driver_spec()
-    config = ProviderConfig.from_env()
+    config = ProviderConfig(google_token=google_token)
     state  = PlanState(trusted_action_urls=tuple(plan.get("trusted_action_urls", [])))
     ctx    = _StepContext(
         store=store, policy=policy, driver=driver, state=state,
