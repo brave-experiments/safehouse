@@ -20,12 +20,9 @@ import asyncio
 import sys
 from typing import Protocol, runtime_checkable
 
+from safehouse.exceptions import ConfirmationRequired
 from safehouse.trace import emit, EvAutoApproved
 from safehouse.trace import Tracer   # for type hints only
-
-
-class ConfirmationRequired(RuntimeError):
-    """Raised when a headless run reaches a step requiring human input."""
 
 
 @runtime_checkable
@@ -40,6 +37,13 @@ class Confirmer(Protocol):
     async def ask_recipient(self) -> str | None:
         """
         Prompt for a recipient email address.
+        Returns None if unavailable (non-interactive or auto confirmer).
+        """
+        ...
+
+    async def ask_clarification(self, message: str) -> str | None:
+        """
+        Prompt for a rephrased task when the planner detects semantic ambiguity.
         Returns None if unavailable (non-interactive or auto confirmer).
         """
         ...
@@ -66,6 +70,12 @@ class ConsoleConfirmer:
         )
         return answer.strip() or None
 
+    async def ask_clarification(self, message: str) -> str | None:
+        sys.stdout.write(f"\n  {message}\n")
+        sys.stdout.flush()
+        answer = await asyncio.to_thread(input, "  Rephrase your task: ")
+        return answer.strip() or None
+
 
 class AutoApproveConfirmer:
     """
@@ -88,6 +98,9 @@ class AutoApproveConfirmer:
     async def ask_recipient(self) -> str | None:
         return None
 
+    async def ask_clarification(self, message: str) -> str | None:
+        return None
+
 
 class DenyConfirmer:
     """Confirmer that declines all slot confirmations (email-only path)."""
@@ -96,6 +109,9 @@ class DenyConfirmer:
         return 0
 
     async def ask_recipient(self) -> str | None:
+        return None
+
+    async def ask_clarification(self, message: str) -> str | None:
         return None
 
 
@@ -120,4 +136,9 @@ class NonInteractiveConfirmer:
         raise ConfirmationRequired(
             "recipient required; pass --recipient or set DEMO_RECIPIENT "
             "for headless runs"
+        )
+
+    async def ask_clarification(self, message: str) -> str | None:
+        raise ConfirmationRequired(
+            "task is ambiguous; rephrase and re-run for headless use"
         )

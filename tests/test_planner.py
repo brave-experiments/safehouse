@@ -9,9 +9,12 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
+import json as _json
+
 from safehouse.planner import (
     _validate_plan, _map_to_concrete, _precheck_shape, _extract_last_plan_json,
     _is_http_url, _is_plausible_email, ToolContract, TOOL_SCHEMA, PlanValidationError,
+    generate_plan, _MAX_PIPELINES,
 )
 from safehouse.registry import DEFAULT_REGISTRY
 
@@ -280,6 +283,50 @@ def test_precheck_empty_steps_rejected() -> None:
 
 def test_precheck_valid_shape_passes() -> None:
     _precheck_shape({"steps": [{"tool": "mcp_page_content", "args": {"url": "x", "slot_id": "s"}}]})
+
+
+# ── generate_plan enforces _precheck_shape on top-level plan ─────────
+# These tests exercise the path that was previously dead code: the _MAX_PIPELINES cap,
+# the empty-pipelines rejection, and the both-keys rejection were never reached because
+# generate_plan only called _precheck_shape(sub) on each sub-plan, never on the
+# top-level abstract_plan that carries the "pipelines" key.
+
+def _fake_client(raw_json: dict):
+    """Return a minimal fake Anthropic client whose stream yields raw_json as JSON."""
+    text = _json.dumps(raw_json)
+
+    class _Stream:
+        text_stream = iter([text])
+        def __enter__(self): return self
+        def __exit__(self, *a): pass
+
+    class _Messages:
+        def stream(self, **kw): return _Stream()
+
+    class _Client:
+        messages = _Messages()
+
+    return _Client()
+
+
+def test_generate_plan_rejects_empty_pipelines() -> None:
+    """generate_plan must raise PlanValidationError when planner returns empty pipelines."""
+    with pytest.raises((PlanValidationError, ValueError), match="non-empty"):
+        generate_plan("task", client=_fake_client({"pipelines": []}))
+
+
+def test_generate_plan_enforces_pipeline_cap() -> None:
+    """generate_plan must reject plans that exceed _MAX_PIPELINES."""
+    over_cap = {"pipelines": [{"steps": [{"tool": "t", "args": {}}]}] * (_MAX_PIPELINES + 1)}
+    with pytest.raises((PlanValidationError, ValueError), match=str(_MAX_PIPELINES)):
+        generate_plan("task", client=_fake_client(over_cap))
+
+
+def test_generate_plan_rejects_both_keys() -> None:
+    """generate_plan must reject plans with both 'steps' and 'pipelines'."""
+    both = {"steps": [{"tool": "t", "args": {}}], "pipelines": []}
+    with pytest.raises((PlanValidationError, ValueError), match="both"):
+        generate_plan("task", client=_fake_client(both))
 
 
 # ── _map_to_concrete top-level key stripping (1.6) ───────────────────

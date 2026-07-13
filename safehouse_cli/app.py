@@ -11,7 +11,7 @@ Invariants (do not change without updating tests):
   - No retry/backoff around driver_run. Retrying a pipeline that sends emails
     is a duplicate-send generator. Idempotency is a driver concern that does
     not exist yet. If driver_run fails, return PIPELINE_ERROR immediately.
-  - driver_run is called exactly once per run_task() invocation.
+  - driver_run_manifest is called exactly once per run_task() invocation.
 """
 
 from __future__ import annotations
@@ -22,10 +22,8 @@ from dataclasses import dataclass
 from enum import IntEnum
 from pathlib import Path
 
-from safehouse.driver import run as driver_run
-from safehouse.ironflow_policy import IronFlow
-from safehouse.planner import generate_plan, PlanValidationError
-from safehouse.slots import SlotStore
+from safehouse.driver import run_manifest as driver_run_manifest
+from safehouse.planner import generate_plan, PlanValidationError, _MISSING_RECIPIENT_SIGNAL
 from safehouse.trace import emit, set_tracer, EvStaticPlan, MultiTracer
 
 from .config import ConfigError, RunConfig
@@ -97,6 +95,10 @@ def build_operator_context(cfg: RunConfig) -> str:
 
 # ── Recipient recovery ────────────────────────────────────────────────
 
+_AMBIGUITY_MARKER = " — "   # planner uses " — " to separate the signal from the explanation
+_EXACT_SIGNAL     = f"Planner rejected the task: {_MISSING_RECIPIENT_SIGNAL}"
+
+
 async def _recover_recipient(
     exc: PlanValidationError,
     cfg: RunConfig,
@@ -105,19 +107,37 @@ async def _recover_recipient(
     api_key: str | None = None,
 ) -> dict:
     """
-    One-shot recovery when the planner rejects a task due to a missing recipient.
+    One-shot recovery when the planner rejects due to a missing recipient or
+    semantic ambiguity.
 
-    Raises PlanValidationError (re-raised) for non-recipient failures.
-    Raises PlanValidationError for empty/None input (no wasted retry).
-    Calls generate_plan exactly once (with augmented context) on success.
+    - Missing recipient: prompt for an email address, re-plan with it as context.
+    - Semantic ambiguity: show the planner's explanation, prompt for a rephrased
+      task, re-plan with the new task string.
 
-    The old code retried generate_plan with IDENTICAL inputs when the user
-    entered an empty string — a guaranteed-to-fail paid LLM call. This
-    function fails immediately on empty/None input instead.
+    Raises PlanValidationError for non-recipient failures or empty input.
+    Calls generate_plan exactly once on success.
     """
     if not (isinstance(exc, PlanValidationError) and exc.field == "recipient"):
-        raise exc   # not recoverable here
+        raise exc
 
+    msg = str(exc)
+
+    # Detect semantic ambiguity: exact signal prefix is present but message has
+    # an explanation suffix after " — ". This is consistent with the planner's
+    # startswith-based classifier and avoids brittle keyword matching.
+    is_ambiguous = msg.startswith(_EXACT_SIGNAL) and _AMBIGUITY_MARKER in msg[len(_EXACT_SIGNAL):]
+
+    if is_ambiguous:
+        # Strip the "Planner rejected the task: " prefix to show just the explanation.
+        explanation = msg.replace("Planner rejected the task: ", "").strip()
+        rephrased = await confirmer.ask_clarification(explanation)
+        if not rephrased:
+            raise PlanValidationError(
+                "task is ambiguous; rephrase and re-run", field="recipient",
+            ) from exc
+        return generate_plan(rephrased, operator_context=operator_context, api_key=api_key)
+
+    # Plain missing-recipient path.
     prompted = await confirmer.ask_recipient()
     if not prompted:
         raise PlanValidationError(
@@ -162,7 +182,7 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
     except PlanValidationError as exc:
         try:
             plan = await _recover_recipient(exc, cfg, confirmer, operator_context, api_key=cfg.anthropic_api_key)
-        except PlanValidationError as exc2:
+        except (PlanValidationError, ValueError) as exc2:
             elapsed = time.monotonic() - t0
             sink.close()
             return RunResult(
@@ -172,8 +192,9 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
 
     # ── Pipeline detection and env checks ──────────────────────────────
     # NOTE: planning precedes env checks — pipeline type is derived from the plan.
-    tools    = {s["tool"] for s in plan["steps"]}
-    pipeline = _tracer_mod.detect_pipeline(tools)
+    sub_plans = plan["pipelines"] if "pipelines" in plan else [plan]
+    tools     = {s["tool"] for p in sub_plans for s in p["steps"]}
+    pipeline  = _tracer_mod.detect_pipeline(tools)
     console_tracer.set_pipeline(pipeline)
 
     # Check env vars required by this pipeline (only what is actually needed).
@@ -198,54 +219,62 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
             return RunResult(ExitCode.CONFIG_ERROR, "error",
                              {"reason": f"GOOGLE_ACCESS_TOKEN is not set.  {hint}"}, session, elapsed)
 
+    # ── Static plan emission (always, before dry-run check) ────────────
+    # One event for the whole manifest so step N/M stays correct across pipelines.
+    emit(EvStaticPlan(
+        session_id = session.id,
+        steps      = [
+            {"pipeline": idx, "step_index": i, "tool": s["tool"], "args": s["args"]}
+            for idx, sub in enumerate(sub_plans)
+            for i, s in enumerate(sub["steps"])
+        ],
+    ))
+
     # ── Dry run ────────────────────────────────────────────────────────
     if cfg.dry_run:
-        emit(EvStaticPlan(
-            session_id = session.id,
-            steps      = [
-                {"step_index": i, "tool": s["tool"], "args": s["args"]}
-                for i, s in enumerate(plan["steps"])
-            ],
-        ))
         elapsed = time.monotonic() - t0
         sink.close()
         return RunResult(ExitCode.OK, "dry_run", {"plan": plan}, session, elapsed)
 
     # ── Execution ──────────────────────────────────────────────────────
-    store  = SlotStore()
-    policy = IronFlow(store)
+    driver_kwargs = {
+        "confirm_slot": confirmer.confirm_slot,
+        "google_token": google_token,
+    }
 
-    emit(EvStaticPlan(
-        session_id = session.id,
-        steps      = [
-            {"step_index": i, "tool": s["tool"], "args": s["args"]}
-            for i, s in enumerate(plan["steps"])
-        ],
-    ))
-
+    coro = driver_run_manifest(cfg.task, plan, **driver_kwargs)
     try:
-        driver_kwargs = {"confirm_slot": confirmer.confirm_slot, "google_token": google_token}
-        if cfg.timeout_s is not None:
-            result = await asyncio.wait_for(
-                driver_run(cfg.task, plan, store, policy, **driver_kwargs),
-                timeout=cfg.timeout_s,
-            )
-        else:
-            result = await driver_run(cfg.task, plan, store, policy, **driver_kwargs)
+        result = (
+            await asyncio.wait_for(coro, timeout=cfg.timeout_s)
+            if cfg.timeout_s is not None
+            else await coro
+        )
+    except ConfirmationRequired as exc:
+        elapsed = time.monotonic() - t0
+        sink.close()
+        return RunResult(
+            ExitCode.CONFIRMATION_REQUIRED, "error",
+            {"reason": str(exc)}, session, elapsed,
+        )
     except asyncio.TimeoutError:
         elapsed = time.monotonic() - t0
         sink.close()
         return RunResult(
             ExitCode.PIPELINE_ERROR, "timeout",
-            {"reason": f"execution timed out after {cfg.timeout_s}s"},
+            {"reason": f"timed out after {cfg.timeout_s}s", "status": "timeout"},
             session, elapsed,
         )
 
     elapsed = time.monotonic() - t0
 
     # ── Audit hook ────────────────────────────────────────────────────
+    # For multi-pipeline runs, audit each pipeline independently.
     if spec.audit_fn:
-        spec.audit_fn(console_tracer, result, elapsed=elapsed)
+        if "actions" in result:
+            for action in result["actions"]:
+                spec.audit_fn(console_tracer, action, elapsed=elapsed)
+        else:
+            spec.audit_fn(console_tracer, result, elapsed=elapsed)
 
     sink.close()
     return _to_run_result(result, session, elapsed)

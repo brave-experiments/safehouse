@@ -96,6 +96,16 @@ class PlanValidationError(ValueError):
         self.field = field
 
 
+_MISSING_RECIPIENT_SIGNAL = "missing routing field: recipient"
+
+
+def _recipient_recovery_field(msg: object) -> str | None:
+    """Return "recipient" if msg is the exact planner missing-recipient signal, else None."""
+    if isinstance(msg, str) and msg.startswith(_MISSING_RECIPIENT_SIGNAL):
+        return "recipient"
+    return None
+
+
 def _get_client(api_key: str | None = None) -> anthropic.Anthropic:
     return anthropic.Anthropic(api_key=api_key)
 
@@ -103,6 +113,7 @@ def _get_client(api_key: str | None = None) -> anthropic.Anthropic:
 _PLANNER_MODEL      = "claude-sonnet-4-6"
 _PLANNER_MAX_TOKENS = 4096
 _PLANNER_TIMEOUT    = 60   # seconds — single SDK call, no tool I/O; 60 s is generous
+_MAX_PIPELINES      = 5    # bounded blast radius — caps total world-actions per run
 
 
 # ── Pipeline pattern shapes ────────────────────────────────────────────
@@ -153,6 +164,34 @@ _PIPELINE_SHAPES: list[PipelinePattern] = [
     "instruction": "<score and summarise options; output top combinations as readable text with URLs>"}},
   {"tool": "send_summary",     "args": {"recipient": "<verbatim email or OPERATOR DEFAULT>", "subject": "<inferred>",
     "body_slot": "travel_summary"}}
+]}
+{"steps": [
+  {"tool": "mcp_page_content", "args": {"url": "<url verbatim from task>", "slot_id": "page_content"}},
+  {"tool": "spawn_processor",  "args": {"reads": ["page_content"], "out_slot": "digest",
+    "instruction": "<specify exact output format>"}},
+  {"tool": "send_summary",     "args": {
+    "recipient": ["<verbatim email A>", "<verbatim email B>"], "subject": "<verbatim>",
+    "body_slot": "digest", "delivery": "combined"}}
+]}""",
+    ),
+
+    PipelinePattern(
+        driver_tool = "send_reply (multi-pipeline)",
+        description = "Reply independently to N senders — one pipeline per sender, each with its own fetch and thread context.",
+        example     = """\
+{"pipelines": [
+  {"steps": [
+    {"tool": "mcp_email_search", "args": {"filter": {"from": "<sender A verbatim>", "limit": 1}, "slot_id": "email_a"}},
+    {"tool": "spawn_processor", "args": {"reads": ["email_a"], "out_slot": "reply_a",
+      "instruction": "Write a polite reply based strictly on the email. Output ONLY the reply text."}},
+    {"tool": "send_reply", "args": {"recipient": "<sender A verbatim>", "subject": "<verbatim>", "body_slot": "reply_a"}}
+  ]},
+  {"steps": [
+    {"tool": "mcp_email_search", "args": {"filter": {"from": "<sender B verbatim>", "limit": 1}, "slot_id": "email_b"}},
+    {"tool": "spawn_processor", "args": {"reads": ["email_b"], "out_slot": "reply_b",
+      "instruction": "Write a polite reply based strictly on the email. Output ONLY the reply text."}},
+    {"tool": "send_reply", "args": {"recipient": "<sender B verbatim>", "subject": "<verbatim>", "body_slot": "reply_b"}}
+  ]}
 ]}""",
     ),
 
@@ -176,12 +215,12 @@ _PIPELINE_SHAPES: list[PipelinePattern] = [
         example     = """\
 {"steps": [
   {"tool": "mcp_email_search", "args": {
-    "filter": {"from": "<sender verbatim>", "limit": 5}, "slot_id": "email_content"}},
+    "filter": {"from": "<sender verbatim>", "limit": 1}, "slot_id": "email_content"}},
   {"tool": "mcp_calendar_search", "args": {
     "filter": {"timeMin": "<ISO8601 Mon 00:00>", "timeMax": "<ISO8601 Fri 23:59>"}, "slot_id": "calendar_events"}},
   {"tool": "spawn_processor", "args": {
     "reads": ["email_content", "calendar_events"], "out_slot": "meeting_proposal",
-    "instruction": "Identify the meeting-request email among those fetched. Find 2-3 free <N>-minute slots on weekdays (09:00-18:00 {timezone}) that do not overlap any existing calendar event. Output ONLY valid JSON: {\"proposed_slots\": [{\"label\": \"<readable weekday date+time+tz>\", \"start\": \"<ISO8601+tz>\", \"end\": \"<ISO8601+tz>\"}], \"reply_body\": \"<polite email body proposing the times — no subject line>\"}"}},
+    "instruction": "Find 2-3 free <N>-minute slots on weekdays (09:00-18:00 {timezone}) that do not overlap any existing calendar event. Output ONLY valid JSON: {\"proposed_slots\": [{\"label\": \"<readable weekday date+time+tz>\", \"start\": \"<ISO8601+tz>\", \"end\": \"<ISO8601+tz>\"}], \"reply_body\": \"<polite email body proposing the times — no subject line>\"}"}},
   {"tool": "schedule_meeting", "args": {"attendee": "<verbatim email from task>",
     "event_title": "<verbatim>", "duration_minutes": 30,
     "reply_subject": "<verbatim>", "slots_slot": "meeting_proposal"}}
@@ -234,6 +273,12 @@ Today's date: {today}. Local timezone: {timezone}.
 AXIOM: Routing fields (recipient, attendee) must appear verbatim
 in the task text or OPERATOR DEFAULTS — never constructed or inferred from context.
 
+MULTI-ACTION: When the task requires N independent actions for N distinct recipients
+or contexts (e.g. "reply to A and reply to B"), emit {"pipelines": [{steps}, ...]}
+where each sub-plan is a complete independent pipeline ending with one driver tool.
+Each recipient must satisfy the AXIOM. Maximum {max_pipelines} pipelines per run.
+Use a single {"steps": [...]} plan when one action covers all recipients.
+
 ══ REGISTERED CAPABILITIES ══
 
 All sub-agents and driver tools registered for this deployment.
@@ -268,8 +313,14 @@ Reason through these internally — do not output this reasoning, only the final
        Include routing fields as args on the Tier 3 driver tool step.
        If OPERATOR DEFAULTS contains a recipient, use it — it carries (T,pub) trust.
        Missing recipient with no OPERATOR DEFAULT → output {"error": "missing routing field: recipient"}.
+       If the task is semantically ambiguous (multiple valid interpretations exist), describe the
+       ambiguity clearly in the error and suggest two concrete phrasings that would resolve it.
+       Example: {"error": "missing routing field: recipient — unclear whether you want a combined
+       summary sent to you, or a separate summary sent to each person. Try: 'summarise and send
+       me the result' or 'send each of them their own summary'."}
   3. SLOT CHAIN — slots are write-once and immutable after first write. Every slot_id used in reads
-       must be declared as an output in a strictly earlier step; no two steps may share a slot_id.
+       must be declared as an output in a strictly earlier step; no two steps within the same
+       pipeline may share a slot_id (slot names may repeat across parallel pipelines).
 
 ══ RULES ══
 
@@ -278,8 +329,8 @@ Reason through these internally — do not output this reasoning, only the final
   2. Only include args listed in the TOOL CATALOG for each tool. Provider-specific fields
      (domain, api_url, mcp_tool, search_params, trusted_action_urls, system_prompt) are
      injected by the concrete mapper — never include them yourself.
-  3. slot_id values must be globally unique and snake_case — slots are write-once immutable;
-     a duplicate slot_id is a runtime error.
+  3. slot_id values must be unique within each pipeline and snake_case — slots are write-once
+     immutable; a duplicate slot_id within the same pipeline is a runtime error.
   4. reads and body_slot must reference slot_ids declared in earlier steps.
   5. The final step must be exactly one Tier 3 driver tool.
   6. Multi-step sampling — when a task specifies an open-ended range rather than a fixed point
@@ -316,6 +367,7 @@ def build_planner_system_prompt(
         .replace("{tool_catalog}",           registry.tool_catalog())
         .replace("{today}",                  today)
         .replace("{timezone}",               timezone)
+        .replace("{max_pipelines}",          str(_MAX_PIPELINES))
     )
     if operator_context:
         prompt += (
@@ -340,10 +392,12 @@ def _is_http_url(value: object, *, https_only: bool = False) -> bool:
     return parts.scheme in allowed and bool(parts.netloc)
 
 
-_EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
-# Character class for email-valid chars — used to boundary-match addresses in the AXIOM check
-# so that "a@b.co" does not match inside "attacker-a@b.com" or "a@b.co.uk".
+_EMAIL_RE = re.compile(r"^[^@\s,]+@[^@\s,]+\.[^@\s,]+$")
+# Lookbehind: conservative — any email-valid char before the address is a boundary violation.
 _EMAIL_BOUNDARY = r"[A-Za-z0-9.+_@-]"
+# Lookahead: a trailing dot blocks only if followed by an alphanumeric (i.e. part of a longer
+# domain like .co.uk or .evil), not when it's a sentence-final period.
+_EMAIL_TRAILING = r"(?:[A-Za-z0-9+_@-]|\.[A-Za-z0-9])"
 
 
 def _is_plausible_email(value: object) -> bool:
@@ -374,8 +428,10 @@ class ToolContract:
     literal_fields: dict[str, frozenset[str]] = field(
         default_factory=dict, hash=False, compare=False,
     )
-    is_driver_tool: bool            = False
-    max_uses:       int | None      = None   # Tier 1 tools: 1 (Rule 6)
+    is_driver_tool:  bool            = False
+    max_uses:        int | None     = None   # Tier 1 tools: 1 (Rule 6)
+    max_email_list:  int | None     = None   # max addresses in email_fields; None = unlimited
+    string_fields:   tuple[str, ...] = ()    # args that must be a plain str, not a list
 
     def __post_init__(self) -> None:
         indexed = (
@@ -419,7 +475,8 @@ class ToolContract:
 # __post_init__ raises AssertionError on any violation so no bad schema can reach runtime.
 TOOL_SCHEMA: dict[str, ToolContract] = {
     # ── Tier 1 — Data Sub-Agents ───────────────────────────────────────────
-    # max_uses=1: single-use only (email, calendar — one inbox per run)
+    # max_uses=5: allows multiple sender-filtered fetches (each filter verbatim from task via AXIOM);
+    #             prevents unbounded sampling but allows "fetch from A and B" in one plan.
     # max_uses=None: multi-step permitted (page fetch — multiple URLs; flight/hotel — range sampling)
     "mcp_page_content": ToolContract(
         required     = ("url", "slot_id"),
@@ -430,13 +487,13 @@ TOOL_SCHEMA: dict[str, ToolContract] = {
         required     = ("api_url", "slot_id"),
         slot_output  = "slot_id",
         https_fields = ("api_url",),
-        max_uses     = 1,
+        max_uses     = 5,
     ),
     "mcp_calendar_search": ToolContract(
         required     = ("api_url", "slot_id"),
         slot_output  = "slot_id",
         https_fields = ("api_url",),
-        max_uses     = 1,
+        max_uses     = 5,
     ),
     "mcp_flight_search": ToolContract(
         required     = ("domain", "mcp_tool", "slot_id"),
@@ -464,31 +521,36 @@ TOOL_SCHEMA: dict[str, ToolContract] = {
     # via the planner. driver.run() pre-commits them to state.vars["_routing"] as (T,pub)
     # before step 0 — structurally locked before any sub-agent executes.
     "send_reply": ToolContract(
-        required       = ("recipient", "subject", "body_slot"),
-        email_fields   = ("recipient",),
-        slot_refs      = ("body_slot",),
-        is_driver_tool = True,
+        required        = ("recipient", "subject", "body_slot"),
+        email_fields    = ("recipient",),
+        slot_refs       = ("body_slot",),
+        max_email_list  = 1,   # send_reply is strictly one-to-one
+        is_driver_tool  = True,
     ),
     "send_summary": ToolContract(
-        required       = ("recipient", "subject", "body_slot"),
-        email_fields   = ("recipient",),
-        slot_refs      = ("body_slot",),
-        is_driver_tool = True,
+        required        = ("recipient", "subject", "body_slot"),
+        email_fields    = ("recipient",),
+        slot_refs       = ("body_slot",),
+        literal_fields  = {"delivery": frozenset({"combined", "separate"})},
+        max_email_list  = 25,
+        is_driver_tool  = True,
     ),
     "schedule_meeting": ToolContract(
-        required       = ("attendee", "event_title", "reply_subject", "slots_slot"),
-        email_fields   = ("attendee",),
-        slot_refs      = ("slots_slot",),
-        is_driver_tool = True,
+        required        = ("attendee", "event_title", "reply_subject", "slots_slot"),
+        email_fields    = ("attendee",),
+        slot_refs       = ("slots_slot",),
+        max_email_list  = 10,
+        is_driver_tool  = True,
         # duration_minutes is optional: driver uses args.get("duration_minutes", 30)
     ),
     "modify_emails": ToolContract(
-        required       = ("sender", "action"),
-        literal_fields = {"action": frozenset({
+        required        = ("sender", "action"),
+        string_fields   = ("sender",),
+        literal_fields  = {"action": frozenset({
             "add_label", "remove_label", "archive",
             "mark_read", "mark_unread", "star", "unstar",
         })},
-        is_driver_tool = True,
+        is_driver_tool  = True,
     ),
 }
 
@@ -528,8 +590,8 @@ def _validate_plan(
     if not isinstance(steps, list) or not steps:
         raise ValueError("Plan must have a non-empty 'steps' array")
 
-    axiom_haystack  = f"{task}\n{operator_context}".lower() if (task or operator_context) else None
-    last_idx        = len(steps) - 1
+    axiom_haystack      = f"{task}\n{operator_context}".lower() if (task or operator_context) else None
+    last_idx            = len(steps) - 1
     declared_slots: set[str]      = set()
     tool_usage:     dict[str, int] = {}
 
@@ -583,17 +645,49 @@ def _validate_plan(
             if slot not in declared_slots:
                 raise ValueError(f"{ctx}: '{f}' references undeclared slot '{slot}'")
 
-        # Email fields — format + AXIOM (routing field must come from the task string).
+        # string_fields — must be a plain str, not a list (e.g. modify_emails.sender).
+        for f in sc.string_fields:
+            val = args.get(f)
+            if val is not None and not isinstance(val, str):
+                raise PlanValidationError(
+                    f"{ctx}: '{f}' must be a string, got {type(val).__name__}", field=f,
+                )
+
+        # Email fields — accept str | list[str]; validate format + AXIOM per element.
         for f in sc.email_fields:
-            val = args[f]
-            if not _is_plausible_email(val):
-                raise PlanValidationError(f"{ctx}: '{f}'='{val}' is not a valid email address", field=f)
-            if axiom_haystack is not None:
-                if not re.search(rf"(?<!{_EMAIL_BOUNDARY}){re.escape(val.lower())}(?!{_EMAIL_BOUNDARY})", axiom_haystack):
+            raw  = args[f]
+            addrs: list[str] = list(raw) if isinstance(raw, (list, tuple)) else [raw]
+
+            if not addrs:
+                raise PlanValidationError(f"{ctx}: '{f}' must not be empty", field=f)
+
+            if sc.max_email_list is not None and len(addrs) > sc.max_email_list:
+                raise PlanValidationError(
+                    f"{ctx}: '{f}' has {len(addrs)} addresses — at most {sc.max_email_list} allowed",
+                    field=f,
+                )
+
+            seen_lower: set[str] = set()
+            for addr in addrs:
+                if not _is_plausible_email(addr):
                     raise PlanValidationError(
-                        f"{ctx}: '{f}'='{val}' does not appear verbatim in the task or OPERATOR DEFAULTS (AXIOM violation)",
-                        field=f,
+                        f"{ctx}: '{f}'='{addr}' is not a valid email address", field=f,
                     )
+                lo = addr.lower()
+                if lo in seen_lower:
+                    raise PlanValidationError(
+                        f"{ctx}: '{f}' contains duplicate address '{addr}'", field=f,
+                    )
+                seen_lower.add(lo)
+                if axiom_haystack is not None:
+                    if not re.search(
+                        rf"(?<!{_EMAIL_BOUNDARY}){re.escape(lo)}(?!{_EMAIL_TRAILING})",
+                        axiom_haystack,
+                    ):
+                        raise PlanValidationError(
+                            f"{ctx}: '{f}'='{addr}' does not appear verbatim in the task or OPERATOR DEFAULTS (AXIOM violation)",
+                            field=f,
+                        )
 
         for f in sc.https_fields:
             if not _is_http_url(args[f], https_only=True):
@@ -615,13 +709,61 @@ def _validate_plan(
             raise ValueError(f"{ctx}: driver tool must be the last step ({last_idx - i} unreachable step(s) follow)")
 
     # Every tool was validated above, so direct indexing is safe.
-    last_sc = TOOL_SCHEMA[steps[-1]["tool"]]
+    last_step = steps[-1]
+    last_sc = TOOL_SCHEMA[last_step["tool"]]
     if not last_sc.is_driver_tool:
         driver_tools = ", ".join(n for n, sc in TOOL_SCHEMA.items() if sc.is_driver_tool)
         raise ValueError(
             f"Plan must end with a Tier 3 driver tool — "
-            f"last step is '{steps[-1]['tool']}'; expected one of: {driver_tools}"
+            f"last step is '{last_step['tool']}'; expected one of: {driver_tools}"
         )
+
+    # Threaded reply drivers (send_reply, schedule_meeting): at most one email fetch,
+    # named filter.from required, routing address must match, limit must be 1.
+    # Keeps In-Reply-To / thread_id provenance unambiguous. field=None — structural,
+    # must NOT open recipient recovery.
+    _THREADED_TOOLS = ("send_reply", "schedule_meeting")
+    last_tool = last_step.get("tool")
+    if last_tool in _THREADED_TOOLS:
+        email_searches = [s for s in steps if s.get("tool") == "mcp_email_search"]
+        if len(email_searches) > 1:
+            raise PlanValidationError(
+                f"Step {last_idx + 1} ({last_tool}): at most one mcp_email_search allowed — "
+                f"use pipelines for multiple recipients",
+            )
+        if email_searches:
+            filt = email_searches[0].get("args", {}).get("filter")
+            if not isinstance(filt, dict):
+                filt = {}
+            f_from = filt.get("from")
+            if not (isinstance(f_from, str) and f_from.strip()):
+                raise PlanValidationError(
+                    f"Step {last_idx + 1} ({last_tool}): mcp_email_search requires "
+                    f"filter.from (not only filter.q)",
+                )
+            limit = filt.get("limit", 1)
+            try:
+                limit_n = int(limit)
+            except (TypeError, ValueError):
+                limit_n = -1
+            if limit_n != 1:
+                raise PlanValidationError(
+                    f"Step {last_idx + 1} ({last_tool}): mcp_email_search filter.limit "
+                    f"must be 1 (got {limit!r}) — threading uses the first fetched message",
+                )
+            routing_key = "recipient" if last_tool == "send_reply" else "attendee"
+            routing_raw = last_step.get("args", {}).get(routing_key, "")
+            if isinstance(routing_raw, (list, tuple)):
+                routing_addrs = [str(a).lower() for a in routing_raw]
+            else:
+                routing_addrs = [str(routing_raw).lower()]
+            if f_from.strip().lower() not in routing_addrs:
+                raise PlanValidationError(
+                    f"Step {last_idx + 1} ({last_tool}): '{routing_key}'={routing_raw!r} does not "
+                    f"include mcp_email_search filter.from='{f_from}' — "
+                    f"fetching email from one sender and acting for a different address "
+                    f"is likely a planning error",
+                )
 
 
 _ISO_DATE = "%Y-%m-%d"
@@ -655,9 +797,28 @@ def _precheck_shape(plan: dict) -> None:
     Raises ValueError with a descriptive message on any shape violation.
     """
     if not isinstance(plan, dict):
-        raise ValueError(
-            f"Planner output must be a JSON object, got {type(plan).__name__}"
-        )
+        raise ValueError(f"Planner output must be a JSON object, got {type(plan).__name__}")
+    if "pipelines" in plan and "steps" in plan:
+        raise ValueError("Planner output must not contain both 'steps' and 'pipelines'")
+    if "pipelines" in plan:
+        pipelines = plan["pipelines"]
+        if not isinstance(pipelines, list) or not pipelines:
+            raise ValueError("'pipelines' must be a non-empty array")
+        if len(pipelines) > _MAX_PIPELINES:
+            raise ValueError(f"'pipelines' exceeds maximum of {_MAX_PIPELINES}")
+        seen_sigs: set[str] = set()
+        for i, sub in enumerate(pipelines):
+            if not isinstance(sub, dict) or not isinstance(sub.get("steps"), list):
+                raise ValueError(f"Pipeline {i + 1}: must be an object with a 'steps' array")
+            _precheck_shape(sub)
+            sig = json.dumps(sub, sort_keys=True)
+            if sig in seen_sigs:
+                raise ValueError(
+                    f"Pipeline {i + 1} is a duplicate of an earlier pipeline "
+                    f"(same driver tool and arguments)"
+                )
+            seen_sigs.add(sig)
+        return
     steps = plan.get("steps")
     if not isinstance(steps, list) or not steps:
         raise ValueError("Planner output must have a non-empty 'steps' array")
@@ -766,6 +927,13 @@ def _map_to_concrete(abstract_plan: dict, registry: ToolRegistry) -> dict:
     return result
 
 
+def _map_sub_plans(abstract_plan: dict, registry: ToolRegistry) -> dict:
+    """Wrap _map_to_concrete to handle both single-plan and pipelines shapes."""
+    if "pipelines" not in abstract_plan:
+        return _map_to_concrete(abstract_plan, registry)
+    return {"pipelines": [_map_to_concrete(sub, registry) for sub in abstract_plan["pipelines"]]}
+
+
 
 
 _PLAN_DECODER = json.JSONDecoder()
@@ -792,7 +960,7 @@ def _extract_last_plan_json(raw: str) -> dict:
             obj, pos = _PLAN_DECODER.raw_decode(raw, pos)
             if isinstance(obj, dict):
                 last_any = obj
-                if "steps" in obj or "error" in obj:
+                if "steps" in obj or "error" in obj or "pipelines" in obj:
                     last_plan_like = obj
         except json.JSONDecodeError:
             pos += 1
@@ -850,15 +1018,19 @@ def generate_plan(
 
     if "error" in abstract_plan:
         msg = abstract_plan["error"]
-        f: str | None = "recipient" if "recipient" in msg else None
-        raise PlanValidationError(f"Planner rejected the task: {msg}", field=f)
+        # field="recipient" opens the recovery path (ask_recipient or ask_clarification).
+        # Both the exact missing-signal and ambiguity messages start with that signal;
+        # any other recipient-mentioning rejection is a hard planning failure.
+        raise PlanValidationError(f"Planner rejected the task: {msg}", field=_recipient_recovery_field(msg))
 
     _precheck_shape(abstract_plan)
 
-    plan = _map_to_concrete(abstract_plan, registry)
+    plan = _map_sub_plans(abstract_plan, registry)
     _trace.emit(_trace.EvPlanPhase2(plan=plan, abstract_plan=abstract_plan))
 
-    _validate_plan(plan, task=task, operator_context=operator_context)
+    sub_plans = plan["pipelines"] if "pipelines" in plan else [plan]
+    for sub in sub_plans:
+        _validate_plan(sub, task=task, operator_context=operator_context)
     _trace.emit(_trace.EvPlanPhase3(plan=plan))
 
     return plan

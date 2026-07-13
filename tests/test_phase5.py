@@ -14,6 +14,7 @@ Covers:
 No API key required — all tests use in-process mocking.
 """
 import asyncio
+import base64
 import json
 import sys
 import os
@@ -189,8 +190,8 @@ def test_schedule_meeting_choice_one_approved(monkeypatch) -> None:
 
     sent: list[dict] = []
 
-    async def _fake_gmail_send(to, subject, body, token, state):
-        sent.append({"to": to, "subject": subject})
+    async def _fake_gmail_send(to, subject, body, token, state, **kw):
+        sent.append({"to": to, "subject": subject, "body_slot": kw.get("body_slot", "")})
 
     monkeypatch.setattr(driver_mod, "_gmail_send", _fake_gmail_send)
 
@@ -224,6 +225,7 @@ def test_schedule_meeting_choice_one_approved(monkeypatch) -> None:
     assert final.get("status") == "success"
     assert final.get("event_id") == "evt123"
     assert sent[0]["to"] == "alice@corp.com"
+    assert sent[0]["body_slot"] == "slots"
 
 
 # ── GmailClient / FakeGmailClient ────────────────────────────────────
@@ -270,6 +272,110 @@ def test_gmail_client_send_success() -> None:
 
     msg_id = asyncio.run(gmail.send("a@b.com", "Subj", "Body", ""))
     assert msg_id == "msg123"
+
+
+def test_gmail_client_send_sets_reply_threading_headers() -> None:
+    """Recipient clients need In-Reply-To/References; threadId alone is not enough."""
+    captured: dict = {}
+
+    class _CaptureClient:
+        async def post(self, url, headers=None, json=None):
+            captured["json"] = json
+            return FakeHttpxResponse(200, {"id": "sent1"})
+
+    gmail = GmailClient.__new__(GmailClient)
+    from safehouse.driver import _google_headers
+    gmail._headers = _google_headers("token")
+    gmail._client = _CaptureClient()
+
+    asyncio.run(gmail.send(
+        "sender@example.com", "Re: Hello", "Thanks",
+        "thread_abc",
+        in_reply_to="<orig@mail.example>",
+        references="<root@mail.example> <orig@mail.example>",
+    ))
+
+    payload = captured["json"]
+    assert payload["threadId"] == "thread_abc"
+    raw = base64.urlsafe_b64decode(payload["raw"] + "==").decode("utf-8", errors="replace")
+    assert "In-Reply-To: <orig@mail.example>" in raw
+    assert "References: <root@mail.example> <orig@mail.example>" in raw
+    assert "Subject: Re: Hello" in raw
+
+
+def test_gmail_send_keeps_gated_subject_not_fetched(monkeypatch) -> None:
+    """Fetched Subject must not override the IronFlow-gated (T,pub) subject."""
+    from safehouse.driver import _gmail_send
+    from safehouse.labels import LVal, Label
+    from safehouse.plan_types import PlanState
+
+    captured: dict = {}
+
+    class _FakeGmail:
+        def __init__(self, *a, **k):
+            pass
+
+        async def send(self, to, subject, body, thread_id, *, in_reply_to="", references=""):
+            captured.update({
+                "subject": subject, "thread_id": thread_id,
+                "in_reply_to": in_reply_to, "references": references,
+            })
+            return "msg1"
+
+    class _FakeClient:
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *a):
+            return False
+
+    monkeypatch.setattr("safehouse.driver.GmailClient", _FakeGmail)
+    monkeypatch.setattr("safehouse.driver.httpx.AsyncClient", lambda **k: _FakeClient())
+
+    state = PlanState()
+    state.set_var("_email_thread_meta_email", LVal({
+        "thread_id": "tid1",
+        "message_id": "<orig@mail.example>",
+        "references": "<root@mail.example>",
+        # subject intentionally omitted / would be ignored if present
+        "subject": "Attacker Subject\nBcc: evil@x.com",
+    }, Label.T_pub()))
+
+    asyncio.run(_gmail_send(
+        "alice@corp.com", "Re: Locked From Task", "body", "tok", state,
+        body_slot="email",
+    ))
+    assert captured["subject"] == "Re: Locked From Task"
+    assert captured["thread_id"] == "tid1"
+    assert captured["in_reply_to"] == "<orig@mail.example>"
+    assert "evil" not in captured["subject"]
+    assert "\n" not in captured["subject"]
+
+
+def test_gmail_parse_message_extracts_threading_headers() -> None:
+    from safehouse.runner import _gmail_parse_message, _sanitize_rfc_msg_id
+
+    assert _sanitize_rfc_msg_id("bad\nid@x.com") == ""
+    assert _sanitize_rfc_msg_id("good@mail.example") == "<good@mail.example>"
+
+    parsed = _gmail_parse_message({
+        "threadId": "tid1",
+        "snippet": "hi",
+        "payload": {
+            "headers": [
+                {"name": "From", "value": "sender@example.com"},
+                {"name": "Subject", "value": "Hello there"},
+                {"name": "Date", "value": "Mon, 13 Jul 2026 12:00:00 +0000"},
+                {"name": "Message-ID", "value": "<abc123@mail.example>"},
+                {"name": "References", "value": "<root@mail.example>"},
+            ],
+            "body": {"data": ""},
+        },
+    })
+    assert parsed["thread_id"] == "tid1"
+    assert parsed["message_id"] == "<abc123@mail.example>"
+    assert parsed["references"] == "<root@mail.example>"
+    assert parsed["subject"] == "Hello there"
 
 
 def test_gmail_client_send_raises_on_non_2xx() -> None:
