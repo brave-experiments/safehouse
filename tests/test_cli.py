@@ -182,7 +182,7 @@ def test_schedule_meeting_auto_approve_creates_event(monkeypatch) -> None:
 
     sent: list[dict] = []
 
-    async def _fake_gmail_send(to, subject, body, token, state):
+    async def _fake_gmail_send(to, subject, body, token, state, **kw):
         sent.append({"to": to})
 
     monkeypatch.setattr(driver_mod, "_gmail_send", _fake_gmail_send)

@@ -63,6 +63,7 @@ from dataclasses import dataclass, field
 from datetime import date
 from email.mime.text import MIMEText
 import httpx
+from .exceptions import ConfirmationRequired
 from .labels import LVal, Label, I, C, taint_all, Capability
 from .slots import SlotStore, SlotWriter
 from .ironflow_policy import IronFlow, FlowField, FlowMode, IronFlowViolation, Role
@@ -120,10 +121,30 @@ class GmailClient:
         self._headers = _google_headers(token)
         self._client  = client
 
-    async def send(self, to: str, subject: str, body: str, thread_id: str = "") -> str:
-        """POST a MIME email. Returns the sent message id."""
+    async def send(
+        self,
+        to: str,
+        subject: str,
+        body: str,
+        thread_id: str = "",
+        *,
+        in_reply_to: str = "",
+        references: str = "",
+    ) -> str:
+        """
+        POST a MIME email. Returns the sent message id.
+
+        For threaded replies, pass thread_id plus In-Reply-To / References
+        (RFC 5322). Recipients' clients key off those headers; threadId alone
+        is not enough outside the sender's Gmail view.
+        """
         msg = MIMEText(body, "plain", "utf-8")
-        msg["To"] = to; msg["From"] = "me"; msg["Subject"] = subject
+        msg["To"] = to
+        msg["From"] = "me"
+        msg["Subject"] = subject
+        if in_reply_to:
+            msg["In-Reply-To"] = in_reply_to
+            msg["References"] = references or in_reply_to
         payload: dict = {"raw": base64.urlsafe_b64encode(msg.as_bytes()).decode()}
         if thread_id:
             payload["threadId"] = thread_id
@@ -278,15 +299,58 @@ def _get_routing(state: PlanState) -> dict | None:
         return None
 
 
+def _freeze_routing(routing: dict) -> dict:
+    """Freeze any list values as tuples — prevents post-lock mutation of the routing block."""
+    return {k: tuple(v) if isinstance(v, list) else v for k, v in routing.items()}
+
+
 def _routing_recipient_subject(routing: dict) -> tuple[LVal, LVal]:
     return (
-        LVal(routing["recipient"], Label.T_pub()),
-        LVal(routing["subject"],   Label.T_pub()),
+        LVal(_addr_header(routing["recipient"]), Label.T_pub()),
+        LVal(routing["subject"],                  Label.T_pub()),
     )
 
 
-def _email_domain(address: str) -> str:
-    return address.split("@")[-1].lower()
+def _addr_list(v: object) -> list[str]:
+    """Routing recipient/attendee value (str/list/tuple) → order-preserving, case-folded de-duped list."""
+    if isinstance(v, (list, tuple)):
+        seen: dict[str, str] = {}
+        for a in v:
+            seen.setdefault(str(a).lower(), str(a))
+        return list(seen.values())
+    return [str(v)]
+
+
+def _addr_header(v: object) -> str:
+    """RFC 5322 To:/attendee header from a str or address collection."""
+    return ", ".join(_addr_list(v))
+
+
+def _header_no_inject(value: str) -> str:
+    """Strip CR/LF so attacker-controlled header text cannot inject MIME fields."""
+    return (value or "").replace("\r", "").replace("\n", "").strip()
+
+
+def _reply_references(message_id: str, prior: str) -> str:
+    """Build References: prior chain + message being replied to."""
+    mid = _header_no_inject(message_id)
+    if not mid:
+        return ""
+    prior = _header_no_inject(prior)
+    if prior and mid not in prior.split():
+        return f"{prior} {mid}"
+    return prior or mid
+
+
+def _world_action_committed(result: dict) -> bool:
+    """True if a sub-result already caused irreversible world side effects."""
+    if result.get("status") == "success":
+        return True
+    if result.get("sent"):          # partial send_summary (separate delivery)
+        return True
+    if result.get("event_id"):      # calendar invite created; reply may have failed
+        return True
+    return False
 
 
 def _bridge_body(policy: IronFlow, lval: LVal) -> LVal:
@@ -328,17 +392,15 @@ def _declassify_for_send(
     routing: dict,
     who: str,
     not_from: str,
-    domain_checked: bool,
     always: bool = False,
 ) -> LVal:
     """Explicit (_,priv)→(_,pub) downgrade before the email bridge. Skipped when already pub unless always."""
     if not always and lval.label.confidentiality != C.priv:
         return lval
+    recipient_display = _addr_header(routing[who])
     preconditions = [
         'routing pre-committed in state.vars["_routing"] (T,pub) before step 0',
-        f"{who} '{routing[who]}' predetermined from task — not from {not_from}",
-        *([f"domain '{_email_domain(routing[who])}' derived from locked {who} — checked before declassify"]
-          if domain_checked else []),
+        f"{who} '{recipient_display}' predetermined from task — not from {not_from}",
         "spawn_processor isolated: no CanNetwork, no CanCallTool, no CanSpawn",
     ]
     return policy.declassify(
@@ -349,25 +411,6 @@ def _declassify_for_send(
         preconditions = preconditions,
     )
 
-
-def _check_domain_whitelist(
-    address: str, trusted_domains: list[str], empty_msg: str, mismatch_key: str
-) -> str | None:
-    """Return a plain error reason string if address domain is not in trusted_domains, else None.
-    Emits EvGate("DOMAIN_CHECK") on both pass and fail for audit visibility.
-    """
-    if not trusted_domains:
-        return empty_msg
-    domain = _email_domain(address)
-    detail = f"domain={domain!r} key={mismatch_key!r}"
-    if not any(d.lower() == domain for d in trusted_domains):
-        msg = f"address domain '{domain}' not in {mismatch_key} {trusted_domains}"
-        _trace.emit(_trace.EvGate(gate="DOMAIN_CHECK", who=mismatch_key,
-                                  detail=detail, passed=False, blocked=msg))
-        return msg
-    _trace.emit(_trace.EvGate(gate="DOMAIN_CHECK", who=mismatch_key,
-                              detail=detail + " trusted=True", passed=True))
-    return None
 
 
 def _is_weekday(slot: dict) -> bool:
@@ -404,19 +447,40 @@ async def _gmail_send(
     body: str,
     google_token: str,
     state: PlanState,
+    *,
+    body_slot: str = "",
 ) -> None:
     """
-    Send an email via Gmail. Sets threadId from _email_thread_meta if present
-    (In-Reply-To/References omitted — Message-ID is sender-controlled and must not be trusted).
-    Emits EvEmailSent on success. Raises GmailSendError on non-2xx response.
+    Send an email via Gmail.
+
+    body_slot: when set (send_reply / schedule_meeting), resolve thread meta via
+    _thread_source and attach threadId + In-Reply-To / References.
+    Subject is always the IronFlow-gated (T,pub) value — never replaced from
+    fetched headers (those are untrusted). message_id is MIME-threading only.
+    Emits EvEmailSent on success. Raises GmailSendError on non-2xx.
     """
-    try:
-        thread_id = state.get_var("_email_thread_meta").value.get("thread_id", "")
-    except KeyError:
-        thread_id = ""
+    thread_id = ""
+    in_reply_to = ""
+    references = ""
+    if body_slot:
+        try:
+            thread_source = state.get_var("_thread_source").value
+        except KeyError:
+            thread_source = {}
+        lookup_slot = thread_source.get(body_slot, body_slot)
+        try:
+            meta = state.get_var(f"_email_thread_meta_{lookup_slot}").value
+        except KeyError:
+            meta = {}
+        thread_id = meta.get("thread_id", "") or ""
+        in_reply_to = meta.get("message_id", "") or ""
+        references = _reply_references(in_reply_to, meta.get("references", "") or "")
 
     async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
-        msg_id = await GmailClient(google_token, client).send(to, subject, body, thread_id)
+        msg_id = await GmailClient(google_token, client).send(
+            to, subject, body, thread_id,
+            in_reply_to=in_reply_to, references=references,
+        )
     _trace.emit(_trace.EvEmailSent(from_addr="me", to=to, message_id=msg_id))
 
 
@@ -428,9 +492,9 @@ def _pipeline_error(reason: str, policy: IronFlow, store: SlotStore) -> dict:
             "slot_inventory": inventory, "violations": violations}
 
 
-def _terminal_error(msg: str, store: SlotStore) -> tuple[str, dict]:
+def _terminal_error(msg: str, store: SlotStore, **extra: object) -> tuple[str, dict]:
     """Return a terminal (json_str, dict) error pair — stops the pipeline at this step."""
-    payload = {"status": "error", "reason": msg}
+    payload: dict = {"status": "error", "reason": msg, **extra}
     return json.dumps(payload), {**payload, "slot_inventory": store.inventory()}
 
 
@@ -484,10 +548,20 @@ async def _handle_mcp_email_search(args: dict, ctx: _StepContext) -> tuple[str, 
 
     async def _run(w: SlotWriter) -> None:
         thread_meta = await run_mcp_email_search(spec, filter_p, w, policy, google_token=ctx.config.google_token)
-        if thread_meta.get("thread_id"):
-            # thread_id is a Gmail API envelope field (provider-assigned), not sender-controlled —
-            # promoting to (T,pub) is safe here.
-            state.set_var("_email_thread_meta", LVal(thread_meta, Label.T_pub()))
+        # thread_id is Gmail envelope (provider-assigned). message_id / references
+        # are sanitized header values used ONLY for In-Reply-To / References —
+        # never as Subject or To. Subject stays the gated (T,pub) routing value.
+        # Omit raw subject from state.vars: PlanState only accepts (T,pub) and
+        # fetched Subject is untrusted content.
+        if thread_meta.get("thread_id") or thread_meta.get("message_id"):
+            state.set_var(
+                f"_email_thread_meta_{slot_id}",
+                LVal({
+                    "thread_id":  thread_meta.get("thread_id", ""),
+                    "message_id": thread_meta.get("message_id", ""),
+                    "references": thread_meta.get("references", ""),
+                }, Label.T_pub()),
+            )
 
     return await _run_tier1(
         ctx, slot_id, spec, "mcp_email_search",
@@ -548,12 +622,14 @@ async def _handle_send_summary(args: dict, ctx: _StepContext) -> tuple[str, dict
     """
     Driver tool step: send a summary email using routing pre-committed by driver.run().
 
-    recipient and subject are read from state.vars["_routing"] — committed as
-    (T,pub) before step 0, before any external content was fetched.
+    recipient in routing may be a str or tuple of strs (locked immutable before step 0).
+    delivery='separate' (from step args) sends one message per recipient;
+    default (combined) joins all addresses in a single To: header.
     IPI-based routing injection is structurally impossible.
     """
     store, policy, state, config = ctx.store, ctx.policy, ctx.state, ctx.config
     body_slot = args["body_slot"]
+    delivery  = args.get("delivery", "combined")
 
     if not store.is_written(body_slot):
         return _terminal_error(f"body_slot '{body_slot}' not written", store)
@@ -568,36 +644,55 @@ async def _handle_send_summary(args: dict, ctx: _StepContext) -> tuple[str, dict
             store,
         )
 
-    recipient_lval, subject_lval = _routing_recipient_subject(routing)
-    # No domain whitelist check here: send_summary recipient comes directly from the
-    # task string (never from a fetched email), so its domain is already operator-trusted.
-    # send_reply adds a domain check because the recipient is derived from an email fetch.
+    subject_lval = LVal(routing["subject"], Label.T_pub())
     body_lval = _bridge_body(policy, _declassify_for_send(
         policy, store.read(body_slot), field=body_slot, routing=routing,
-        who="recipient", not_from="fetched content", domain_checked=False,
+        who="recipient", not_from="fetched content",
     ))
 
-    _gate_email_action(policy, "send_summary", recipient_lval, subject_lval, body_lval)
+    recipients = _addr_list(routing["recipient"])
+    groups     = [[r] for r in recipients] if delivery == "separate" else [recipients]
+    body_str   = str(body_lval.value)
 
-    try:
-        await _gmail_send(
-            recipient_lval.value, subject_lval.value,
-            str(body_lval.value), config.google_token, state,
-        )
-    except GmailSendError as exc:
-        return _terminal_error(str(exc), store)
+    sent: list[str] = []
 
-    _trace.emit(_trace.EvActionFired(
-        recipient=recipient_lval.value, recipient_label=str(recipient_lval.label),
-        subject=subject_lval.value, subject_label=str(subject_lval.label),
-        body_chars=len(str(body_lval.value)), body_label=str(body_lval.label),
-        body_preview=str(body_lval.value)[:120],
-    ))
+    for gi, group in enumerate(groups):
+        to_header      = _addr_header(group)
+        recipient_lval = LVal(to_header, Label.T_pub())
+        _gate_email_action(policy, "send_summary", recipient_lval, subject_lval, body_lval)
+        try:
+            await _gmail_send(
+                to_header, subject_lval.value,
+                body_str, config.google_token, state,
+            )
+        except GmailSendError as exc:
+            if sent:
+                reason = (
+                    f"send failed for {group}: {exc}. "
+                    f"Already sent to {sent!r}. Do not retry — partial delivery occurred."
+                )
+            else:
+                reason = f"send failed for {group}: {exc}"
+            unsent = [a for g in groups[gi:] for a in g]
+            err_dict = {
+                "status": "error", "reason": reason,
+                "sent": sent, "unsent": unsent,
+                "slot_inventory": store.inventory(),
+            }
+            return json.dumps(err_dict), err_dict
+        sent.extend(group)
+        _trace.emit(_trace.EvActionFired(
+            recipient=to_header, recipient_label=str(recipient_lval.label),
+            subject=subject_lval.value, subject_label=str(subject_lval.label),
+            body_chars=len(body_str), body_label=str(body_lval.label),
+            body_preview=body_str[:120],
+        ))
 
     state.record_step("SendSummary")
-    return json.dumps({"status": "delivered"}), _email_action_result(
-        store, recipient_lval, subject_lval, body_lval,
-    )
+    all_recipients_lval = LVal(_addr_header(recipients), Label.T_pub())
+    final = _email_action_result(store, all_recipients_lval, subject_lval, body_lval)
+    final["sent"] = sent
+    return json.dumps({"status": "delivered", "sent": sent}), final
 
 
 async def _handle_send_reply(args: dict, ctx: _StepContext) -> tuple[str, dict | None]:
@@ -623,17 +718,11 @@ async def _handle_send_reply(args: dict, ctx: _StepContext) -> tuple[str, dict |
         return _terminal_error("GOOGLE_ACCESS_TOKEN not set (send_reply requires Gmail)", store)
 
     recipient_lval, subject_lval = _routing_recipient_subject(routing)
-    if reason := _check_domain_whitelist(
-        routing["recipient"], [_email_domain(routing["recipient"])],
-        "invalid recipient in routing — driver.run() pre-commitment error",
-        "trusted_reply_domains",
-    ):
-        return _terminal_error(reason, store)
 
     raw_body = store.read(body_slot)
     body_lval = _bridge_body(policy, _declassify_for_send(
         policy, raw_body, field=body_slot, routing=routing,
-        who="recipient", not_from="email content", domain_checked=True, always=True,
+        who="recipient", not_from="email content", always=True,
     ))
 
     _gate_email_action(policy, "send_reply", recipient_lval, subject_lval, body_lval)
@@ -642,6 +731,7 @@ async def _handle_send_reply(args: dict, ctx: _StepContext) -> tuple[str, dict |
         await _gmail_send(
             recipient_lval.value, subject_lval.value,
             str(body_lval.value), config.google_token, state,
+            body_slot=body_slot,
         )
     except GmailSendError as exc:
         return _terminal_error(str(exc), store)
@@ -679,24 +769,17 @@ async def _handle_schedule_meeting(args: dict, ctx: _StepContext) -> tuple[str, 
     if routing is None:
         return _terminal_error(_ROUTING_MISSING, store)
 
-    attendee_lval = LVal(routing["attendee"],      Label.T_pub())
+    attendee_raw  = routing["attendee"]
+    attendee_lval = LVal(_addr_header(attendee_raw), Label.T_pub())
     subject_lval  = LVal(routing["reply_subject"], Label.T_pub())
     event_title   = routing["event_title"]
     calendar_id   = str(routing.get("calendarId", "primary"))
     google_token  = ctx.config.google_token
-    trusted_domains = [_email_domain(routing["attendee"])]
-
-    if reason := _check_domain_whitelist(
-        routing["attendee"], trusted_domains,
-        "invalid attendee in routing — driver.run() pre-commitment error",
-        "trusted_attendee_domains",
-    ):
-        return _terminal_error(reason, store)
 
     raw_slots = store.read(slots_slot)
     slots_declassified = _declassify_for_send(
         policy, raw_slots, field=slots_slot, routing=routing,
-        who="attendee", not_from="fetched content", domain_checked=True, always=True,
+        who="attendee", not_from="fetched content", always=True,
     )
 
     try:
@@ -719,8 +802,8 @@ async def _handle_schedule_meeting(args: dict, ctx: _StepContext) -> tuple[str, 
     policy.before_action("schedule_meeting", "subject",  subject_lval,  Role.ROUTING)
 
     _trace.emit(_trace.EvMeetingOptionsReady(
-        attendee=routing["attendee"], event_title=event_title,
-        proposed_slots=proposed_slots, trusted_domains=trusted_domains,
+        attendee=_addr_header(attendee_raw), event_title=event_title,
+        proposed_slots=proposed_slots,
     ))
 
     choice = await ctx.confirm_slot(proposed_slots)
@@ -767,7 +850,7 @@ async def _handle_schedule_meeting(args: dict, ctx: _StepContext) -> tuple[str, 
                         "summary":   event_title,
                         "start":     {"dateTime": chosen_slot["start"]},
                         "end":       {"dateTime": chosen_slot["end"]},
-                        "attendees": [{"email": routing["attendee"]}],
+                        "attendees": [{"email": a} for a in _addr_list(attendee_raw)],
                     },
                 )
             if cal_resp.status_code not in (200, 201):
@@ -781,12 +864,22 @@ async def _handle_schedule_meeting(args: dict, ctx: _StepContext) -> tuple[str, 
             await _gmail_send(
                 attendee_lval.value, subject_lval.value,
                 str(body_lval.value), google_token, state,
+                body_slot=slots_slot,  # thread into the fetched meeting-request email
             )
         except GmailSendError as exc:
-            return _terminal_error(str(exc), store)
+            # Calendar event may already exist — surface it so the operator does not retry blindly.
+            detail = str(exc)
+            if event_id:
+                detail = (
+                    f"{detail}. Calendar event already created (event_id={event_id!r}). "
+                    f"Do not retry — invite exists; reply was not sent."
+                )
+            return _terminal_error(
+                detail, store, event_id=event_id, event_link=event_link,
+            )
 
     _trace.emit(_trace.EvMeetingScheduled(
-        attendee=attendee_lval.value, attendee_label=str(attendee_lval.label),
+        attendee=_addr_header(attendee_raw), attendee_label=str(attendee_lval.label),
         event_title=event_title,
         start_time=chosen_slot["start"] if chosen_slot else "",
         end_time=chosen_slot["end"] if chosen_slot else "",
@@ -995,11 +1088,35 @@ _DRIVER_ROUTING_FIELDS: dict[str, list[str]] = {
 }
 
 
+def routing_block_for(plan: dict) -> dict | None:
+    """
+    Extract the routing block from a single sub-plan (must have 'steps') without executing it.
+
+    Returns None if the driver tool has no routing fields.
+    Raises ValueError for a pipelines-shaped plan or if any required routing field is missing.
+    """
+    if "pipelines" in plan:
+        raise ValueError("routing_block_for requires a single sub-plan, not a pipelines-shaped plan")
+    driver_step = plan["steps"][-1] if plan.get("steps") else {}
+    driver_tool = driver_step.get("tool", "")
+    driver_args = driver_step.get("args", {})
+    keys = _DRIVER_ROUTING_FIELDS.get(driver_tool, [])
+    if not keys:
+        return None
+    missing = [k for k in keys if k not in driver_args]
+    if missing:
+        raise ValueError(
+            f"routing_block_for: {driver_tool} missing required routing fields: {missing}"
+        )
+    return {k: driver_args[k] for k in keys}
+
+
 async def run(
     task: str, plan: dict, store: SlotStore, policy: IronFlow,
     *,
     google_token: str = "",
     confirm_slot: Callable[[list[dict]], Awaitable[int]] = _default_confirm_slot,
+    routing: dict | None = None,
 ) -> dict:
     """
     Execute a validated manifest produced by generate_plan().
@@ -1024,24 +1141,49 @@ async def run(
         config=config, confirm_slot=confirm_slot,
     )
 
-    driver_step = plan["steps"][-1]
-    driver_tool = driver_step.get("tool", "")
-    driver_args = driver_step.get("args", {})
-    if routing_keys := _DRIVER_ROUTING_FIELDS.get(driver_tool, []):
-        routing_block: dict[str, object] = {
-            k: driver_args[k] for k in routing_keys if k in driver_args
-        }
-        missing = [k for k in routing_keys if k not in routing_block]
-        if missing:
-            return _pipeline_error(
-                f"{driver_tool} missing required routing fields: {missing}", policy, store
-            )
-        state.set_var("_routing", LVal(routing_block, Label.T_pub()))
-        _trace.emit(_trace.EvRoutingLocked(driver_tool=driver_tool, routing=routing_block))
+    driver_step  = plan["steps"][-1]
+    driver_tool  = driver_step.get("tool", "")
+    emit_locked  = routing is None   # only emit EvRoutingLocked when we extract it here
 
-    _trace.emit(_trace.EvDriverStart(task=task))
+    if routing is None:
+        # Single-plan path: extract routing from the manifest step args.
+        driver_args  = driver_step.get("args", {})
+        routing_keys = _DRIVER_ROUTING_FIELDS.get(driver_tool, [])
+        if routing_keys:
+            missing = [k for k in routing_keys if k not in driver_args]
+            if missing:
+                return _pipeline_error(
+                    f"{driver_tool} missing required routing fields: {missing}", policy, store,
+                )
+            routing = {k: driver_args[k] for k in routing_keys}
+
+    if routing is not None:
+        locked: dict[str, object] = _freeze_routing(routing)
+        state.set_var("_routing", LVal(locked, Label.T_pub()))
+        if emit_locked:
+            _trace.emit(_trace.EvRoutingLocked(driver_tool=driver_tool, routing=locked))
 
     steps    = plan["steps"]
+
+    # Build static provenance: maps each processor output slot to its email-search
+    # ancestor slot so _gmail_send can resolve _email_thread_meta_<email_slot>.
+    # Transitive: handles chained processors (processor reads another processor's output).
+    email_slot_for: dict[str, str] = {}
+    for step in steps:
+        tool = step.get("tool", "")
+        if tool == "mcp_email_search":
+            sid = step["args"]["slot_id"]
+            email_slot_for[sid] = sid
+        elif tool == "spawn_processor":
+            out = step["args"]["out_slot"]
+            for r in step["args"].get("reads", []):
+                if r in email_slot_for:
+                    email_slot_for[out] = email_slot_for[r]
+                    break
+    if email_slot_for:
+        state.set_var("_thread_source", LVal(email_slot_for, Label.T_pub()))
+
+    _trace.emit(_trace.EvDriverStart(task=task))
     pos      = 0
     step_num = 0
     while pos < len(steps):
@@ -1059,6 +1201,8 @@ async def run(
                 _, final = await _dispatch(step["tool"], step["args"], ctx)
             except IronFlowViolation as exc:
                 return _pipeline_error(f"policy violation: {exc}", policy, store)
+            except ConfirmationRequired:
+                raise
             except Exception as exc:
                 return _pipeline_error(str(exc), policy, store)
             finals = [final] if final is not None else []
@@ -1075,6 +1219,8 @@ async def run(
                 step_num += 1
                 try:
                     raw.append(await _dispatch(s["tool"], s["args"], ctx))
+                except ConfirmationRequired:
+                    raise
                 except Exception as e:
                     raw.append(e)
             finals = []
@@ -1097,3 +1243,85 @@ async def run(
             return final
 
     return _pipeline_error("manifest completed without terminal step", policy, store)
+
+
+async def run_manifest(
+    task: str,
+    plan: dict,
+    *,
+    google_token: str = "",
+    confirm_slot: Callable[[list[dict]], Awaitable[int]] = _default_confirm_slot,
+) -> dict:
+    """
+    Execute a validated manifest for both single-plan and multi-pipeline shapes.
+
+    For multi-pipeline plans, pre-extracts and emits ALL routing blocks before any
+    SlotStore is constructed, making the "all routing locked before step 0" guarantee
+    structural rather than audit-narrative. Violations from each pipeline are hoisted
+    into the aggregate result so POLICY_VIOLATION exit codes propagate correctly.
+
+    Timeout is the caller's responsibility — wrap this coroutine with asyncio.wait_for.
+    Single-plan manifests delegate to run(); if the result is not success but already
+    committed world side effects (sent / event_id), do_not_retry=True is attached.
+    """
+    sub_plans = plan.get("pipelines")
+
+    if sub_plans is None:
+        store  = SlotStore()
+        policy = IronFlow(store)
+        result = await run(task, plan, store, policy,
+                           google_token=google_token, confirm_slot=confirm_slot)
+        if result.get("status") != "success" and _world_action_committed(result):
+            result = {**result, "do_not_retry": True}
+        return result
+
+    # Pre-extract ALL routing blocks before constructing any SlotStore.
+    routing_blocks: list[dict | None] = []
+    for sub in sub_plans:
+        try:
+            rb = routing_block_for(sub)
+        except ValueError as exc:
+            return {"status": "error", "reason": str(exc), "violations": [], "actions": []}
+        routing_blocks.append(rb)
+
+    # Emit all EvRoutingLocked events before the first pipeline executes.
+    for idx, (sub, rb) in enumerate(zip(sub_plans, routing_blocks)):
+        if rb is not None:
+            driver_tool = sub["steps"][-1].get("tool", "")
+            locked_rb   = _freeze_routing(rb)
+            _trace.emit(_trace.EvRoutingLocked(
+                driver_tool=driver_tool,
+                routing=locked_rb,
+                pipeline=idx,
+            ))
+
+    results:    list[dict] = []
+    violations: list      = []
+
+    for sub, rb in zip(sub_plans, routing_blocks):
+        store  = SlotStore()
+        policy = IronFlow(store)
+        sub_result = await run(task, sub, store, policy,
+                               google_token=google_token, confirm_slot=confirm_slot, routing=rb)
+        results.append(sub_result)
+        violations.extend(sub_result.get("violations", []))
+
+    statuses = [r.get("status") for r in results]
+    if all(s == "success" for s in statuses):
+        agg_status = "success"
+    elif all(s == "error" for s in statuses):
+        agg_status = "error"
+    else:
+        agg_status = "partial"
+
+    # Any irreversible side effect means blind retry is unsafe — even on status=error.
+    do_not_retry = (
+        any(_world_action_committed(r) for r in results) and agg_status != "success"
+    )
+
+    return {
+        "status": agg_status,
+        "actions": results,
+        "violations": violations,
+        "do_not_retry": do_not_retry,
+    }

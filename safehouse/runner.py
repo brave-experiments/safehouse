@@ -340,16 +340,43 @@ def _find_mime_part(part: dict, mime_type: str) -> str:
     return ""
 
 
+def _sanitize_rfc_msg_id(value: str) -> str:
+    """
+    Return a single RFC 5322 msg-id suitable for In-Reply-To / References, or "".
+
+    Rejects CR/LF (header injection) and values that are not a bracketed msg-id.
+    Used only for MIME threading headers — never for routing fields.
+    """
+    v = (value or "").strip()
+    if not v or "\r" in v or "\n" in v:
+        return ""
+    if not v.startswith("<"):
+        v = f"<{v}>"
+    # msg-id = "<" id-left "@" id-right ">" — keep permissive on internals, strict on shape.
+    if not re.fullmatch(r"<[^<>\s]+@[^<>\s]+>", v):
+        return ""
+    return v
+
+
+def _sanitize_references(value: str) -> str:
+    """Keep only well-formed msg-ids from a References header; drop junk / injections."""
+    if not value or "\r" in value or "\n" in value:
+        return ""
+    ids = re.findall(r"<[^<>\s]+@[^<>\s]+>", value)
+    return " ".join(ids)
+
+
 def _gmail_parse_message(msg: dict) -> dict:
     """
-    Parse a Gmail messages.get response into {from, subject, date, body, thread_id}.
+    Parse a Gmail messages.get response into {from, subject, date, body, thread_id,
+    message_id, references}.
     Deterministic — no LLM.
 
-    thread_id  — Gmail thread identifier (top-level field from the API response).
-                 Assigned by Gmail, not the sender — safe to trust for reply threading.
-    message_id — intentionally excluded: it is the RFC 2822 Message-ID header,
-                 written by the sender (attacker-controlled). Only thread_id
-                 (Gmail envelope field) is used.
+    thread_id   — Gmail thread identifier (API envelope field, provider-assigned).
+    message_id  — RFC 5322 Message-ID header. Sender-written, so it is NOT used for
+                  routing. It is required for In-Reply-To / References so the
+                  recipient's client threads the reply (threadId alone is not enough).
+    references  — existing References chain from the fetched message, if any.
 
     Body extraction priority:
       1. text/plain  — used as-is; no stripping needed.
@@ -372,13 +399,17 @@ def _gmail_parse_message(msg: dict) -> dict:
             return _html.unescape(re.sub(r"<[^>]+>", " ", html_body)).strip()
         return msg.get("snippet", "")
 
+    message_id = _sanitize_rfc_msg_id(hdrs.get("message-id", ""))
+    references = _sanitize_references(hdrs.get("references", ""))
+
     return {
-        "from":       hdrs.get("from",       "(unknown)"),
-        "subject":    hdrs.get("subject",     "(no subject)"),
-        "date":       hdrs.get("date",        "(unknown)"),
-        "body":       _decode_body(payload),
-        "thread_id":  msg.get("threadId",     ""),
-        # message_id omitted — sender-controlled (RFC 2822 header).
+        "from":        hdrs.get("from",       "(unknown)"),
+        "subject":     hdrs.get("subject",     "(no subject)"),
+        "date":        hdrs.get("date",        "(unknown)"),
+        "body":        _decode_body(payload),
+        "thread_id":   msg.get("threadId",     ""),
+        "message_id":  message_id,
+        "references":  references,
     }
 
 
@@ -400,12 +431,16 @@ async def run_mcp_email_search(
     Step 2 — GET /gmail/v1/users/me/messages/{id}?format=full per result.
     Step 3 — Deterministic parser extracts headers + body.
 
-    Returns thread_meta dict containing thread_id — for use by send_reply to
-    thread the outgoing reply correctly. Comes from the Gmail API (operator code),
-    not from the email body, so the caller may treat it as (T,pub).
+    Returns thread_meta dict for send_reply threading:
+      thread_id   — Gmail envelope id (provider-assigned)
+      message_id  — sanitized RFC Message-ID (for In-Reply-To / References only)
+      references  — prior References chain (sanitized)
+      subject     — original Subject (slot display only; driver does not store or
+                    send it — Subject on the wire is the gated (T,pub) routing value)
 
     Auth: google_token (gmail.readonly scope required).
     The From address MUST NOT reach any routing field without driver validation.
+    message_id from headers is NEVER used as routing — only as MIME threading.
     """
     auth  = _google_auth_headers(google_token)
     limit = int(filter_params.get("limit", 1))
@@ -460,7 +495,7 @@ async def run_mcp_email_search(
             # No results is a valid API response — write an informative slot so
             # spawn_processor can report "nothing found" rather than crashing.
             writer.write(f"(no messages found for query: {query!r})")
-            return {"thread_id": ""}
+            return {"thread_id": "", "message_id": "", "references": "", "subject": ""}
 
         msg_urls: list[str] = []
         for msg_id in message_ids:
@@ -494,7 +529,13 @@ async def run_mcp_email_search(
 
     writer.write(content)
 
-    return {"thread_id": emails[0]["thread_id"] if emails else ""}
+    first = emails[0] if emails else {}
+    return {
+        "thread_id":  first.get("thread_id", ""),
+        "message_id": first.get("message_id", ""),
+        "references": first.get("references", ""),
+        "subject":    first.get("subject", ""),
+    }
 
 
 # ── run_mcp_calendar_search ────────────────────────────────────────────

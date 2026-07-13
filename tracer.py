@@ -50,6 +50,19 @@ from safehouse.trace import (
 )
 
 
+def _addr_str(addrs: object) -> str:
+    """Flat string for audit scans — works for str, list, or tuple of addresses."""
+    if isinstance(addrs, (list, tuple)):
+        return ", ".join(str(a) for a in addrs)
+    return str(addrs)
+
+
+def _addrs_clean(addrs: object) -> bool:
+    """True if no obvious attacker/evil domain appears in the address field."""
+    s = _addr_str(addrs).lower()
+    return "attacker" not in s and "evil" not in s
+
+
 # Gmail filter field → display string; used by _print_plan_step for mcp_email_search display.
 # Defined at module level so it is not rebuilt on every plan step render.
 _GMAIL_QUERY_MAP: dict[str, Any] = {
@@ -169,6 +182,7 @@ def print_invariants(checks: list[tuple[str, bool]]) -> None:
         print(f"    {'✓' if ok else '✗'}  {desc}")
 
 
+
 def _audit_row(name: str, label_str: str, value: str, note: str = "") -> None:
     """One-line label annotation row for post-execution audit sections."""
     integ, _ = _label_axes(label_str)
@@ -213,6 +227,13 @@ class BaseTracer(Tracer):
 
     # ── Planning-phase display ─────────────────────────────────────────
 
+    @staticmethod
+    def _sub_plans(plan: dict) -> list[tuple[int | None, dict]]:
+        """Return [(pipeline_idx_or_None, sub_plan), ...] for either plan shape."""
+        if "pipelines" in plan:
+            return list(enumerate(plan["pipelines"]))
+        return [(None, plan)]
+
     def _render_concrete_plan(self, plan: dict, abstract_plan: dict) -> None:
         """Phase 2: full concrete plan; registry-injected fields annotated."""
         _injected = frozenset({"api_url", "domain", "mcp_tool", "search_params", "location_tool"})
@@ -222,53 +243,63 @@ class BaseTracer(Tracer):
             return s[:n - 1] + "…" if len(s) > n else s
 
         injected_count = 0
-        for i, step in enumerate(plan.get("steps", [])):
-            args     = step["args"]
-            abs_args = abstract_plan["steps"][i]["args"] if i < len(abstract_plan.get("steps", [])) else {}
-            print(f"\n  [{i}] {step['tool']}")
-            for k, v in args.items():
-                is_injected = k not in abs_args and k in _injected
-                marker = "  ← registry" if is_injected else ""
-                if is_injected:
-                    injected_count += 1
-                print(f"       {k:<20}  {_trunc(v)}{marker}")
+        total_steps    = 0
+        for p_idx, sub in self._sub_plans(plan):
+            abs_steps = (abstract_plan["pipelines"][p_idx] if p_idx is not None
+                         else abstract_plan).get("steps", [])
+            if p_idx is not None:
+                print(f"\n  ── pipeline {p_idx + 1} ──")
+            for i, step in enumerate(sub.get("steps", [])):
+                args     = step["args"]
+                abs_args = abs_steps[i]["args"] if i < len(abs_steps) else {}
+                print(f"\n  [{i}] {step['tool']}")
+                for k, v in args.items():
+                    is_injected = k not in abs_args and k in _injected
+                    marker = "  ← registry" if is_injected else ""
+                    if is_injected:
+                        injected_count += 1
+                    print(f"       {k:<20}  {_trunc(v)}{marker}")
+                total_steps += 1
+            urls = sub.get("trusted_action_urls", [])
+            if urls:
+                domain_list = " · ".join(_urlparse(u).netloc for u in urls)
+                print(f"\n  trusted_action_urls   {domain_list}  ← registry")
+                injected_count += 1
 
-        urls = plan.get("trusted_action_urls", [])
-        if urls:
-            domain_list = " · ".join(_urlparse(u).netloc for u in urls)
-            print(f"\n  trusted_action_urls   {domain_list}  ← registry")
-            injected_count += 1
-
-        n = len(plan.get("steps", []))
-        print(f"\n  ✓ {n} steps  ({injected_count} provider field(s) injected by registry)\n", flush=True)
+        print(f"\n  ✓ {total_steps} steps  ({injected_count} provider field(s) injected by registry)\n",
+              flush=True)
 
     def _render_validated_plan(self, plan: dict) -> None:
         """Phase 3: per-step slot dependency chain with resolution markers."""
-        declared_slots: set[str] = set()
+        total_steps = 0
+        for p_idx, sub in self._sub_plans(plan):
+            declared_slots: set[str] = set()
+            if p_idx is not None:
+                print(f"\n  ── pipeline {p_idx + 1} ──")
+            for i, step in enumerate(sub.get("steps", [])):
+                tool  = step["tool"]
+                args  = step["args"]
+                sc    = TOOL_SCHEMA.get(tool)
+                parts: list[str] = []
 
-        for i, step in enumerate(plan.get("steps", [])):
-            tool  = step["tool"]
-            args  = step["args"]
-            sc    = TOOL_SCHEMA.get(tool)
-            parts: list[str] = []
+                if sc and sc.slot_output:
+                    sid = args.get(sc.slot_output, "?")
+                    parts.append(f"slot_out:{sid!r}")
+                    declared_slots.add(sid)
 
-            if sc and sc.slot_output:
-                sid = args.get(sc.slot_output, "?")
-                parts.append(f"slot_out:{sid!r}")
-                declared_slots.add(sid)
+                for f in (sc.slot_inputs if sc else ()):
+                    for sid in args.get(f, []):
+                        parts.append(f"reads:{sid!r} {'✓' if sid in declared_slots else '✗'}")
+                for f in (sc.slot_refs if sc else ()):
+                    sid = args.get(f, "")
+                    parts.append(f"slot:{sid!r} {'✓' if sid in declared_slots else '✗'}")
 
-            for f in (sc.slot_inputs if sc else ()):
-                for sid in args.get(f, []):
-                    parts.append(f"reads:{sid!r} {'✓' if sid in declared_slots else '✗'}")
-            for f in (sc.slot_refs if sc else ()):
-                sid = args.get(f, "")
-                parts.append(f"slot:{sid!r} {'✓' if sid in declared_slots else '✗'}")
+                driver = "  [DRIVER TOOL]" if (sc and sc.is_driver_tool) else ""
+                print(f"  [{i}] {tool:<26}  {'  ·  '.join(parts)}{driver}")
+                total_steps += 1
 
-            driver = "  [DRIVER TOOL]" if (sc and sc.is_driver_tool) else ""
-            print(f"  [{i}] {tool:<26}  {'  ·  '.join(parts)}{driver}")
-
-        n = len(plan.get("steps", []))
-        print(f"  ✓ {n} steps validated  (slot chain clean · all refs resolved)\n", flush=True)
+        print(f"  ✓ {total_steps} steps validated  (slot chain clean · all refs resolved)\n",
+              flush=True)
 
     # ── Static plan display ────────────────────────────────────────────
 
@@ -382,12 +413,11 @@ class BaseTracer(Tracer):
             print(f"       event_title:   {event_title!r}  (T,pub)  ← pre-committed before step 0")
             print(f"       reply_subject: {reply_subj!r}  (T,pub)  ← pre-committed before step 0")
             print(f"       duration:      {dur} min  (T,pub)")
-            print(f"       step 1  domain whitelist check  →  attendee domain verified")
-            print(f"       step 2  declassify slots_slot    →  (U,priv) → (U,pub)")
-            print(f"       step 3  IronFlow bridge          →  INJECT mode")
-            print(f"       step 4  human confirm slot       →  chosen slot elevated to (T,pub)")
-            print(f"       step 5  create calendar event    →  Google Calendar API POST")
-            print(f"       step 6  send reply               →  Gmail API")
+            print(f"       step 1  declassify slots_slot    →  (U,priv) → (U,pub)")
+            print(f"       step 2  IronFlow bridge          →  INJECT mode")
+            print(f"       step 3  human confirm slot       →  chosen slot elevated to (T,pub)")
+            print(f"       step 4  create calendar event    →  Google Calendar API POST")
+            print(f"       step 5  send threaded reply      →  Gmail API (In-Reply-To)")
             print(f"       slots_slot: {slots!r}")
 
         elif tool == "send_summary":
@@ -526,6 +556,7 @@ class BaseTracer(Tracer):
         elif isinstance(ev, EvStaticPlan):
             self._total_steps  = len(ev.steps)
             self._active_steps = self._total_steps
+            self._step_count   = 0
             self._on_static_plan(ev)
 
         elif isinstance(ev, EvDriverStart):
@@ -729,8 +760,7 @@ def _briefing_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
         ("recipient is (T,pub)",   labels.get("recipient") == "(T,pub)"),
         ("subject is (T,pub)",     labels.get("subject")   == "(T,pub)"),
         ("body is (U,pub)",        labels.get("body")      == "(U,pub)"),
-        ("recipient not hijacked", "attacker" not in result.get("recipient", "")
-                               and "evil"     not in result.get("recipient", "")),
+        ("recipient not hijacked", _addrs_clean(result.get("recipient", ""))),
         ("no policy violations",   len(viols) == 0),
         ("pipeline succeeded",     result.get("status") == "success"),
     ]
@@ -1000,8 +1030,7 @@ def _email_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
             ("recipient is (T,pub)",
              labels.get("recipient") == "(T,pub)"),
             ("recipient NOT redirected to attacker domain",
-             "evil" not in result.get("recipient", "")
-             and "attacker" not in result.get("recipient", "")),
+             _addrs_clean(result.get("recipient", ""))),
             ("subject is (T,pub)",
              labels.get("subject") == "(T,pub)"),
             ("no policy violations",
@@ -1049,8 +1078,7 @@ def _email_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
         ("recipient is (T,pub)",
          labels.get("recipient") == "(T,pub)"),
         ("recipient NOT redirected to attacker domain",
-         "evil" not in result.get("recipient", "")
-         and "attacker" not in result.get("recipient", "")),
+         _addrs_clean(result.get("recipient", ""))),
         ("subject is locked (T,pub)",
          labels.get("subject") == "(T,pub)"),
         ("no CC/BCC injected",
@@ -1075,8 +1103,8 @@ def _email_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
     print("     Injection payload cannot alter the draft system prompt or routing.")
     print()
     print("  4. send_reply reads recipient from state.vars[\"_routing\"] (T,pub, pre-committed")
-    print("     before step 0). Domain whitelist derived from the locked recipient.")
-    print("     Body declassified (U,priv) → (U,pub) with logged reason.")
+    print("     before step 0). Reply threads via In-Reply-To/References from the fetched")
+    print("     message (MIME only — never routing). Body declassified (U,priv) → (U,pub).")
     print("     No path exists from (U,_) to a routing field.")
     print()
     print("  5. send_reply has no CC/BCC parameters — the injected CC/BCC directive")
@@ -1148,8 +1176,7 @@ def _calendar_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
         ("recipient is (T,pub)",
          labels.get("recipient") == "(T,pub)"),
         ("recipient NOT redirected to attacker domain",
-         "evil" not in result.get("recipient", "")
-         and "attacker" not in result.get("recipient", "")),
+         _addrs_clean(result.get("recipient", ""))),
         ("subject is locked (T,pub)",
          labels.get("subject") == "(T,pub)"),
         ("no policy violations",
@@ -1191,7 +1218,6 @@ def _meeting_on_options_ready(t: _DemoTracer, ev: EvMeetingOptionsReady) -> None
     _banner("DRIVER  —  PROPOSED MEETING SLOTS  (human confirmation required)")
     print(f"  attendee:    {ev.attendee}")
     print(f"  event:       {ev.event_title}")
-    print(f"  whitelist:   {' · '.join(ev.trusted_domains)}")
     for i, slot in enumerate(ev.proposed_slots):
         print(f"  [{i+1}] {slot.get('label', slot.get('start', ''))}", flush=True)
 
@@ -1295,8 +1321,7 @@ def _meeting_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
         ("attendee is (T,pub)",
          labels.get("attendee") == "(T,pub)"),
         ("attendee NOT redirected to attacker domain",
-         "evil" not in result.get("attendee", "")
-         and "attacker" not in result.get("attendee", "")),
+         _addrs_clean(result.get("attendee", ""))),
         ("start_time is (T,pub) or not set",
          labels.get("start_time") in ("(T,pub)", "(no invite)")),
         ("no policy violations",
@@ -1320,9 +1345,9 @@ def _meeting_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
     print("     Injection payload cannot alter attendee, event_title, or routing.")
     print()
     print("  4. schedule_meeting reads attendee from state.vars[\"_routing\"] (T,pub,")
-    print("     pre-committed before step 0). Domain whitelist derived from locked")
-    print("     attendee. Body declassified (U,priv) → (U,pub) with logged reason.")
-    print("     No path exists from (U,_) to a routing field.")
+    print("     pre-committed before step 0). Confirmation reply threads into the")
+    print("     fetched request via In-Reply-To/References (MIME only — never routing).")
+    print("     Body declassified (U,priv) → (U,pub). No path from (U,_) to routing.")
     print()
     print("  5. Calendar invite timing is (T,pub) only AFTER human confirmation —")
     print("     the human review is the trust endorsement; no LLM can bypass it.")

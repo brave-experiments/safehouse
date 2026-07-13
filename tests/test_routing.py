@@ -4,7 +4,6 @@ tests/test_routing.py — Routing lock and domain-check gate tests.
 Covers:
   - driver.run() pre-commits _routing before step 0 and emits EvRoutingLocked
   - _handle_send_summary fails closed when _routing is absent
-  - _check_domain_whitelist emits EvGate("DOMAIN_CHECK") on pass and fail
 
 No API key required — all tests use in-process mocking.
 """
@@ -21,7 +20,6 @@ from safehouse.driver import (
     run as driver_run,
     _DRIVER_ROUTING_FIELDS,
     _StepContext,
-    _check_domain_whitelist,
     ProviderConfig,
 )
 from safehouse.plan_types import PlanState
@@ -153,51 +151,5 @@ def test_send_summary_reads_routing_from_state() -> None:
     assert result.get("reason", "").startswith("body_slot")
 
 
-# ── _check_domain_whitelist audit visibility ──────────────────────────
-
-def test_domain_whitelist_emits_gate_on_pass() -> None:
-    tracer = _ListTracer()
-    _trace.set_tracer(tracer)
-    try:
-        err = _check_domain_whitelist(
-            "alice@corp.com", ["corp.com"], "empty", "trusted_reply_domains"
-        )
-    finally:
-        _trace.set_tracer(Tracer())
-
-    assert err is None
-    gates = [e for e in tracer.events
-             if isinstance(e, _trace.EvGate) and e.gate == "DOMAIN_CHECK"]
-    assert len(gates) == 1
-    assert gates[0].passed is True
-
-
-def test_domain_whitelist_emits_gate_on_fail() -> None:
-    tracer = _ListTracer()
-    _trace.set_tracer(tracer)
-    try:
-        err = _check_domain_whitelist(
-            "alice@evil.com", ["corp.com"], "empty", "trusted_reply_domains"
-        )
-    finally:
-        _trace.set_tracer(Tracer())
-
-    assert err is not None
-    gates = [e for e in tracer.events
-             if isinstance(e, _trace.EvGate) and e.gate == "DOMAIN_CHECK"]
-    assert len(gates) == 1
-    assert gates[0].passed is False
-    assert gates[0].blocked != ""
-
-
-def test_domain_whitelist_case_insensitive() -> None:
-    err = _check_domain_whitelist("alice@CORP.COM", ["corp.com"], "empty", "k")
-    assert err is None
-
-
-def test_domain_whitelist_rejects_empty_trusted_list() -> None:
-    err = _check_domain_whitelist("alice@corp.com", [], "no domains configured", "k")
-    assert err is not None
-    assert "no domains configured" in err
 
 

@@ -121,13 +121,15 @@ class MCPSpec:
 # Default filter description for REST sub-agents that don't supply their own.
 # Describes the two usage patterns for mcp_email_search; mcp_calendar_search overrides this.
 _DEFAULT_FILTER_DESCRIPTION = (
-    "Pattern A — single-sender/act-on-one: set from + limit "
-    "(limit=1 for latest; limit=5 to identify one among recent candidates). "
-    "Add subject_contains ONLY if task explicitly names a keyword — never guess. "
-    "Pattern B — broad/summarise-all: omit from; use q only if task names a keyword; "
-    "set limit 100+; let spawn_processor identify relevant emails. "
-    "Fields: from, subject_contains, is_unread, has_attachment, "
-    "after_date, before_date, label, q, limit (default 3)"
+    "Use q (Gmail search syntax) as the primary filter field — it is fully general. "
+    "Examples: q='from:alice@corp.com' (received from), q='to:alice@corp.com' (sent to), "
+    "q='from:alice@corp.com in:sent' (your sent mail to alice), "
+    "q='subject:invoice has:attachment'. "
+    "Set limit=1 for the latest message; limit=5–10 to surface candidates for a processor. "
+    "Named shorthand fields (from, subject_contains, is_unread, has_attachment, "
+    "after_date, before_date, label) are also accepted and appended to q — "
+    "use q directly when the task implies sent mail or any query not covered by the named fields. "
+    "Exception: send_reply plans must set filter.from to the reply recipient (not only q)."
 )
 
 _CATALOG_CATEGORY_HEADERS: dict[str, str] = {
@@ -428,18 +430,19 @@ _CATALOG_SPECS: list[CatalogSpec] = [
     CatalogSpec(
         name        = "send_summary",
         category    = "terminal_auto",
-        description = "Send new email; body from slot. Routing (recipient, subject) pre-committed (T,pub) — never derived from slot content.",
+        description = "Send new email; body from slot. Routing (recipient, subject) pre-committed (T,pub) — never derived from slot content. recipient may be a list for multi-recipient sends.",
         args        = (
-            ArgSpec("recipient", "str", description="verbatim, must contain @"),
-            ArgSpec("subject",   "str", description="verbatim or inferred from task context"),
+            ArgSpec("recipient", "str | list[str]", description="verbatim email(s), each must contain @; list sends to multiple recipients"),
+            ArgSpec("subject",   "str",             description="verbatim or inferred from task context"),
             ArgSpec("body_slot", "str"),
+            ArgSpec("delivery",  "str", required=False, description="combined (default — one message) | separate (one message per recipient)"),
         ),
     ),
 
     CatalogSpec(
         name        = "send_reply",
         category    = "terminal_auto",
-        description = "Reply to fetched email thread; body from slot. Routing (recipient, subject) pre-committed (T,pub) — never derived from slot content.",
+        description = "Reply to fetched email thread; body from slot. Routing (recipient, subject) pre-committed (T,pub) — never derived from slot content. Exactly one recipient.",
         args        = (
             ArgSpec("recipient", "str", description="verbatim sender email, must contain @"),
             ArgSpec("subject",   "str", description="verbatim or inferred from task context"),
@@ -450,13 +453,13 @@ _CATALOG_SPECS: list[CatalogSpec] = [
     CatalogSpec(
         name        = "schedule_meeting",
         category    = "terminal_confirmed",
-        description = "Propose calendar slots, confirm with human, create event, send reply. Routing (attendee, title, subject) pre-committed (T,pub) — never derived from slot content.",
+        description = "Propose calendar slots, confirm with human, create event, send reply. Routing (attendee, title, subject) pre-committed (T,pub) — never derived from slot content. attendee may be a list.",
         args        = (
-            ArgSpec("attendee",         "str", description="verbatim email from task, must contain @"),
-            ArgSpec("event_title",      "str", description="verbatim"),
-            ArgSpec("reply_subject",    "str", description="verbatim"),
-            ArgSpec("slots_slot",       "str", description="slot written by spawn_processor with proposed_slots JSON"),
-            ArgSpec("duration_minutes", "int", required=False, description="default 60"),
+            ArgSpec("attendee",         "str | list[str]", description="verbatim email(s) from task, each must contain @"),
+            ArgSpec("event_title",      "str",             description="verbatim"),
+            ArgSpec("reply_subject",    "str",             description="verbatim"),
+            ArgSpec("slots_slot",       "str",             description="slot written by spawn_processor with proposed_slots JSON"),
+            ArgSpec("duration_minutes", "int", required=False, description="default 30"),
         ),
     ),
 

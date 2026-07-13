@@ -120,6 +120,7 @@ class EvRoutingLocked:
     """
     driver_tool: str         # e.g. "send_reply", "schedule_meeting"
     routing:     dict        # locked fields, all (T,pub)
+    pipeline:    int = -1    # -1 for single-plan; 0-based index for multi-pipeline
 
 @dataclass
 class EvMeetingOptionsReady:
@@ -131,7 +132,7 @@ class EvMeetingOptionsReady:
     attendee:        str
     event_title:     str
     proposed_slots:  list[dict]   # [{label, start, end}]
-    trusted_domains: list[str]
+    trusted_domains: list[str] = field(default_factory=list)
 
 @dataclass
 class EvMeetingConfirmation:
