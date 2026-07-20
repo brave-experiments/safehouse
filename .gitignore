@@ -32,3 +32,7 @@ data_slots/
 # Local tooling
 .claude/
 .pytest_cache/
+
+# Packaging leftovers
+build/
+dist/

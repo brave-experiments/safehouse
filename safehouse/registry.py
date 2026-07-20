@@ -30,7 +30,7 @@ Key security invariant:
 from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Literal
-from .labels import Label, Capability, CAPABILITY_LABEL
+from .labels import Capability, CAPABILITY_LABEL
 
 
 # ── Prompt schema types ────────────────────────────────────────────────────────
@@ -456,10 +456,9 @@ _CATALOG_SPECS: list[CatalogSpec] = [
         description = "Propose calendar slots, confirm with human, create event, send reply. Routing (attendee, title, subject) pre-committed (T,pub) — never derived from slot content. attendee may be a list.",
         args        = (
             ArgSpec("attendee",         "str | list[str]", description="verbatim email(s) from task, each must contain @"),
-            ArgSpec("event_title",      "str",             description="verbatim"),
-            ArgSpec("reply_subject",    "str",             description="verbatim"),
+            ArgSpec("event_title",      "str",             description="verbatim from task; if absent use a short generic title (e.g. Meeting) — never invent a name from an email local-part"),
+            ArgSpec("reply_subject",    "str",             description="verbatim or short inferred subject (e.g. Re: Meeting Request)"),
             ArgSpec("slots_slot",       "str",             description="slot written by spawn_processor with proposed_slots JSON"),
-            ArgSpec("duration_minutes", "int", required=False, description="default 30"),
         ),
     ),
 
@@ -477,6 +476,3 @@ _CATALOG_SPECS: list[CatalogSpec] = [
 ]
 
 DEFAULT_REGISTRY = ToolRegistry.from_specs(_MCP_SPECS, _CATALOG_SPECS)
-
-#
-# no current pipeline needs slot→var extraction. Re-register when a pipeline requires it.

@@ -11,8 +11,6 @@ The demo (or any other consumer) renders those events however it wants.
 from __future__ import annotations
 from contextvars import ContextVar
 from dataclasses import dataclass, field
-from typing import Any
-
 
 # ── Event types ───────────────────────────────────────────────────────
 
@@ -75,7 +73,7 @@ class EvTaint:
 @dataclass
 class EvGate:
     """An IronFlow enforcement gate fired."""
-    gate:    str    # SPAWN | NET | READ | WRITE | BRIDGE | ACTION
+    gate:    str    # PRECOMMIT | DECLASSIFY | SPAWN | NET | BRIDGE | ACTION
     who:     str    # agent_id or field name
     detail:  str
     passed:  bool
@@ -141,6 +139,18 @@ class EvMeetingConfirmation:
     chosen_index:   int    # 0-based index; -1 if cancelled
     approved:       bool
 
+
+@dataclass
+class EvActionGranted:
+    """Single-use exact-value endorsement issued after human confirmation.
+
+    Grant-required ROUTING fields (e.g. schedule_meeting start/end) may only
+    pass before_action when values match this grant; forged (T,pub) is denied.
+    """
+    tool:   str
+    fields: dict  # exact endorsed values, e.g. {"start_time": "...", "end_time": "..."}
+
+
 @dataclass
 class EvMeetingScheduled:
     """Calendar event created and reply sent by schedule_meeting."""
@@ -165,9 +175,13 @@ class EvAutoApproved:
 
     Emitted by AutoApproveConfirmer so headless --approve auto decisions
     are visible in JSONL audit logs alongside all other gate events.
+    start/end are the exact values ActionGrant will endorse — label is
+    untrusted annotation only.
     """
     slot_index: int    # always 1 — first proposed slot
-    label:      str    # human-readable slot label, e.g. "Mon 14 Jul 10:00 BST"
+    label:      str    # untrusted annotation, e.g. "Mon 14 Jul 10:00 BST"
+    start:      str = ""  # exact ISO start endorsed by ActionGrant
+    end:        str = ""  # exact ISO end endorsed by ActionGrant
 
 
 @dataclass
@@ -192,22 +206,22 @@ class EvEmailsModified:
 
 @dataclass
 class EvDeclassify:
-    """Explicit, logged declassification: (_, priv) → (_, pub).
+    """Explicit, logged confidentiality downgrade: (_,priv) → (_,pub).
 
-    Only the DRIVER may call this. The reason and preconditions fields form
-    the audit proof that the declassification is safe (typically: destination
-    was locked before the private data was fetched — robust declassification).
+    Only the DRIVER may call this. Preconditions are generated from checked
+    policy state: this exact routing state was committed before any sub-agent
+    spawn, and the source came from a write-once slot.
     """
-    field:         str         # slot_id or field name being declassified
+    field:         str         # slot_id being declassified
     label_before:  str         # e.g. "(U,priv)"
     label_after:   str         # e.g. "(U,pub)"
     authority:     str         # always "DRIVER" in current architecture
     reason:        str         # human-readable justification
-    preconditions: list[str]   # conditions that make the declassification safe
+    preconditions: list[str]   # checked evidence for destination independence
 
 @dataclass
 class EvReplyActionFired:
-    """send_reply executed — routing from locked template var (T,pub)."""
+    """send_reply executed — routing from locked `_routing` var (T,pub)."""
     recipient:        str
     recipient_label:  str
     subject:          str
@@ -256,7 +270,7 @@ Event = (
     EvGate | EvEmailSent | EvActionFired |
     EvBookingUrlsExtracted |
     EvRoutingLocked | EvDeclassify | EvReplyActionFired |
-    EvMeetingOptionsReady | EvMeetingConfirmation | EvMeetingScheduled |
+    EvMeetingOptionsReady | EvMeetingConfirmation | EvActionGranted | EvMeetingScheduled |
     EvAutoApproved | EvEmailsModified |
     EvPipelineEnd
 )
@@ -292,3 +306,13 @@ def set_tracer(t: Tracer) -> None:
 
 def emit(event: Event) -> None:
     _current.get().on_event(event)
+
+
+def format_meeting_slot(slot: dict, *, index: int | None = None) -> str:
+    """Render start→end; optional label is annotation only."""
+    line = f"{slot.get('start', '?')} → {slot.get('end', '?')}"
+    if slot.get("label"):
+        line += f"  ({slot['label']})"
+    if index is not None:
+        return f"  [{index}] {line}"
+    return line

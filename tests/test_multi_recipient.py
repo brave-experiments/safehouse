@@ -35,6 +35,14 @@ from safehouse.slots import SlotStore
 from safehouse.trace import Tracer
 
 
+def _precommitted_policy(
+    store: SlotStore, state: PlanState, *, sources: set[str], transform: str,
+) -> IronFlow:
+    policy = IronFlow(store)
+    policy.precommit_routing(state, sources=sources, transform=transform)
+    return policy
+
+
 def _plan(recipient):
     return {"steps": [
         {"tool": "mcp_page_content", "args": {"url": "https://example.com", "capability": "WEB_FETCH", "slot_id": "c"}},
@@ -164,7 +172,8 @@ def test_routing_lock_captures_recipient_list_as_tuple():
         plan = {"steps": [{"tool": "send_summary", "args": {
             "recipient": recips, "subject": "Digest", "body_slot": "body",
         }}]}
-        asyncio.run(driver_run("t", plan, SlotStore(), IronFlow(SlotStore())))
+        store = SlotStore()
+        asyncio.run(driver_run("t", plan, store, IronFlow(store)))
         recips.append("attacker@evil.com")   # F7: mutate the plan's list AFTER the lock
     finally:
         _trace.set_tracer(Tracer())
@@ -224,9 +233,15 @@ def test_schedule_meeting_multi_attendee_e2e(monkeypatch):
     async def _confirm_one(slots):
         return 1
 
-    ctx = _StepContext(store=store, policy=IronFlow(store), driver=driver_spec(),
-                       state=state, config=ProviderConfig(google_token="tok"),
-                       confirm_slot=_confirm_one)
+    ctx = _StepContext(
+        store=store,
+        policy=_precommitted_policy(store, state, sources={"slots"},
+                                    transform="structured:meeting_proposal"),
+        driver=driver_spec(),
+        state=state,
+        config=ProviderConfig(google_token="tok"),
+        confirm_slot=_confirm_one,
+    )
     _, final = asyncio.run(_handle_schedule_meeting({"slots_slot": "slots"}, ctx))
 
     assert final["status"] == "success"
@@ -256,7 +271,9 @@ def _summary_ctx(recipients):
     state.set_var("_routing", LVal({"recipient": recipients, "subject": "S"}, Label.T_pub()))
     store.create("body")
     store.write("body", "summary text", Label.U_pub())
-    ctx = _StepContext(store=store, policy=IronFlow(store), driver=driver_spec(),
+    ctx = _StepContext(store=store, policy=_precommitted_policy(store, state, sources={"body"},
+                       transform="opaque"),
+                       driver=driver_spec(),
                        state=state, config=ProviderConfig(google_token="tok"))
     return ctx
 
@@ -352,7 +369,9 @@ def test_send_reply_passes_thread_true(monkeypatch):
     state.set_var("_routing", LVal({"recipient": "a@corp.com", "subject": "Re: hi"}, Label.T_pub()))
     store.create("body")
     store.write("body", "reply text", Label.U_pub())
-    ctx = _StepContext(store=store, policy=IronFlow(store), driver=driver_spec(),
+    ctx = _StepContext(store=store, policy=_precommitted_policy(store, state, sources={"body"},
+                       transform="opaque"),
+                       driver=driver_spec(),
                        state=state, config=ProviderConfig(google_token="tok"))
     from safehouse.driver import _handle_send_reply
     asyncio.run(_handle_send_reply({"body_slot": "body"}, ctx))
@@ -396,9 +415,15 @@ def test_schedule_meeting_passes_body_slot_for_threading(monkeypatch):
     async def _confirm_one(slots):
         return 1
 
-    ctx = _StepContext(store=store, policy=IronFlow(store), driver=driver_spec(),
-                       state=state, config=ProviderConfig(google_token="tok"),
-                       confirm_slot=_confirm_one)
+    ctx = _StepContext(
+        store=store,
+        policy=_precommitted_policy(store, state, sources={"meeting_proposal"},
+                                    transform="structured:meeting_proposal"),
+        driver=driver_spec(),
+        state=state,
+        config=ProviderConfig(google_token="tok"),
+        confirm_slot=_confirm_one,
+    )
     asyncio.run(_handle_schedule_meeting({"slots_slot": "meeting_proposal"}, ctx))
     assert calls["body_slot"] == "meeting_proposal"
 

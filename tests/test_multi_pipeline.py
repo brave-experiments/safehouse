@@ -266,9 +266,14 @@ def test_send_reply_carries_email_thread_id(monkeypatch):
 
     plan = _reply_pipeline("alice@corp.com", "a")
     store = SlotStore()
-    result = asyncio.run(driver_run(
-        "reply to alice", plan, store, IronFlow(store), google_token="fake-token"
-    ))
+    tracer = _ListTracer()
+    _trace.set_tracer(tracer)
+    try:
+        result = asyncio.run(driver_run(
+            "reply to alice", plan, store, IronFlow(store), google_token="fake-token"
+        ))
+    finally:
+        _trace.set_tracer(Tracer())
 
     assert result.get("status") == "success", f"pipeline failed: {result}"
     assert sent_args, "GmailClient.send was never called"
@@ -279,6 +284,33 @@ def test_send_reply_carries_email_thread_id(monkeypatch):
     assert sent_args[0]["in_reply_to"] == "<msg-a@mail.example>"
     assert sent_args[0]["references"] == "<msg-a@mail.example>"
     assert sent_args[0]["subject"] == "Re: test a"  # gated routing — not fetched Subject
+
+    precommit_i = next(
+        i for i, event in enumerate(tracer.events)
+        if isinstance(event, _trace.EvGate)
+        and event.gate == "PRECOMMIT"
+        and event.passed
+    )
+    spawn_i = next(
+        i for i, event in enumerate(tracer.events)
+        if isinstance(event, _trace.EvAgentSpawned)
+    )
+    declassify_i = next(
+        i for i, event in enumerate(tracer.events)
+        if isinstance(event, _trace.EvDeclassify)
+    )
+    action_i = next(
+        i for i, event in enumerate(tracer.events)
+        if isinstance(event, _trace.EvGate)
+        and event.gate == "ACTION"
+        and event.who == "body"
+        and event.passed
+    )
+    sent_i = next(
+        i for i, event in enumerate(tracer.events)
+        if isinstance(event, _trace.EvEmailSent)
+    )
+    assert precommit_i < spawn_i < declassify_i < action_i < sent_i
 
 
 def test_send_reply_thread_id_isolated_per_pipeline(monkeypatch):
@@ -562,8 +594,11 @@ def test_schedule_meeting_gmail_fail_after_calendar_includes_event_id(monkeypatc
     monkeypatch.setattr("safehouse.driver.httpx.AsyncClient", lambda **k: _Client())
     monkeypatch.setattr(driver_mod, "_gmail_send", _boom)
 
+    policy = IronFlow(store)
+    policy.precommit_routing(state, sources={"meeting_proposal"},
+                             transform="structured:meeting_proposal")
     ctx = _StepContext(
-        store=store, policy=IronFlow(store), driver=driver_spec(),
+        store=store, policy=policy, driver=driver_spec(),
         state=state, config=ProviderConfig(google_token="tok"),
         confirm_slot=_confirm,
     )
@@ -704,7 +739,7 @@ def test_precheck_rejects_truly_identical_pipelines():
 # ── B4 regression: partial+violation → exit code POLICY_VIOLATION ──────
 
 def test_to_run_result_partial_with_violation_maps_to_policy_violation(tmp_path):
-    from safehouse_cli.app import ExitCode, RunResult, _to_run_result
+    from safehouse_cli.app import ExitCode, _to_run_result
     from safehouse_cli.logging_io import Session
     session = Session.new(tmp_path)
     result = _to_run_result(
@@ -794,3 +829,53 @@ def test_routing_locked_emitted_before_driver_start():
         assert max(routing_locked_indices) < min(plan_step_indices), (
             "EvRoutingLocked must all precede the first EvPlanStep"
         )
+
+
+def test_routing_snapshot_survives_mutation_while_prior_pipeline_awaits(monkeypatch):
+    """Pipeline 2 must execute the same frozen route recorded before pipeline 1."""
+    from safehouse.driver import run_manifest
+
+    recipient_b = ["b@corp.com"]
+    plan = {"pipelines": [
+        {"steps": [{"tool": "send_summary", "args": {
+            "recipient": ["a@corp.com"], "subject": "S1", "body_slot": "b1",
+        }}]},
+        {"steps": [{"tool": "send_summary", "args": {
+            "recipient": recipient_b, "subject": "S2", "body_slot": "b2",
+        }}]},
+    ]}
+    first_started = asyncio.Event()
+    seen_routes: list[dict] = []
+
+    async def _fake_run(task, sub_plan, store, policy, **kwargs):
+        seen_routes.append(kwargs["routing"])
+        if len(seen_routes) == 1:
+            first_started.set()
+            await asyncio.sleep(0)
+        return {"status": "success", "violations": []}
+
+    async def _mutate_original_plan():
+        await first_started.wait()
+        recipient_b.append("attacker@evil.com")
+
+    monkeypatch.setattr(driver_mod, "run", _fake_run)
+    tracer = _ListTracer()
+    _trace.set_tracer(tracer)
+
+    async def _run_and_mutate():
+        return await asyncio.gather(
+            run_manifest("t", plan),
+            _mutate_original_plan(),
+        )
+
+    try:
+        asyncio.run(_run_and_mutate())
+    finally:
+        _trace.set_tracer(Tracer())
+
+    locked = [
+        event for event in tracer.events
+        if isinstance(event, _trace.EvRoutingLocked) and event.pipeline == 1
+    ]
+    assert locked[0].routing["recipient"] == ("b@corp.com",)
+    assert seen_routes[1]["recipient"] == ("b@corp.com",)

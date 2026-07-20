@@ -11,9 +11,8 @@ import os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 import pytest
-from safehouse.labels import Label, LVal, I, C
+from safehouse.labels import Label
 from safehouse.slots import SlotStore
-from safehouse.ironflow_policy import IronFlow
 from safehouse import trace as _trace
 from safehouse.trace import Tracer
 

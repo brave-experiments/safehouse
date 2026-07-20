@@ -19,7 +19,7 @@ driver.py — Manifest executor and tool handlers.
 
     Tier 3 — Driver Tools (pure Python, no LLM, no network except the action itself):
       _handle_send_summary()           IronFlow bridge + gate → Gmail API
-      _handle_send_reply()             domain check + declassify + bridge + mailbox send
+      _handle_send_reply()             slot-bound declassify + bridge + mailbox send
       _handle_schedule_meeting()       human slot confirm + calendar event + reply email
       _handle_modify_emails()          bulk Gmail action on all messages from sender (no content read)
 
@@ -58,9 +58,8 @@ from __future__ import annotations
 import asyncio
 import base64
 import json
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import date
 from email.mime.text import MIMEText
 import httpx
 from .exceptions import ConfirmationRequired
@@ -70,6 +69,12 @@ from .ironflow_policy import IronFlow, FlowField, FlowMode, IronFlowViolation, R
 from .permissions import AgentSpec, driver_spec, fetcher_spec, processor_spec
 from .runner import run_mcp_page_content, run_mcp_search, run_mcp_email_search, run_mcp_calendar_search, run_processor
 from .plan_types import PlanState
+from .release import (
+    DRIVER_RELEASE,
+    EMAIL_BODY_MAX_CHARS,
+    ReleaseTransformError,
+    apply_release_transform,
+)
 from . import trace as _trace
 
 
@@ -84,7 +89,7 @@ _GCAL_EVENTS_BASE = "https://www.googleapis.com/calendar/v3/calendars"
 _HTTP_TIMEOUT   = 15   # seconds — all single-request API calls
 _BATCH_TIMEOUT  = 30   # seconds — Gmail batchModify (larger payload)
 
-_BODY_MAX_CHARS = 2000  # matches _BODY_FLOW_FIELD type_params["max_chars"]
+_BODY_MAX_CHARS = EMAIL_BODY_MAX_CHARS
 
 _ROUTING_MISSING = "routing not pre-committed — internal error in driver.run()"
 
@@ -151,10 +156,11 @@ class GmailClient:
         resp = await self._client.post(_GMAIL_SEND_URL, headers=self._headers, json=payload)
         if resp.status_code not in (200, 201):
             raise GmailSendError(f"Gmail send {resp.status_code}: {resp.text[:200]}")
+        # 2xx already committed the send — never raise after this or do_not_retry is lost.
         try:
             return resp.json().get("id", "")
-        except Exception as exc:
-            raise GmailSendError(f"Gmail send response not JSON: {exc}") from exc
+        except Exception:
+            return ""
 
     async def list_labels(self) -> list[dict]:
         """Return all Gmail labels for the authenticated user."""
@@ -225,7 +231,11 @@ class GmailClient:
 
 
 async def _default_confirm_slot(slots: list[dict]) -> int:
-    """Console prompt for schedule_meeting — runs input() in a thread so the event loop is not blocked."""
+    """Console prompt for schedule_meeting — runs input() in a thread so the event loop is not blocked.
+
+    Display of start→end is owned by EvMeetingOptionsReady / CLI confirmers
+    (no print() in safehouse/). This fallback only collects the index.
+    """
     n = len(slots)
     answer = await asyncio.to_thread(
         input,
@@ -243,7 +253,9 @@ async def _default_confirm_slot(slots: list[dict]) -> int:
 class _StepContext:
     """Frozen context passed to every step handler.
     References are immutable; store and state are intentionally mutable — they
-    accumulate slots and vars as the pipeline executes."""
+    accumulate slots and vars as the pipeline executes. The policy must govern
+    this exact store and must already hold any routing precommit required by
+    handlers called outside run()."""
     store:        SlotStore
     policy:       IronFlow
     driver:       AgentSpec
@@ -252,6 +264,10 @@ class _StepContext:
     confirm_slot: Callable[[list[dict]], Awaitable[int]] = field(
         default=_default_confirm_slot
     )
+
+    def __post_init__(self) -> None:
+        if not self.policy.bound_to(self.store):
+            raise ValueError("IronFlow policy must be bound to the context SlotStore")
 
 _Handler = Callable[
     [dict, _StepContext],
@@ -292,7 +308,7 @@ def _slot_result(
                         "chars": len(str(lval.value)), "status": "written"}), None
 
 
-def _get_routing(state: PlanState) -> dict | None:
+def _get_routing(state: PlanState) -> Mapping[str, object] | None:
     try:
         return state.get_var("_routing").value
     except KeyError:
@@ -304,7 +320,7 @@ def _freeze_routing(routing: dict) -> dict:
     return {k: tuple(v) if isinstance(v, list) else v for k, v in routing.items()}
 
 
-def _routing_recipient_subject(routing: dict) -> tuple[LVal, LVal]:
+def _routing_recipient_subject(routing: Mapping[str, object]) -> tuple[LVal, LVal]:
     return (
         LVal(_addr_header(routing["recipient"]), Label.T_pub()),
         LVal(routing["subject"],                  Label.T_pub()),
@@ -384,41 +400,32 @@ def _email_action_result(
     }
 
 
-def _declassify_for_send(
+def _release_slot(
     policy: IronFlow,
-    lval: LVal,
     *,
-    field: str,
-    routing: dict,
+    slot_id: str,
+    state: PlanState,
+    routing: Mapping[str, object],
     who: str,
     not_from: str,
-    always: bool = False,
 ) -> LVal:
-    """Explicit (_,priv)→(_,pub) downgrade before the email bridge. Skipped when already pub unless always."""
-    if not always and lval.label.confidentiality != C.priv:
-        return lval
+    """Authorize via declassify_slot, then apply the precommitted release transform."""
     recipient_display = _addr_header(routing[who])
-    preconditions = [
-        'routing pre-committed in state.vars["_routing"] (T,pub) before step 0',
-        f"{who} '{recipient_display}' predetermined from task — not from {not_from}",
-        "spawn_processor isolated: no CanNetwork, no CanCallTool, no CanSpawn",
-    ]
-    return policy.declassify(
-        lval,
-        field         = field,
-        reason        = f"{who} pre-committed before step 0; sub-agent isolated; robust declassification",
-        authority     = "DRIVER",
-        preconditions = preconditions,
+    authorized = policy.declassify_slot(
+        slot_id,
+        state=state,
+        reason=(
+            f"{who} '{recipient_display}' pre-committed before observation; "
+            f"not derived from {not_from}"
+        ),
     )
-
-
-
-def _is_weekday(slot: dict) -> bool:
-    """True if slot start date is Mon–Fri; True on parse failure (human verifies)."""
-    try:
-        return date.fromisoformat(str(slot.get("start", ""))[:10]).weekday() < 5
-    except (ValueError, TypeError):
-        return True
+    transform = policy.release_transform()
+    if transform is None:
+        raise RuntimeError(
+            f"release transform missing for slot {slot_id!r} — "
+            "content tools must precommit a transform id"
+        )
+    return apply_release_transform(transform, authorized)
 
 
 async def _run_tier1(
@@ -434,8 +441,8 @@ async def _run_tier1(
     store, policy, driver, state = ctx.store, ctx.policy, ctx.driver, ctx.state
     if err := _create_slot(store, slot_id):
         return err
-    _emit_spawned(spec, kind, detail)
     policy.before_spawn(driver)
+    _emit_spawned(spec, kind, detail)
     writer = store.writer_for(slot_id, spec.max_label, agent_id=spec.id)
     await run_fn(writer)
     return _slot_result(store, state, slot_id, step_name)
@@ -608,8 +615,8 @@ async def _handle_spawn_processor(args: dict, ctx: _StepContext) -> tuple[str, d
     input_labels = [store.read(sid).label for sid in reads]
     out_label    = taint_all(input_labels + [agent_base])
     spec = processor_spec(f"proc_{out_slot}", out_label, instruction)
-    _emit_spawned(spec, "processor", {"reads": reads, "out_slot": out_slot, "out_label": str(out_label)})
     policy.before_spawn(driver)
+    _emit_spawned(spec, "processor", {"reads": reads, "out_slot": out_slot, "out_label": str(out_label)})
     reader = store.reader_for(reads, agent_id=spec.id, max_label=spec.max_label)
     writer = store.writer_for(out_slot, out_label, agent_id=spec.id)
     await run_processor(reads, reader, writer, system_prompt=spec.system_prompt, agent_id=spec.id, timeout=300)
@@ -645,10 +652,16 @@ async def _handle_send_summary(args: dict, ctx: _StepContext) -> tuple[str, dict
         )
 
     subject_lval = LVal(routing["subject"], Label.T_pub())
-    body_lval = _bridge_body(policy, _declassify_for_send(
-        policy, store.read(body_slot), field=body_slot, routing=routing,
-        who="recipient", not_from="fetched content",
-    ))
+    try:
+        body_lval = _bridge_body(policy, _release_slot(
+            policy, slot_id=body_slot, state=state, routing=routing,
+            who="recipient", not_from="fetched content",
+        ))
+    except ReleaseTransformError as exc:
+        return _terminal_error(str(exc), store)
+
+    if not str(body_lval.value).strip():
+        return _terminal_error("released body is empty — nothing to send", store)
 
     recipients = _addr_list(routing["recipient"])
     groups     = [[r] for r in recipients] if delivery == "separate" else [recipients]
@@ -720,10 +733,16 @@ async def _handle_send_reply(args: dict, ctx: _StepContext) -> tuple[str, dict |
     recipient_lval, subject_lval = _routing_recipient_subject(routing)
 
     raw_body = store.read(body_slot)
-    body_lval = _bridge_body(policy, _declassify_for_send(
-        policy, raw_body, field=body_slot, routing=routing,
-        who="recipient", not_from="email content", always=True,
-    ))
+    try:
+        body_lval = _bridge_body(policy, _release_slot(
+            policy, slot_id=body_slot, state=state, routing=routing,
+            who="recipient", not_from="email content",
+        ))
+    except ReleaseTransformError as exc:
+        return _terminal_error(str(exc), store)
+
+    if not str(body_lval.value).strip():
+        return _terminal_error("released body is empty — nothing to send", store)
 
     _gate_email_action(policy, "send_reply", recipient_lval, subject_lval, body_lval)
 
@@ -773,27 +792,33 @@ async def _handle_schedule_meeting(args: dict, ctx: _StepContext) -> tuple[str, 
     attendee_lval = LVal(_addr_header(attendee_raw), Label.T_pub())
     subject_lval  = LVal(routing["reply_subject"], Label.T_pub())
     event_title   = routing["event_title"]
-    calendar_id   = str(routing.get("calendarId", "primary"))
+    calendar_id   = "primary"
     google_token  = ctx.config.google_token
 
     raw_slots = store.read(slots_slot)
-    slots_declassified = _declassify_for_send(
-        policy, raw_slots, field=slots_slot, routing=routing,
-        who="attendee", not_from="fetched content", always=True,
-    )
-
     try:
-        slots_data: dict = json.loads(str(slots_declassified.value))
-    except json.JSONDecodeError:
-        return _terminal_error(
-            "processor output is not valid JSON — "
-            "spawn_processor instruction must specify JSON output with "
-            "'proposed_slots' and 'reply_body' keys",
-            store,
+        slots_released = _release_slot(
+            policy, slot_id=slots_slot, state=state, routing=routing,
+            who="attendee", not_from="fetched content",
         )
+    except ReleaseTransformError as exc:
+        return _terminal_error(str(exc), store)
 
-    proposed_slots: list[dict] = [s for s in slots_data.get("proposed_slots", []) if _is_weekday(s)]
-    reply_body: str = slots_data.get("reply_body", str(slots_declassified.value))
+    slots_data = slots_released.value
+    if not isinstance(slots_data, Mapping):
+        return _terminal_error("meeting_proposal transform did not return an object", store)
+
+    # Freeze a snapshot before confirm — confirmer must not TOCTOU-mutate
+    # start/end between display and ActionGrant.
+    proposed_slots: list[dict] = [
+        {
+            "start": str(s["start"]),
+            "end":   str(s["end"]),
+            **({"label": str(s["label"])} if "label" in s else {}),
+        }
+        for s in slots_data["proposed_slots"]
+    ]
+    reply_body: str = str(slots_data.get("reply_body", ""))
 
     if not proposed_slots:
         return _terminal_error("no 'proposed_slots' in processor output", store)
@@ -806,10 +831,10 @@ async def _handle_schedule_meeting(args: dict, ctx: _StepContext) -> tuple[str, 
         proposed_slots=proposed_slots,
     ))
 
-    choice = await ctx.confirm_slot(proposed_slots)
+    choice = await ctx.confirm_slot([dict(s) for s in proposed_slots])
 
     approved    = 1 <= choice <= len(proposed_slots)
-    chosen_slot = proposed_slots[choice - 1] if approved else None
+    chosen_slot = dict(proposed_slots[choice - 1]) if approved else None
 
     _trace.emit(_trace.EvMeetingConfirmation(
         proposed_slots=proposed_slots,
@@ -817,15 +842,26 @@ async def _handle_schedule_meeting(args: dict, ctx: _StepContext) -> tuple[str, 
         approved=approved,
     ))
 
-    if approved:
-        slot_label = chosen_slot.get("label", f"{chosen_slot['start']} — {chosen_slot['end']}")
-        reply_body_lval = LVal(
-            f"Hi,\n\nI've confirmed our meeting for {slot_label}. "
-            f"A calendar invite has been sent your way.\n\nLooking forward to it!",
-            slots_declassified.label,
+    if not approved and not reply_body.strip():
+        return _terminal_error(
+            "declined with no reply_body — nothing to send "
+            "(processor output must include 'reply_body' for the email-only path)",
+            store,
         )
+
+    slot_label = "(email only)"
+    start, end = "", ""
+    if approved:
+        start = str(chosen_slot["start"])
+        end   = str(chosen_slot["end"])
+        slot_label = chosen_slot.get("label") or f"{start} — {end}"
+        confirmed = (
+            f"Hi,\n\nI've confirmed our meeting for {slot_label}. "
+            f"A calendar invite has been sent your way.\n\nLooking forward to it!"
+        )
+        reply_body_lval = LVal(confirmed[:_BODY_MAX_CHARS], slots_released.label)
     else:
-        reply_body_lval = LVal(reply_body[:_BODY_MAX_CHARS], slots_declassified.label)
+        reply_body_lval = LVal(reply_body[:_BODY_MAX_CHARS], slots_released.label)
 
     body_lval = _bridge_body(policy, reply_body_lval)
     policy.before_action("schedule_meeting", "body", body_lval, Role.CONTENT)
@@ -834,8 +870,16 @@ async def _handle_schedule_meeting(args: dict, ctx: _StepContext) -> tuple[str, 
     start_label, end_label = "(no invite)", "(no invite)"
 
     if approved:
-        start_lval = LVal(chosen_slot["start"], Label.T_pub())
-        end_lval   = LVal(chosen_slot["end"],   Label.T_pub())
+        try:
+            policy.issue_action_grant(
+                state,
+                tool="schedule_meeting",
+                fields={"start_time": start, "end_time": end},
+            )
+        except IronFlowViolation as exc:
+            return _terminal_error(str(exc), store)
+        start_lval = LVal(start, Label.T_pub())
+        end_lval   = LVal(end,   Label.T_pub())
         start_label, end_label = str(start_lval.label), str(end_lval.label)
 
         policy.before_action("schedule_meeting", "start_time", start_lval, Role.ROUTING)
@@ -848,15 +892,29 @@ async def _handle_schedule_meeting(args: dict, ctx: _StepContext) -> tuple[str, 
                     headers=_google_headers(google_token),
                     json={
                         "summary":   event_title,
-                        "start":     {"dateTime": chosen_slot["start"]},
-                        "end":       {"dateTime": chosen_slot["end"]},
+                        "start":     {"dateTime": start},
+                        "end":       {"dateTime": end},
                         "attendees": [{"email": a} for a in _addr_list(attendee_raw)],
                     },
                 )
             if cal_resp.status_code not in (200, 201):
                 return _terminal_error(f"Calendar API {cal_resp.status_code}: {cal_resp.text[:200]}", store)
-            ev_data    = cal_resp.json()
-            event_id   = ev_data.get("id", "")
+            # 2xx already created the event — parse failures must still latch do_not_retry.
+            try:
+                ev_data = cal_resp.json()
+            except Exception:
+                return _terminal_error(
+                    "Calendar API returned 2xx but response was not JSON — "
+                    "invite may already exist; do not retry",
+                    store, event_id="committed-unparsed",
+                )
+            if not isinstance(ev_data, dict):
+                return _terminal_error(
+                    "Calendar API returned 2xx with non-object JSON — "
+                    "invite may already exist; do not retry",
+                    store, event_id="committed-unparsed",
+                )
+            event_id   = ev_data.get("id", "") or "committed-unparsed"
             event_link = ev_data.get("htmlLink", "")
 
     if google_token:
@@ -881,8 +939,8 @@ async def _handle_schedule_meeting(args: dict, ctx: _StepContext) -> tuple[str, 
     _trace.emit(_trace.EvMeetingScheduled(
         attendee=_addr_header(attendee_raw), attendee_label=str(attendee_lval.label),
         event_title=event_title,
-        start_time=chosen_slot["start"] if chosen_slot else "",
-        end_time=chosen_slot["end"] if chosen_slot else "",
+        start_time=start,
+        end_time=end,
         start_label=start_label, end_label=end_label,
         event_id=event_id, event_link=event_link,
         reply_sent=bool(google_token),
@@ -895,7 +953,7 @@ async def _handle_schedule_meeting(args: dict, ctx: _StepContext) -> tuple[str, 
         "status":      "success",
         "attendee":    attendee_lval.value,
         "event_title": event_title,
-        "slot":        chosen_slot["label"] if chosen_slot else "(email only)",
+        "slot":        slot_label,
         "event_id":    event_id,
         "labels": {
             "attendee":   str(attendee_lval.label),
@@ -1087,6 +1145,21 @@ _DRIVER_ROUTING_FIELDS: dict[str, list[str]] = {
     "modify_emails":    ["sender", "action"],
 }
 
+def _release_gate_for(
+    driver_tool: str, driver_args: Mapping[str, object],
+) -> tuple[frozenset[str], str | None]:
+    """Resolve precommit release sources + transform id from the terminal step args."""
+    gate = DRIVER_RELEASE.get(driver_tool)
+    if gate is None:
+        raise ValueError(f"{driver_tool!r} missing from DRIVER_RELEASE")
+    missing = [k for k in gate.slot_args if k not in driver_args]
+    if missing:
+        raise ValueError(
+            f"{driver_tool} missing required release slot args: {missing}"
+        )
+    sources = frozenset(str(driver_args[k]) for k in gate.slot_args)
+    return sources, gate.transform
+
 
 def routing_block_for(plan: dict) -> dict | None:
     """
@@ -1129,9 +1202,16 @@ async def run(
 
     confirm_slot — injected callback for schedule_meeting human approval;
                    defaults to console input() wrapped in asyncio.to_thread.
+
+    store and policy are a one-run pair: policy must be freshly constructed as
+    IronFlow(store). Reusing a precommitted policy is rejected.
     """
     if not plan.get("steps"):
         return _pipeline_error("manifest has no steps", policy, store)
+    if not policy.bound_to(store):
+        return _pipeline_error(
+            "IronFlow policy must be bound to the execution SlotStore", policy, store,
+        )
 
     driver = driver_spec()
     config = ProviderConfig(google_token=google_token)
@@ -1158,10 +1238,18 @@ async def run(
             routing = {k: driver_args[k] for k in routing_keys}
 
     if routing is not None:
-        locked: dict[str, object] = _freeze_routing(routing)
-        state.set_var("_routing", LVal(locked, Label.T_pub()))
+        # set_var owns the freeze (list→tuple + MappingProxyType); no pre-freeze.
+        state.set_var("_routing", LVal(routing, Label.T_pub()))
+        try:
+            sources, transform = _release_gate_for(driver_tool, driver_step.get("args", {}))
+            policy.precommit_routing(state, sources=sources, transform=transform)
+        except (IronFlowViolation, ValueError) as exc:
+            return _pipeline_error(str(exc), policy, store)
         if emit_locked:
-            _trace.emit(_trace.EvRoutingLocked(driver_tool=driver_tool, routing=locked))
+            _trace.emit(_trace.EvRoutingLocked(
+                driver_tool=driver_tool,
+                routing=dict(state.get_var("_routing").value),
+            ))
 
     steps    = plan["steps"]
 
@@ -1282,16 +1370,15 @@ async def run_manifest(
             rb = routing_block_for(sub)
         except ValueError as exc:
             return {"status": "error", "reason": str(exc), "violations": [], "actions": []}
-        routing_blocks.append(rb)
+        routing_blocks.append(_freeze_routing(rb) if rb is not None else None)
 
     # Emit all EvRoutingLocked events before the first pipeline executes.
     for idx, (sub, rb) in enumerate(zip(sub_plans, routing_blocks)):
         if rb is not None:
             driver_tool = sub["steps"][-1].get("tool", "")
-            locked_rb   = _freeze_routing(rb)
             _trace.emit(_trace.EvRoutingLocked(
                 driver_tool=driver_tool,
-                routing=locked_rb,
+                routing=dict(rb),
                 pipeline=idx,
             ))
 

@@ -41,47 +41,39 @@ Access tokens expire after roughly one hour. If a task fails with `401 Unauthori
 
 ### Auth modes (`safehouse configure`)
 
-`safehouse configure` stores your Google auth choice in `~/.safehouse/config.toml`. Three modes trade convenience against setup cost:
+`safehouse configure` stores your Google auth choice in the resolved config file (see [Configuration](#configuration) for path rules). Three modes trade convenience against setup cost:
 
-| Mode | How it works | Re-auth cadence |
-|---|---|---|
-| `static` | Paste an access token (see below). Simplest. | Re-mint + reconfigure every ~1 hour. |
-| `token_command` | A command whose stdout is a fresh token (e.g. `oauth2l`, or your own script). | Whatever your broker does. **Not** `gcloud auth print-access-token` — those tokens cannot carry Gmail/Calendar scopes (`403 insufficient scopes`). |
-| `oauth` | Refresh-token flow; `safehouse` refreshes automatically via `google-auth` (`pip install 'safehouse[google]'`). | See the expiry reality below. |
 
-**Refresh-token expiry reality (consumer Gmail):** an OAuth app in "Testing" status issues refresh tokens that expire after **7 days**, so `oauth` mode means a weekly re-mint + `safehouse configure`. Publishing to Production with the restricted `gmail.modify` scope requires Google verification — not viable for personal use. Google **Workspace "Internal"** apps are exempt from the 7-day limit. There is no "authorize once, forever" for consumer Gmail.
+| Mode            | How it works                                                                                                   | Re-auth cadence                                                                                                                                    |
+| --------------- | -------------------------------------------------------------------------------------------------------------- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `static`        | Paste an access token (see below). Simplest.                                                                   | Re-mint + reconfigure every ~1 hour.                                                                                                               |
+| `token_command` | A command whose stdout is a fresh token (e.g. `oauth2l`, or your own script).                                  | Whatever your broker does. **Not** `gcloud auth print-access-token` — those tokens cannot carry Gmail/Calendar scopes (`403 insufficient scopes`). |
+| `oauth`         | Refresh-token flow; `safehouse` refreshes automatically via `google-auth` (`pip install 'safehouse[google]'`). | See the expiry reality below.                                                                                                                      |
 
-For `oauth` mode, mint the refresh token in the Playground with **your own OAuth credentials** (gear → "Use your own OAuth credentials") — the default shared client revokes refresh tokens after 24h. The client must be type **Web application** with redirect URI exactly `https://developers.google.com/oauthplayground`. Then run `safehouse configure`, choose `oauth`, and paste the refresh token, client_id, and client_secret (stored in `~/.safehouse/google_credentials.json`, `chmod 600` — never in `config.toml`).
+
+
 
 ### Mint a token with the OAuth Playground
 
 1. Open the [OAuth 2.0 Playground](https://developers.google.com/oauthplayground).
-
 2. In **Step 1** (left panel), select the following scopes:
 
-   | API | Scope |
-   |---|---|
-   | Gmail API v1 | `https://www.googleapis.com/auth/gmail.modify` |
-   | Gmail API v1 | `https://www.googleapis.com/auth/gmail.send` |
-   | Google Calendar API v3 | `https://www.googleapis.com/auth/calendar` |
+  | API                    | Scope                                          |
+  | ---------------------- | ---------------------------------------------- |
+  | Gmail API v1           | `https://www.googleapis.com/auth/gmail.modify` |
+  | Gmail API v1           | `https://www.googleapis.com/auth/gmail.send`   |
+  | Google Calendar API v3 | `https://www.googleapis.com/auth/calendar`     |
 
    `gmail.modify` covers reading and labelling mail, so a separate `gmail.readonly` scope is not needed.
-
 3. Click **Authorize APIs**, sign in with your Google account, and grant access.
-
 4. Click **Exchange authorization code for tokens**.
-
 5. Copy the **Access token** (it starts with `ya29`).
-
 6. Export it in your shell:
-
-   ```bash
+  ```bash
    export GOOGLE_ACCESS_TOKEN=ya29...
-   ```
+  ```
 
-### Refreshing an expired token
 
-Repeat steps 1–6. The Playground remembers authorized scopes for the session, so a refresh is usually just Authorize APIs → Exchange → copy → re-export.
 
 ## Configuration
 
@@ -116,11 +108,15 @@ export GOOGLE_ACCESS_TOKEN=ya29...
 export DEMO_RECIPIENT=you@example.com
 ```
 
-| Variable | Required by | Notes |
-|---|---|---|
-| `ANTHROPIC_API_KEY` | All tasks | — |
-| `GOOGLE_ACCESS_TOKEN` | All tasks that use Gmail or Calendar | From the OAuth Playground; expires after ~1 hour |
-| `DEMO_RECIPIENT` | Tasks that email their output | Optional — overridden by `--recipient`; prompted at runtime if neither is set |
+
+| Variable              | Required by                          | Notes                                                                         |
+| --------------------- | ------------------------------------ | ----------------------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY`   | All tasks                            | —                                                                             |
+| `GOOGLE_ACCESS_TOKEN` | All tasks that use Gmail or Calendar | From the OAuth Playground; expires after ~1 hour                              |
+| `DEMO_RECIPIENT`      | Tasks that email their output        | Optional — overridden by `--recipient`; prompted at runtime if neither is set |
+
+
+
 
 ## Usage
 
@@ -193,31 +189,39 @@ Needs: `ANTHROPIC_API_KEY`, `GOOGLE_ACCESS_TOKEN`, `DEMO_RECIPIENT`
 safehouse --task "Find all my travel dates that are coming in the future and past and give me a summary of total time spent away from home."
 ```
 
+
+
 ### Command-line reference
 
 All flags work with any pipeline:
 
-| Flag | Description |
-|---|---|
-| `--task TEXT` | The task to execute (required) |
-| `--recipient EMAIL` | Recipient for emailed output; overrides `DEMO_RECIPIENT` |
-| `--approve MODE` | Approval mode for confirmation prompts: `interactive`, `auto`, or `deny`. Defaults to `interactive` on a terminal, `deny` otherwise |
-| `--pause` | Pause at key steps — useful for walkthroughs and video recording. Forces `--approve interactive` |
-| `--dry-run` | Plan the task and print the manifest without executing |
-| `--json` | Write a single JSON result object to stdout; all human-readable output goes to stderr |
-| `--results-dir PATH` | Directory for session transcripts and JSONL traces (default: `results/`) |
-| `--non-interactive` | Disable all blocking prompts, for headless/CI use. Defaults to `--approve deny`; pass `--approve auto` to enable auto-approval |
-| `--timeout SECONDS` | Abort execution after this many seconds (no limit by default) |
+
+| Flag                   | Description                                                                                                                                                   |
+| ---------------------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `TASK` / `--task TEXT` | Task to execute (positional or `--task`; one required)                                                                                                        |
+| `--recipient EMAIL`    | Recipient for emailed output; overrides `DEMO_RECIPIENT`                                                                                                      |
+| `--approve MODE`       | Approval mode for confirmation prompts: `interactive`, `auto`, or `deny`. Defaults to `interactive` on a terminal, `deny` otherwise                           |
+| `--pause`              | Force `--approve interactive` (walkthrough alias)                                                                                                             |
+| `--dry-run`            | Plan and validate only — no Tier 1/3 side effects. Still calls the planner; for Google pipelines may run `token_command` or an oauth refresh before returning |
+| `--json`               | Write a single JSON result object to stdout; all human-readable output goes to stderr                                                                         |
+| `--results-dir PATH`   | Directory for session transcripts and JSONL traces (default: `results/`)                                                                                      |
+| `--non-interactive`    | Disable all blocking prompts, for headless/CI use. Defaults to `--approve deny`; pass `--approve auto` to enable auto-approval                                |
+| `--timeout SECONDS`    | Abort execution after this many seconds (no limit by default)                                                                                                 |
+
 
 > `--auto-approve` still works as an alias for `--approve auto` but is deprecated and will be removed in a future release.
+
+
 
 ### Approval modes
 
 The `schedule_meeting` step requires human confirmation before creating a calendar event. `--approve` controls who answers that prompt:
 
-- **`interactive`** — you're prompted in the terminal before the calendar event is created. The default when attached to a terminal.
-- **`auto`** — the first proposed slot is selected automatically. Useful for unattended runs where the side effects are acceptable.
-- **`deny`** — the calendar creation step is skipped. Email pipelines (send_summary, send_reply, modify_emails) are unaffected and still run to completion. The default for headless runs.
+- `interactive` — you're prompted in the terminal before the calendar event is created. The default when attached to a terminal.
+- `auto` — the first proposed slot is selected automatically. Useful for unattended runs where the side effects are acceptable.
+- `deny` — skips creating the calendar invite. Pure email tools (`send_summary`, `send_reply`, `modify_emails`) are unaffected. On a **meeting** task, deny still takes the email-only path and may send the proposal/`reply_body` (or fail if that body is empty). Default for headless runs.
+
+
 
 ### Scripting and automation
 
@@ -243,28 +247,30 @@ With `--json`, stdout carries exactly one JSON object and nothing else:
 
 Exit codes are stable and script-safe:
 
-| Code | Meaning |
-|---|---|
-| `0` | Success (including completed dry runs) |
-| `1` | Pipeline error — execution failed, or timed out under `--timeout` |
-| `2` | Configuration error — missing env vars or invalid flag combinations |
-| `3` | Planning failed — the planner rejected the task |
-| `4` | Policy violation — an IronFlow safety gate blocked the run. Worth monitoring separately from generic failures |
-| `5` | Confirmation required — a headless run reached a step that needs human approval |
-| `6` | Credential error — the Google token could not be resolved (token_command failed, or the OAuth refresh token expired/was revoked). Re-run `safehouse configure` |
-| `130` | Interrupted (Ctrl-C) |
 
-Note that `--dry-run` still invokes the planner, so it requires `ANTHROPIC_API_KEY` (and the detected pipeline's env vars) even though nothing executes. Exit codes `5` and `130` terminate before the result object is written; on those codes, read stderr rather than expecting JSON on stdout.
+| Code  | Meaning                                                                                                                                                        |
+| ----- | -------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `0`   | Success (including completed dry runs)                                                                                                                         |
+| `1`   | Pipeline error — execution failed, or timed out under `--timeout`                                                                                              |
+| `2`   | Configuration error — missing env vars or invalid flag combinations                                                                                            |
+| `3`   | Planning failed — the planner rejected the task                                                                                                                |
+| `4`   | Policy violation — an IronFlow safety gate blocked the run. Worth monitoring separately from generic failures                                                  |
+| `5`   | Confirmation required — a headless run reached a step that needs human approval                                                                                |
+| `6`   | Credential error — the Google token could not be resolved (token_command failed, or the OAuth refresh token expired/was revoked). Re-run `safehouse configure` |
+| `130` | Interrupted (Ctrl-C)                                                                                                                                           |
+
+
+Note that `--dry-run` still invokes the planner (needs `ANTHROPIC_API_KEY`). For pipelines that use Gmail/Calendar it also resolves Google credentials before returning — so a missing token fails dry-run, and `token_command` / oauth may run. Exit codes `5` and `130` terminate before the result object is written; on those codes, read stderr rather than expecting JSON on stdout.
 
 Session transcripts and JSONL traces are written under `--results-dir`, named by session id. The JSONL traces are sensitive: they include planner prompts, operator context, and email addresses.
 
 ## Troubleshooting
 
-**`401 Unauthorized` from Google APIs.** Your access token has expired (they last ~1 hour). Mint a new one via the [OAuth Playground](https://developers.google.com/oauthplayground) and re-export `GOOGLE_ACCESS_TOKEN`.
+`401 Unauthorized` **from Google APIs.** Your access token has expired (they last ~1 hour). Mint a new one via the [OAuth Playground](https://developers.google.com/oauthplayground) and re-export `GOOGLE_ACCESS_TOKEN`.
 
-**`403 Forbidden` / insufficient scopes.** The token was minted without one of the required scopes. Re-authorize with all three scopes listed above, then exchange and export a fresh token.
+`403 Forbidden` **/ insufficient scopes.** The token was minted without one of the required scopes. Re-authorize with all three scopes listed above, then exchange and export a fresh token.
 
-**SafeHouse prompts for a recipient every run.** Set `DEMO_RECIPIENT` in your shell profile or `.env` so it's picked up automatically.
+**SafeHouse prompts for a recipient every run.** Set `DEMO_RECIPIENT` in your shell profile, store it via `safehouse configure`, or pass `--recipient` each run. SafeHouse does not load `.env` files automatically.
 
 **"This app isn't verified" and no way past it.** Use your own OAuth credentials in the Playground (gear icon → **Use your own OAuth credentials**) with a Google Cloud project that has the Gmail and Calendar APIs enabled and your account listed as a test user.
 
@@ -273,3 +279,4 @@ Session transcripts and JSONL traces are written under `--results-dir`, named by
 - Access tokens grant read/send/modify access to your mailbox and full calendar access. Treat them like passwords: do not commit or log them.
 - The one-hour lifetime limits exposure, but prefer a dedicated test Google account when running against real mail.
 - If a token may have leaked, revoke access at [myaccount.google.com/permissions](https://myaccount.google.com/permissions).
+

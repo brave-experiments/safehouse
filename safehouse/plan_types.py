@@ -26,9 +26,9 @@ class PlanState:
     trusted_action_urls holds the driver-declared external-action URL whitelist,
     sourced from the manifest (auto-populated from registry booking_domain values).
 
-    "_routing" is a special var pre-committed by driver.run() before step 0
-    with all routing fields from the terminal step (recipient/subject/attendee/etc.)
-    as (T,pub) — replacing the old create_*_template pattern.
+    "_routing" is pre-committed by driver.run() before step 0 with terminal-step
+    routing fields as (T,pub). Release source slot ids are bound on IronFlow at
+    the same precommit (not stored in vars).
 
     vars_summary() strips labels for external consumers (all vars are T,pub
     by invariant — enforced by set_var).
@@ -48,6 +48,16 @@ class PlanState:
                 f"state.vars may only hold (T,pub) values; "
                 f"got {lval.label} for '{name}'"
             )
+        if name == "_routing":
+            if name in self._vars:
+                raise ValueError("routing is permanently committed")
+            if not isinstance(lval.value, Mapping):
+                raise TypeError("routing must be a mapping")
+            frozen = {
+                key: tuple(value) if isinstance(value, list) else value
+                for key, value in lval.value.items()
+            }
+            lval = LVal(MappingProxyType(frozen), lval.label)
         if name in self._vars and not overwrite:
             raise ValueError(
                 f"var '{name}' is already committed; pass overwrite=True to replace it"
@@ -64,4 +74,7 @@ class PlanState:
 
     def vars_summary(self) -> dict[str, Any]:
         """Values only — labels implicit (all T,pub by set_var invariant)."""
-        return {k: v.value for k, v in self._vars.items()}
+        return {
+            key: dict(lval.value) if isinstance(lval.value, Mapping) else lval.value
+            for key, lval in self._vars.items()
+        }
