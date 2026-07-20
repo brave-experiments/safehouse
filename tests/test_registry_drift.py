@@ -8,12 +8,15 @@ but it is spelled out in four places that must stay in agreement:
   2. safehouse.driver._HANDLERS             — what the driver can execute
   3. safehouse.driver._DRIVER_ROUTING_FIELDS — which driver tools get the
      routing-lock (pre-committed (T,pub) routing before step 0)
+  3b. safehouse.release.DRIVER_RELEASE — release slot args + transform id
+     per driver tool (opaque | structured:<id> | None)
   4. tracer.detect_pipeline / _PIPELINE_ENV
      — pipeline classification and env requirements
 
 Nothing cross-checks these at runtime, and the failure modes of drift are
 silent: an unrouted driver tool skips the routing lock (a security property),
-and an unclassified tool falls into the "briefing" bucket (wrong env checks).
+a tool missing from DRIVER_RELEASE cannot precommit sources/transform, and an
+unclassified tool falls into the "briefing" bucket (wrong env checks).
 These tests convert every such drift into a CI
 failure with a message that says exactly which registry to update.
 
@@ -26,6 +29,7 @@ import pytest
 
 from safehouse.planner import TOOL_SCHEMA
 from safehouse.driver import _DRIVER_ROUTING_FIELDS, _HANDLERS
+from safehouse.release import DRIVER_RELEASE
 
 import tracer
 
@@ -101,6 +105,104 @@ def test_every_driver_tool_has_routing_lock() -> None:
         f"driver tools with an EMPTY routing-field list {sorted(empty)} — "
         f"an empty list is indistinguishable from a missing entry"
     )
+
+
+def test_every_driver_tool_has_release_slots() -> None:
+    """
+    Every driver tool must declare release-slot arg names (possibly empty) and
+    a transform id (None iff no slots). Must stay aligned with TOOL_SCHEMA.slot_refs.
+    """
+    driver_tools = {name for name, sc in TOOL_SCHEMA.items() if sc.is_driver_tool}
+    released = set(DRIVER_RELEASE)
+
+    missing = driver_tools - released
+    assert not missing, (
+        f"driver tools with NO DRIVER_RELEASE entry {sorted(missing)} — "
+        f"add them (use ReleaseGate(()) for routing-only tools)"
+    )
+
+    stale = released - driver_tools
+    assert not stale, (
+        f"DRIVER_RELEASE entries for non-driver tools {sorted(stale)}"
+    )
+
+    for tool, gate in DRIVER_RELEASE.items():
+        expected = TOOL_SCHEMA[tool].slot_refs
+        assert gate.slot_args == expected, (
+            f"{tool}: DRIVER_RELEASE.slot_args={gate.slot_args!r} != "
+            f"TOOL_SCHEMA.slot_refs={expected!r}"
+        )
+        if gate.slot_args:
+            assert gate.transform, f"{tool}: content release requires transform id"
+            assert gate.transform == "opaque" or gate.transform.startswith("structured:")
+        else:
+            assert gate.transform is None
+
+    # Exact transform map — format-only checks allow schedule_meeting→opaque
+    # which would skip meeting_proposal validation before ActionGrant.
+    assert {t: g.transform for t, g in DRIVER_RELEASE.items()} == {
+        "send_summary":     "opaque",
+        "send_reply":       "opaque",
+        "schedule_meeting": "structured:meeting_proposal",
+        "modify_emails":    None,
+    }
+
+
+def test_driver_routing_fields_match_schema_routing_keys() -> None:
+    """
+    Exact routing-key sets — a non-empty but incomplete list still "has a lock"
+    while silently skipping fields the handler later reads from args.
+    """
+    expected = {
+        "send_summary":     ["recipient", "subject"],
+        "send_reply":       ["recipient", "subject"],
+        "schedule_meeting": ["attendee", "event_title", "reply_subject"],
+        "modify_emails":    ["sender", "action"],
+    }
+    assert _DRIVER_ROUTING_FIELDS == expected
+
+
+def test_grant_required_wired_in_schedule_meeting_handler() -> None:
+    """
+    _GRANT_REQUIRED must match before_action field names in the handler source.
+    Pinning the frozenset alone does not catch deleting the grant calls.
+    """
+    import inspect
+    from safehouse.ironflow_policy import _GRANT_REQUIRED
+    from safehouse.driver import _handle_schedule_meeting
+
+    src = inspect.getsource(_handle_schedule_meeting)
+    assert "issue_action_grant" in src
+    for tool, field in _GRANT_REQUIRED:
+        assert tool == "schedule_meeting"
+        needle = f'before_action("schedule_meeting", "{field}"'
+        assert needle in src, (
+            f"_handle_schedule_meeting must call {needle}... — "
+            f"otherwise _GRANT_REQUIRED is dead configuration"
+        )
+
+
+def test_grant_required_fields_reference_real_driver_tools() -> None:
+    """
+    _GRANT_REQUIRED entries must name existing driver tools, and the calendar
+    time endorsement must stay pinned. Renaming schedule_meeting (or dropping
+    start/end) without updating _GRANT_REQUIRED would silently disable the
+    single-use ActionGrant requirement — a security regression, not an error.
+    """
+    from safehouse.ironflow_policy import _GRANT_REQUIRED
+
+    driver_tools = {name for name, sc in TOOL_SCHEMA.items() if sc.is_driver_tool}
+    for tool, grant_field in _GRANT_REQUIRED:
+        assert tool in driver_tools, (
+            f"_GRANT_REQUIRED references {tool!r} which is not a driver tool — "
+            f"update safehouse/ironflow_policy.py _GRANT_REQUIRED"
+        )
+        assert tool in _HANDLERS, f"_GRANT_REQUIRED references unhandled tool {tool!r}"
+
+    assert _GRANT_REQUIRED == frozenset({
+        ("schedule_meeting", "start_time"),
+        ("schedule_meeting", "end_time"),
+    }), "calendar start/end must remain grant-required (exact human endorsement)"
 
 
 def test_driver_tool_must_terminate_plans() -> None:
@@ -179,13 +281,10 @@ def test_handlers_are_granted_or_internal() -> None:
     from safehouse.driver import _HANDLERS
     from safehouse.permissions import driver_spec, CanCallTool
     granted = {p.tool_id for p in driver_spec().perms if isinstance(p, CanCallTool)}
-    # query_slot is a driver-internal endorsement path, not a plannable manifest
-    # tool (absent from DEFAULT_REGISTRY and TOOL_SCHEMA by design).
-    INTERNAL_ONLY = {"query_slot"}
-    ungoverned = set(_HANDLERS) - granted - INTERNAL_ONLY
+    ungoverned = set(_HANDLERS) - granted
     assert not ungoverned, (
-        f"handlers neither granted nor marked internal-only: {sorted(ungoverned)} — "
-        f"add a CanCallTool grant in driver_spec() or add to INTERNAL_ONLY with justification"
+        f"handlers not granted in driver_spec(): {sorted(ungoverned)} — "
+        f"add a CanCallTool grant in driver_spec()"
     )
 
 

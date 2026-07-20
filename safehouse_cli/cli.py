@@ -33,12 +33,15 @@ import tracer as _tracer_mod
 
 
 def _select_confirmer(cfg: RunConfig) -> Confirmer:
-    if not cfg.interactive:
-        return NonInteractiveConfirmer()
+    # Approval mode wins over interactive flag — otherwise
+    # `--non-interactive --approve auto|deny` (the documented CI form) would
+    # always raise ConfirmationRequired via NonInteractiveConfirmer.
     if cfg.approval == ApprovalMode.AUTO_FIRST_SLOT:
         return AutoApproveConfirmer()
     if cfg.approval == ApprovalMode.DENY:
         return DenyConfirmer()
+    if not cfg.interactive:
+        return NonInteractiveConfirmer()
     return ConsoleConfirmer()
 
 

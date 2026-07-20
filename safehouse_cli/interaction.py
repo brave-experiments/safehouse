@@ -1,17 +1,8 @@
 """
 interaction.py — Confirmer protocol and implementations for safehouse_cli.
 
-The headline bug this module fixes:
-  The headline bug: the old harness monkeypatched builtins.input to return
-  the string "yes". The schedule_meeting driver then called int("yes"), which
-  raised ValueError, was caught as choice=0, and silently created no calendar
-  invite while logging that it had approved. AutoApproveConfirmer returning 1
-  is the correct fix: slot index 1 is "choose the first proposed slot".
-
-Design:
-  - Confirmer is a Protocol (structural typing) so test doubles need no imports.
-  - Each implementation is self-contained; cli.py selects based on ApprovalMode.
-  - No builtins monkeypatching anywhere in this module or its callers.
+Confirmers return a 1-based slot index (or 0 for email-only). Grant integrity
+depends on start/end values, not labels — AutoApprove emits those explicitly.
 """
 
 from __future__ import annotations
@@ -21,8 +12,7 @@ import sys
 from typing import Protocol, runtime_checkable
 
 from safehouse.exceptions import ConfirmationRequired
-from safehouse.trace import emit, EvAutoApproved
-from safehouse.trace import Tracer   # for type hints only
+from safehouse.trace import emit, EvAutoApproved, format_meeting_slot
 
 
 @runtime_checkable
@@ -78,21 +68,17 @@ class ConsoleConfirmer:
 
 
 class AutoApproveConfirmer:
-    """
-    Headless confirmer that automatically selects slot 1.
-
-    Fixes the old monkeypatch bug: returning "yes" caused int("yes") → ValueError
-    → choice=0 → email-only path with no calendar invite, despite logging "approved".
-    This implementation returns the integer 1 directly.
-
-    Always prints and emits a trace event so the auto-decision is auditable.
-    """
+    """Selects slot 1 and emits the exact start/end ActionGrant will endorse."""
 
     async def confirm_slot(self, slots: list[dict]) -> int:
-        label = slots[0].get("label", slots[0].get("start", "slot 1")) if slots else "slot 1"
-        sys.stdout.write(f"  [auto-approve] selecting slot 1: {label}\n")
+        slot = slots[0] if slots else {}
+        start = str(slot.get("start", ""))
+        end = str(slot.get("end", ""))
+        label = str(slot.get("label", "") or start or "slot 1")
+        display = format_meeting_slot(slot) if (start or end) else label
+        sys.stdout.write(f"  [auto-approve] selecting slot 1: {display}\n")
         sys.stdout.flush()
-        emit(EvAutoApproved(slot_index=1, label=str(label)))
+        emit(EvAutoApproved(slot_index=1, label=label, start=start, end=end))
         return 1
 
     async def ask_recipient(self) -> str | None:
@@ -119,11 +105,9 @@ class NonInteractiveConfirmer:
     """
     Confirmer for headless runs that must never block.
 
-    Both methods raise ConfirmationRequired — cli.py maps this to exit code 5.
-    Use this when approval=INTERACTIVE but --non-interactive was passed; the
-    ConfigError in RunConfig.from_args() prevents that combination in practice,
-    but this class remains available for programmatic use where the caller knows
-    what it's doing.
+    Raises ConfirmationRequired — cli.py maps this to exit code 5.
+    Used when approval=INTERACTIVE but prompts are impossible; RunConfig
+    forbids that combo for CLI, but programmatic callers may still use it.
     """
 
     async def confirm_slot(self, slots: list[dict]) -> int:

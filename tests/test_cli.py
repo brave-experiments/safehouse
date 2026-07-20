@@ -62,7 +62,7 @@ import os
 import sys
 import tempfile
 from pathlib import Path
-from unittest.mock import AsyncMock, MagicMock, patch, call
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -77,7 +77,7 @@ from safehouse_cli.interaction import (
     NonInteractiveConfirmer,
 )
 from safehouse_cli.logging_io import JsonlTraceSink, Session, TeeStream, tee_streams
-from safehouse_cli.app import ExitCode, RunResult, _to_run_result, _recover_recipient, build_operator_context
+from safehouse_cli.app import ExitCode, _to_run_result, _recover_recipient
 from safehouse.planner import PlanValidationError
 import safehouse.trace as _trace
 
@@ -122,6 +122,23 @@ def test_non_interactive_default_approval_is_deny(monkeypatch) -> None:
 
 # ── Confirmers ────────────────────────────────────────────────────────
 
+def test_select_confirmer_honours_approve_auto_when_non_interactive() -> None:
+    """Documented CI form `--non-interactive --approve auto` must not raise."""
+    from safehouse_cli.cli import _select_confirmer
+    cfg = RunConfig.from_args([
+        "--task", "t", "--non-interactive", "--approve", "auto",
+    ])
+    assert isinstance(_select_confirmer(cfg), AutoApproveConfirmer)
+
+
+def test_select_confirmer_honours_approve_deny_when_non_interactive() -> None:
+    from safehouse_cli.cli import _select_confirmer
+    cfg = RunConfig.from_args([
+        "--task", "t", "--non-interactive", "--approve", "deny",
+    ])
+    assert isinstance(_select_confirmer(cfg), DenyConfirmer)
+
+
 def test_auto_approve_returns_int_1() -> None:
     """Regression: old builtins.input monkeypatch returned "yes" → int("yes") crash."""
     result = asyncio.run(AutoApproveConfirmer().confirm_slot([
@@ -129,6 +146,36 @@ def test_auto_approve_returns_int_1() -> None:
     ]))
     assert result == 1
     assert isinstance(result, int)
+
+
+def test_auto_approve_audits_exact_start_end(capsys) -> None:
+    """Headless auto-approve must surface the times ActionGrant will endorse."""
+    from safehouse.trace import EvAutoApproved, Tracer
+    from safehouse import trace as _trace
+
+    class _Cap(Tracer):
+        def __init__(self) -> None:
+            self.events: list = []
+        def on_event(self, event) -> None:
+            self.events.append(event)
+
+    cap = _Cap()
+    _trace.set_tracer(cap)
+    try:
+        asyncio.run(AutoApproveConfirmer().confirm_slot([{
+            "label": "Mon 10am",
+            "start": "2026-09-09T03:00:00",
+            "end":   "2026-09-09T04:00:00",
+        }]))
+    finally:
+        _trace.set_tracer(Tracer())
+
+    out = capsys.readouterr().out
+    assert "2026-09-09T03:00:00" in out
+    assert "2026-09-09T04:00:00" in out
+    ev = [e for e in cap.events if isinstance(e, EvAutoApproved)][0]
+    assert ev.start == "2026-09-09T03:00:00"
+    assert ev.end == "2026-09-09T04:00:00"
 
 
 def test_deny_confirmer_returns_zero() -> None:
@@ -217,8 +264,11 @@ def test_schedule_meeting_auto_approve_creates_event(monkeypatch) -> None:
     }), Label.U_priv())
 
     confirmer = AutoApproveConfirmer()
+    policy = IronFlow(store)
+    policy.precommit_routing(state, sources={"slots"},
+                             transform="structured:meeting_proposal")
     ctx = _StepContext(
-        store=store, policy=IronFlow(store),
+        store=store, policy=policy,
         driver=__import__("safehouse.permissions", fromlist=["driver_spec"]).driver_spec(),
         state=state,
         config=ProviderConfig(google_token="fake"),
@@ -253,7 +303,6 @@ def test_recover_recipient_retries_with_augmented_context(monkeypatch) -> None:
         assert "prompted@example.com" in operator_context
         return good_plan
 
-    from safehouse_cli import config as _cfg_mod
     with patch("safehouse_cli.app.generate_plan", side_effect=_fake_generate_plan):
         from safehouse_cli.config import RunConfig
         cfg = MagicMock(spec=RunConfig)
@@ -439,27 +488,7 @@ def test_plan_validation_error_is_value_error_subclass() -> None:
 
 
 def test_generate_plan_raises_typed_exc_on_error_response(monkeypatch) -> None:
-    """generate_plan raises PlanValidationError(field='recipient') for recipient errors."""
-    import safehouse.planner as planner_mod
-
-    class _FakeStream:
-        text_stream = iter([""])
-        def __enter__(self): return self
-        def __exit__(self, *a): pass
-
-    class _FakeMessages:
-        def stream(self, **kw): return _FakeStream()
-
-    class _FakeClient:
-        messages = _FakeMessages()
-
-    # Patch to inject a known raw output
-    import json as _json
-    raw_output = _json.dumps({"error": "missing routing field: recipient"})
-    # Note: _get_client uses lru_cache — patch via patch.object if a real call is needed.
-    # This test validates PlanValidationError construction only, not the full LLM call.
-
-    # Direct test: simulate what generate_plan does with abstract_plan having error+recipient
+    """PlanValidationError carries field='recipient' for recipient routing errors."""
     exc = PlanValidationError("Planner rejected the task: missing routing field: recipient",
                               field="recipient")
     assert exc.field == "recipient"

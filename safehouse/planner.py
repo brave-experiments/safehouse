@@ -161,7 +161,7 @@ _PIPELINE_SHAPES: list[PipelinePattern] = [
     "params": {"city": "<full city name>", "check_in": "<verbatim>", "check_out": "<verbatim>", "adults": 1},
     "slot_id": "hotel_results"}},
   {"tool": "spawn_processor",  "args": {"reads": ["flight_results", "hotel_results"], "out_slot": "travel_summary",
-    "instruction": "<score and summarise options; output top combinations as readable text with URLs>"}},
+    "instruction": "Select the best flight and hotel. Output ONLY the email body (plain text or light markdown): top flight with price/times/airline + booking URL if present; top hotel with name/price/total + booking URL; combined total. Do NOT include a Subject line, greeting preamble, or meta commentary. Keep under 7000 characters."}},
   {"tool": "send_summary",     "args": {"recipient": "<verbatim email or OPERATOR DEFAULT>", "subject": "<inferred>",
     "body_slot": "travel_summary"}}
 ]}
@@ -222,8 +222,8 @@ _PIPELINE_SHAPES: list[PipelinePattern] = [
     "reads": ["email_content", "calendar_events"], "out_slot": "meeting_proposal",
     "instruction": "Find 2-3 free <N>-minute slots on weekdays (09:00-18:00 {timezone}) that do not overlap any existing calendar event. Output ONLY valid JSON: {\"proposed_slots\": [{\"label\": \"<readable weekday date+time+tz>\", \"start\": \"<ISO8601+tz>\", \"end\": \"<ISO8601+tz>\"}], \"reply_body\": \"<polite email body proposing the times — no subject line>\"}"}},
   {"tool": "schedule_meeting", "args": {"attendee": "<verbatim email from task>",
-    "event_title": "<verbatim>", "duration_minutes": 30,
-    "reply_subject": "<verbatim>", "slots_slot": "meeting_proposal"}}
+    "event_title": "<verbatim from task, else 'Meeting'>",
+    "reply_subject": "Re: Meeting Request", "slots_slot": "meeting_proposal"}}
 ]}""",
     ),
 
@@ -310,6 +310,9 @@ Reason through these internally — do not output this reasoning, only the final
        matches the task's intended outcome. Do not force-fit; if no tool matches, output an error.
   2. ROUTING FIELDS — apply the AXIOM. Additionally:
        subject/reply_subject may be inferred from task context (e.g. "Summarise my invoices" → "Invoice Summary").
+       event_title: use a title that appears in the task; if the task names none, use a short
+       generic title such as "Meeting" or "30-minute meeting". NEVER invent a person's name by
+       splitting or guessing from an email local-part (e.g. ashahinshamsabadi@… → not "Asha …").
        Include routing fields as args on the Tier 3 driver tool step.
        If OPERATOR DEFAULTS contains a recipient, use it — it carries (T,pub) trust.
        Missing recipient with no OPERATOR DEFAULT → output {"error": "missing routing field: recipient"}.
@@ -338,6 +341,9 @@ Reason through these internally — do not output this reasoning, only the final
      emit one search step per representative sample — typically 3–4 steps spaced evenly across
      the range — each writing to a distinct slot_id. Then add a spawn_processor step that reads
      all result slots and selects the best option. For fixed points, use a single step.
+  7. Email bodies (spawn_processor → send_summary / send_reply body_slot): instruct the
+     processor to output ONLY the message body — no Subject line, no "here is the email"
+     preamble. Subject is a separate (T,pub) routing field. Keep the body under 7000 characters.
 """
 
 
@@ -541,7 +547,6 @@ TOOL_SCHEMA: dict[str, ToolContract] = {
         slot_refs       = ("slots_slot",),
         max_email_list  = 10,
         is_driver_tool  = True,
-        # duration_minutes is optional: driver uses args.get("duration_minutes", 30)
     ),
     "modify_emails": ToolContract(
         required        = ("sender", "action"),

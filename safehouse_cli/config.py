@@ -59,7 +59,6 @@ class RunConfig:
     """
     task:           str
     recipient:      str | None        # --recipient flag; falls back to DEMO_RECIPIENT
-    pause:          bool
     approval:       ApprovalMode
     dry_run:        bool
     json_output:    bool
@@ -110,7 +109,7 @@ class RunConfig:
         p.add_argument("--recipient",
                        help="Recipient email (overrides DEMO_RECIPIENT)")
         p.add_argument("--pause", action="store_true",
-                       help="Pause at key steps for demo/video recording")
+                       help="Force --approve interactive (alias for walkthroughs)")
         p.add_argument("--approve", choices=["interactive", "auto", "deny"],
                        default=None,
                        help="Approval mode for confirmation prompts "
@@ -190,7 +189,6 @@ class RunConfig:
         return cls(
             task         = task,
             recipient    = recipient,
-            pause        = args.pause,
             approval     = approval,
             dry_run      = args.dry_run,
             json_output  = args.json_output,

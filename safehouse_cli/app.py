@@ -20,13 +20,12 @@ import asyncio
 import time
 from dataclasses import dataclass
 from enum import IntEnum
-from pathlib import Path
 
 from safehouse.driver import run_manifest as driver_run_manifest
 from safehouse.planner import generate_plan, PlanValidationError, _MISSING_RECIPIENT_SIGNAL
 from safehouse.trace import emit, set_tracer, EvStaticPlan, MultiTracer
 
-from .config import ConfigError, RunConfig
+from .config import RunConfig
 from .credentials import CredentialError, GoogleTokenProvider
 from .interaction import Confirmer, ConfirmationRequired
 from .logging_io import Session, JsonlTraceSink
@@ -167,7 +166,7 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
 
     # Wire tracer BEFORE generate_plan so planning events reach both sinks.
     spec          = _tracer_mod.get_universal_spec()
-    console_tracer = _tracer_mod.make_tracer(spec, pause=cfg.pause)
+    console_tracer = _tracer_mod.make_tracer(spec)
     set_tracer(MultiTracer(console_tracer, sink))
 
     operator_context = build_operator_context(cfg)
@@ -259,9 +258,14 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
     except asyncio.TimeoutError:
         elapsed = time.monotonic() - t0
         sink.close()
+        # Timeout can land after calendar/email side effects — never blind-retry.
         return RunResult(
             ExitCode.PIPELINE_ERROR, "timeout",
-            {"reason": f"timed out after {cfg.timeout_s}s", "status": "timeout"},
+            {
+                "reason": f"timed out after {cfg.timeout_s}s",
+                "status": "timeout",
+                "do_not_retry": True,
+            },
             session, elapsed,
         )
 

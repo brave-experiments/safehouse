@@ -5,18 +5,14 @@ This file is the rendering engine. It is intentionally separate so that
 safehouse_cli shows only system flow, not display detail.
 
 Contents (in order):
-  1. Terminal display helpers  (_w, _banner, _section, _pause, …)
+  1. Terminal display helpers  (_w, _banner, _section, …)
   2. _ironflow_intro            (opening banner + IronFlow principles)
   3. Shared audit helpers       (print_slot_inventory, print_violations, …)
   4. BaseTracer                 (renders every common pipeline event)
-  5. DemoSpec + _DemoTracer     (generic per-demo configuration + tracer)
-  6. Per-demo specs             (_BRIEFING_SPEC, _TRIP_SPEC, _EMAIL_SPEC,
-                                 _CALENDAR_SPEC)
-     Each spec block: event handlers → audit function → DemoSpec instance
-     _CALENDAR_SPEC covers both the calendar-summary and meeting-scheduling
-     flows; the planner selects the right tools from the task string.
+  5. DemoSpec + _DemoTracer     (configuration + tracer driven by event handlers)
+  6. Per-pipeline handlers/audits  (briefing, trip, email, calendar, meeting)
   7. Universal spec             (_UNIVERSAL_SPEC)
-     Merges all per-demo handlers; runtime pipeline selection via
+     Merges all pipeline handlers; runtime selection via
      tracer._state["_pipeline"] (set by safehouse_cli.app after generate_plan).
 """
 
@@ -33,7 +29,7 @@ from urllib.parse import urlparse as _urlparse
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
 from safehouse.ironflow_policy import PRINCIPLES
-from safehouse.planner import TOOL_SCHEMA, ToolContract
+from safehouse.planner import TOOL_SCHEMA
 from safehouse.trace import (
     Tracer,
     EvPlanPhase1Start, EvPlanChunk, EvPlanPhase2, EvPlanPhase3,
@@ -44,9 +40,10 @@ from safehouse.trace import (
     EvRoutingLocked, EvBookingUrlsExtracted,
     EvReplyActionFired,
     EvMeetingOptionsReady,
-    EvMeetingConfirmation, EvMeetingScheduled,
+    EvMeetingConfirmation, EvMeetingScheduled, EvActionGranted,
     EvEmailsModified,
     EvAutoApproved,
+    format_meeting_slot,
 )
 
 
@@ -92,17 +89,6 @@ def _banner(title: str) -> None:
 def _section(title: str) -> None:
     w = _w()
     print(f"\n{'─'*w}\n  {title}\n{'─'*w}", flush=True)
-
-def _pause(msg: str, hint: str = "") -> None:
-    """Blocking pause for demo/video recording."""
-    w = _w()
-    print(f"\n{'·'*w}")
-    print(f"  ⏸  {msg}")
-    if hint:
-        print(f"     {hint}")
-    input("  Press Enter to continue…")
-    print()   # Enter keypress bypasses _Tee; force newline into file
-    print(f"{'·'*w}\n")
 
 def _fmt_perm(p: str) -> str:
     """Truncate URLs inside NET(...) to 40 chars, stripping the scheme."""
@@ -405,17 +391,15 @@ class BaseTracer(Tracer):
             attendee    = args.get("attendee", "")
             event_title = args.get("event_title", "")
             reply_subj  = args.get("reply_subject", "")
-            dur         = args.get("duration_minutes", 60)
             slots       = args.get("slots_slot", "")
             print(f"\n  [{idx}] schedule_meeting  "
                   f"← TIER 3 DRIVER TOOL · pure Python · no LLM")
             print(f"       attendee:      {attendee!r}  (T,pub)  ← pre-committed before step 0")
             print(f"       event_title:   {event_title!r}  (T,pub)  ← pre-committed before step 0")
             print(f"       reply_subject: {reply_subj!r}  (T,pub)  ← pre-committed before step 0")
-            print(f"       duration:      {dur} min  (T,pub)")
-            print(f"       step 1  declassify slots_slot    →  (U,priv) → (U,pub)")
+            print(f"       step 1  declassify_slot          →  destination-precommitted downgrade")
             print(f"       step 2  IronFlow bridge          →  INJECT mode")
-            print(f"       step 3  human confirm slot       →  chosen slot elevated to (T,pub)")
+            print(f"       step 3  human confirm slot       →  ActionGrant for start/end")
             print(f"       step 4  create calendar event    →  Google Calendar API POST")
             print(f"       step 5  send threaded reply      →  Gmail API (In-Reply-To)")
             print(f"       slots_slot: {slots!r}")
@@ -631,7 +615,11 @@ class BaseTracer(Tracer):
                 print(f"           ✓ {cond}")
 
         elif isinstance(ev, EvAutoApproved):
-            print(f"  [auto-approve] slot {ev.slot_index} selected: {ev.label}")
+            display = (
+                format_meeting_slot({"start": ev.start, "end": ev.end, "label": ev.label})
+                if (ev.start or ev.end) else ev.label
+            )
+            print(f"  [auto-approve] slot {ev.slot_index} selected: {display}")
 
         elif isinstance(ev, EvPipelineEnd):
             self._flush_gates()
@@ -649,13 +637,7 @@ class BaseTracer(Tracer):
 
 @dataclass
 class DemoSpec:
-    """Declarative description of a single demo pipeline."""
-    name:                 str
-    session_prefix:       str
-    # [(env_var, hint_string), ...] — validated before running; values passed to default_task
-    required_env:         list[tuple[str, str]]                  = dc_field(default_factory=list)
-    # Build default task string from collected env values; None means --task is required
-    default_task:         Callable[[dict[str, str]], str] | None = None
+    """Declarative description of tracer display behaviour for a pipeline run."""
     # {EventType: fn(tracer, ev)} — dispatched from _on_other_event
     event_handlers:       dict[type, Callable]                   = dc_field(default_factory=dict)
     # Extra gate types beyond the base {"ACTION", "BRIDGE"}
@@ -668,20 +650,14 @@ class DemoSpec:
     audit_fn:             Callable | None                        = None
     # Banner text shown above the task string
     task_banner:          str  = "TASK"
-    # Passed to run_demo(); auto_approve is disabled automatically when pause=True
-    auto_approve:         bool = False
-    reset_ds:             bool = False
-    # Whether --pause is accepted for this demo
-    supports_pause:       bool = False
 
 
 class _DemoTracer(BaseTracer):
     """Generic tracer driven by DemoSpec — no per-demo subclass needed."""
 
-    def __init__(self, spec: DemoSpec, pause: bool = False) -> None:
+    def __init__(self, spec: DemoSpec) -> None:
         super().__init__()
         self._spec   = spec
-        self._pause  = pause
         self._state: dict[str, Any] = {}
         self._GATE_TYPES = BaseTracer._GATE_TYPES | spec.extra_gate_types
 
@@ -708,32 +684,14 @@ class _DemoTracer(BaseTracer):
 
 
 # ══════════════════════════════════════════════════════════════════════
-# 6. PER-DEMO SPECS
-# Each block: event handler functions → audit function → DemoSpec instance.
+# 6. PER-PIPELINE HANDLERS AND AUDITS
+# Used by _UNIVERSAL_SPEC; dispatched via tracer._state["_pipeline"].
 # ══════════════════════════════════════════════════════════════════════
 
 # ── Briefing ──────────────────────────────────────────────────────────
-# Fetches two articles, synthesises a security briefing, emails it.
+# Fetches articles, synthesises a briefing, emails it.
 # IPI defence: recipient and subject are (T,pub) from the task string;
 # injected content in fetched pages cannot redirect the email.
-
-_BRIEFING_DEFAULT_URLS = (
-    "  1. https://simonwillison.net/2023/Apr/25/dual-llm-pattern/\n"
-    "  2. https://brave.com/blog/prompt-injection-flaw-opera-neon/"
-)
-
-
-def _briefing_default_task(env: dict[str, str]) -> str:
-    import datetime as _dt
-    month_year = _dt.date.today().strftime("%B %Y")
-    return (
-        f"Fetch these two articles and write a combined security briefing:\n"
-        f"{_BRIEFING_DEFAULT_URLS}\n"
-        f"Send the briefing to {env['DEMO_RECIPIENT']} "
-        f"with subject 'AI Security Briefing — {month_year}'."
-    )
-
-
 
 def _briefing_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
     _banner("POST-EXECUTION AUDIT")
@@ -781,25 +739,6 @@ def _on_send_summary_fired(t: _DemoTracer, ev: EvActionFired) -> None:
     print(f"  Body:    {ev.body_chars:,} chars  [{ev.body_label}]")
     if ev.body_preview:
         print(f"  Preview: {ev.body_preview.replace(chr(10), ' ')[:75]!r}")
-
-
-_BRIEFING_SPEC = DemoSpec(
-    name="briefing",
-    session_prefix="briefing",
-    required_env=[
-        ("GOOGLE_ACCESS_TOKEN",
-         "Required for Gmail delivery.  Get one from "
-         "https://developers.google.com/oauthplayground\n"
-         "  Scopes required: gmail.send"),
-        ("DEMO_RECIPIENT",
-         "Set it to your email address:  export DEMO_RECIPIENT=you@example.com"),
-    ],
-    default_task=_briefing_default_task,
-    event_handlers={
-        EvActionFired: _on_send_summary_fired,
-    },
-    audit_fn=_briefing_audit,
-)
 
 
 # ── Trip ──────────────────────────────────────────────────────────────
@@ -862,44 +801,6 @@ def _trip_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
     print(f"  elapsed: {elapsed:.1f}s")
 
 
-def _trip_default_task(env: dict[str, str]) -> str:
-    import datetime as _dt
-    today = _dt.date.today()
-    # outbound: 14 days from today, return: 3 nights later
-    outbound = today + _dt.timedelta(days=14)
-    ret      = outbound + _dt.timedelta(days=3)
-    return (
-        "Find the best London (LHR) to Lisbon (LIS) flight and a Lisbon hotel for a "
-        f"3-night stay, outbound {outbound}, return {ret}, 1 adult, total budget "
-        f"under £600. Email a summary of the best options to {env['DEMO_RECIPIENT']}."
-    )
-
-
-_TRIP_SPEC = DemoSpec(
-    name="trip",
-    session_prefix="trip",
-    required_env=[
-        ("GOOGLE_ACCESS_TOKEN",
-         "Required for Gmail delivery.  Get one from "
-         "https://developers.google.com/oauthplayground\n"
-         "  Scopes required: gmail.send"),
-        ("DEMO_RECIPIENT",
-         "Set it to your email address:  export DEMO_RECIPIENT=you@example.com"),
-    ],
-    default_task=_trip_default_task,
-    event_handlers={
-        EvActionFired:          _on_send_summary_fired,
-        EvBookingUrlsExtracted: _trip_on_booking_urls_extracted,
-    },
-    extra_gate_types={"ACTION_DOMAIN"},
-    slot_written_handler=None,
-    audit_fn=_trip_audit,
-    auto_approve=True,   # disabled automatically when pause=True (see safehouse_cli RunConfig)
-    reset_ds=True,
-    supports_pause=True,
-)
-
-
 # ── Email ──────────────────────────────────────────────────────────────
 # driver.run() pre-commits recipient + subject as (T,pub) before step 0.
 # mcp_email_search calls Gmail REST API deterministically (operator code, no LLM).
@@ -918,7 +819,7 @@ def _render_reply_action_fired(
     t._flush_gates()
     t._state[key] = vars(ev)
     print(f"  To:      {ev.recipient!r}  [{ev.recipient_label}]  "
-          f"← from locked template, not {source}")
+          f"← from locked routing, not {source}")
     print(f"  Subject: {ev.subject!r}  [{ev.subject_label}]")
     print(f"  Body:    {ev.body_chars:,} chars  "
           f"[{ev.body_label_before} → {ev.body_label_after}]  "
@@ -941,13 +842,6 @@ def _email_on_emails_modified(t: _DemoTracer, ev: EvEmailsModified) -> None:
         print(f"  label_id:   {ev.label_id!r}  ← resolved by Gmail labels API")
     print(f"  modified:   {ev.message_count} message(s)")
     print(f"  note:       no email content was read — only opaque message IDs handled")
-
-
-def _email_plan_step(t: _DemoTracer, ev: EvPlanStep) -> None:
-    if ev.tool in ("send_reply", "modify_emails"):
-        _banner(f"DRIVER  —  FINAL ACTION: {ev.tool}")
-    else:
-        BaseTracer._on_plan_step(t, ev)
 
 
 def _email_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
@@ -1004,8 +898,8 @@ def _email_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
         print("  3. No (U,priv) slot is written. No declassification needed.")
         print("     The pipeline contains zero untrusted data at any point.")
         print()
-        print("  4. modify_emails has no routing fields — there is no recipient,")
-        print("     subject, or body that injected content could redirect.")
+        print("  4. Routing is only sender + action (T,pub from the task) — there is no")
+        print("     recipient, subject, or body that injected content could redirect.")
         print("     IPI is a structural impossibility for this tool.")
 
         print_violations(viols)
@@ -1052,7 +946,7 @@ def _email_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
         print()
         print('  4. send_summary reads recipient and subject from state.vars["_routing"] (T,pub,')
         print("     pre-committed before step 0). No path from (U,_) to routing.")
-        print("     Driver declassified body (U,priv) → (U,pub) on isolation grounds.")
+        print("     Driver declassified body (U,priv) → (U,pub) for the precommitted destination.")
 
         print_violations(viols)
         all_ok = all(ok for _, ok in checks)
@@ -1117,35 +1011,12 @@ def _email_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
     print(f"  elapsed: {elapsed:.1f}s")
 
 
-_EMAIL_SPEC = DemoSpec(
-    name="email",
-    session_prefix="email",
-    required_env=[("GOOGLE_ACCESS_TOKEN",
-                   "Get one from https://developers.google.com/oauthplayground\n"
-                   "  Scopes required: gmail.modify + gmail.send\n"
-                   "  See SETUP.md for step-by-step instructions.")],
-    default_task=None,   # --task is required for this demo
-    event_handlers={
-        EvActionFired:      _on_send_summary_fired,
-        EvReplyActionFired: _email_on_reply_action_fired,
-        EvEmailsModified:   _email_on_emails_modified,
-    },
-    plan_step_handler=_email_plan_step,
-    audit_fn=_email_audit,
-    task_banner="TASK  (trusted operator input — the only source of (T,pub) data)",
-)
-
-
 # ── Calendar ───────────────────────────────────────────────────────────
 # Reads Google Calendar events, drafts a summary, sends to locked recipient.
 # IPI defence: calendar event descriptions/titles may contain injection payloads
 # attempting to redirect the reply. Routing is pre-committed as (T,pub) by
 # driver.run() before step 0 — structural impossibility for any injection
 # to alter recipient or subject.
-
-def _calendar_on_reply_action_fired(t: _DemoTracer, ev: EvReplyActionFired) -> None:
-    _render_reply_action_fired(t, ev, key="final_reply", source="calendar content")
-
 
 def _calendar_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
     if result.get("status") not in ("success", None):
@@ -1155,9 +1026,8 @@ def _calendar_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
         print()
     _banner("POST-EXECUTION AUDIT")
 
-    # send_summary stores to "final_summary" (body_label key)
-    # send_reply stores to "final_reply" (body_label_after key)
-    fe = t._state.get("final_summary") or t._state.get("final_reply") or {}
+    # send_summary → "final_summary"; send_reply → "final" (shared reply handler)
+    fe = t._state.get("final_summary") or t._state.get("final") or {}
     if fe:
         body_label = fe.get("body_label") or fe.get("body_label_after", "?")
         via = "send_summary" if "body_label" in fe else "send_reply"
@@ -1200,7 +1070,7 @@ def _calendar_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
     print()
     print('  4. send_summary reads recipient and subject from state.vars["_routing"] (T,pub,')
     print("     pre-committed before step 0). No path from (U,_) to routing.")
-    print("     Driver declassified body (U,priv) → (U,pub) on isolation grounds.")
+    print("     Driver declassified body (U,priv) → (U,pub) for the precommitted destination.")
 
     print_violations(viols)
     all_ok = all(ok for _, ok in checks)
@@ -1210,16 +1080,15 @@ def _calendar_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
 
 
 # ── Meeting event handlers ───────────────────────────────────────────────
-# Shared with the merged _CALENDAR_SPEC.  These fire on the meeting-scheduling
-# path; the calendar-summary path fires the _calendar_on_* handlers above.
-# The two paths emit entirely different event types so there is no overlap.
+# Fire on the meeting-scheduling path; calendar-summary uses reply/summary
+# handlers above. Distinct event types — no overlap.
 
 def _meeting_on_options_ready(t: _DemoTracer, ev: EvMeetingOptionsReady) -> None:
     _banner("DRIVER  —  PROPOSED MEETING SLOTS  (human confirmation required)")
     print(f"  attendee:    {ev.attendee}")
     print(f"  event:       {ev.event_title}")
     for i, slot in enumerate(ev.proposed_slots):
-        print(f"  [{i+1}] {slot.get('label', slot.get('start', ''))}", flush=True)
+        print(format_meeting_slot(slot, index=i + 1), flush=True)
 
 
 def _meeting_on_confirmation(t: _DemoTracer, ev: EvMeetingConfirmation) -> None:
@@ -1227,20 +1096,26 @@ def _meeting_on_confirmation(t: _DemoTracer, ev: EvMeetingConfirmation) -> None:
     t._flush_gates()
     if ev.approved:
         slot = ev.proposed_slots[ev.chosen_index]
-        _banner(f"DRIVER  —  SLOT CONFIRMED  →  {slot.get('label', slot.get('start', ''))}")
+        _banner(f"DRIVER  —  SLOT CONFIRMED  →  "
+                f"{slot.get('start', '?')} → {slot.get('end', '?')}")
     else:
         _banner("DRIVER  —  NO SLOT CHOSEN  →  email only (no calendar event)")
+
+
+def _meeting_on_action_granted(t: _DemoTracer, ev: EvActionGranted) -> None:
+    fields = ", ".join(f"{k}={v!r}" for k, v in sorted(ev.fields.items()))
+    print(f"  ACTION GRANT  [{ev.tool}]  {fields}  ← single-use endorsement", flush=True)
 
 
 def _meeting_on_scheduled(t: _DemoTracer, ev: EvMeetingScheduled) -> None:
     t._state["final_meeting"] = vars(ev)
     _banner("DRIVER  —  FINAL ACTION: schedule_meeting")
     print(f"  attendee:    {ev.attendee!r}  [{ev.attendee_label}]  "
-          f"← from locked template, not email content")
+          f"← from locked routing, not email content")
     print(f"  event_title: {ev.event_title!r}")
     if ev.start_time:
         print(f"  slot:        {ev.start_time} → {ev.end_time}  "
-              f"[{ev.start_label}]  ← elevated after human confirm")
+              f"[{ev.start_label}]  ← ActionGrant after human confirm")
     if ev.event_id:
         print(f"  calendar:    event_id={ev.event_id!r}  link={ev.event_link!r}")
     print(f"  reply:       {ev.body_chars:,} chars  "
@@ -1248,44 +1123,8 @@ def _meeting_on_scheduled(t: _DemoTracer, ev: EvMeetingScheduled) -> None:
           f"← declassified by DRIVER")
 
 
-# ── Merged Calendar + Meeting spec ─────────────────────────────────────
-# _CALENDAR_SPEC covers both flows.  Which flow runs is determined entirely
-# by the task string — the planner selects the right tools automatically:
-#
-#   Calendar summary (default task):
-#     mcp_calendar_search → spawn_processor → send_reply
-#     routing (recipient, subject) pre-committed (T,pub) by driver.run() before step 0
-#
-#   Meeting scheduling (pass --task with a meeting request description):
-#     mcp_email_search → mcp_calendar_search → spawn_processor → schedule_meeting
-#     routing (attendee, event_title, reply_subject) pre-committed (T,pub) before step 0
-#
-# Required env:
-#   GOOGLE_ACCESS_TOKEN — always required (scopes: calendar + gmail.send
-#                         + gmail.readonly for meeting path)
-#   DEMO_RECIPIENT      — only for the default calendar-summary task;
-#                         not needed when --task is provided.
-
-def _calendaring_default_task(env: dict[str, str]) -> str:
-    recipient = os.environ.get("DEMO_RECIPIENT", "").strip()
-    if not recipient:
-        print("\n  ERROR: DEMO_RECIPIENT is not set.")
-        print("  Set it to your email address:  export DEMO_RECIPIENT=you@example.com")
-        print("  (Needed for the default calendar-summary task.)")
-        print("  For meeting scheduling, pass --task explicitly instead.")
-        sys.exit(1)
-    return (
-        f"Fetch my calendar events for today and send a summary to "
-        f"{recipient} with subject 'Your Calendar Summary'."
-    )
-
-
-def _calendaring_plan_step(t: _DemoTracer, ev: EvPlanStep) -> None:
-    if ev.tool in ("send_reply", "schedule_meeting"):
-        _banner(f"DRIVER  —  FINAL ACTION: {ev.tool}")
-    else:
-        BaseTracer._on_plan_step(t, ev)
-
+# Calendar-summary vs meeting-scheduling: planner picks tools; audit dispatches
+# on whether final_meeting was recorded.
 
 def _calendaring_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
     if t._state.get("final_meeting"):
@@ -1308,9 +1147,9 @@ def _meeting_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
         _audit_row("attendee",   fe["attendee_label"],    fe["attendee"],
                    "pre-committed (T,pub) before step 0 — NEVER from email/calendar content")
         _audit_row("start_time", fe["start_label"],        fe["start_time"],
-                   "elevated to (T,pub) after human slot confirmation")
+                   "ActionGrant after human slot confirmation")
         _audit_row("end_time",   fe["end_label"],          fe["end_time"],
-                   "elevated to (T,pub) after human slot confirmation")
+                   "ActionGrant after human slot confirmation")
         _audit_row("body",       fe["body_label_after"],
                    f"{fe['body_chars']:,} chars",
                    f"slot {fe['body_label_before']} → declassified {fe['body_label_after']} by DRIVER")
@@ -1349,40 +1188,14 @@ def _meeting_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
     print("     fetched request via In-Reply-To/References (MIME only — never routing).")
     print("     Body declassified (U,priv) → (U,pub). No path from (U,_) to routing.")
     print()
-    print("  5. Calendar invite timing is (T,pub) only AFTER human confirmation —")
-    print("     the human review is the trust endorsement; no LLM can bypass it.")
+    print("  5. Calendar invite timing requires a single-use ActionGrant issued only")
+    print("     after human confirmation — no LLM can bypass it.")
 
     print_violations(viols)
     all_ok = all(ok for _, ok in checks)
     _banner("ALL INVARIANTS HOLD — IPI ATTACK STRUCTURALLY BLOCKED"
             if all_ok else "SOME CHECKS FAILED")
     print(f"  elapsed: {elapsed:.1f}s")
-
-
-_CALENDAR_SPEC = DemoSpec(
-    name="calendar",
-    session_prefix="calendar",
-    required_env=[
-        ("GOOGLE_ACCESS_TOKEN",
-         "Get one from https://developers.google.com/oauthplayground\n"
-         "  Scopes required: calendar + gmail.readonly + gmail.send"),
-    ],
-    default_task=_calendaring_default_task,
-    event_handlers={
-        # calendar-summary path
-        EvActionFired:         _on_send_summary_fired,
-        EvReplyActionFired:    _calendar_on_reply_action_fired,
-        # meeting-scheduling path
-        EvMeetingOptionsReady: _meeting_on_options_ready,
-        EvMeetingConfirmation: _meeting_on_confirmation,
-        EvMeetingScheduled:    _meeting_on_scheduled,
-    },
-    plan_step_handler=_calendaring_plan_step,
-    slot_written_handler=None,
-    audit_fn=_calendaring_audit,
-    task_banner="TASK  (trusted operator input — the only source of (T,pub) data)",
-    supports_pause=True,
-)
 
 
 # ══════════════════════════════════════════════════════════════════════
@@ -1394,8 +1207,10 @@ _CALENDAR_SPEC = DemoSpec(
 # ══════════════════════════════════════════════════════════════════════
 
 def _universal_plan_step(t: _DemoTracer, ev: EvPlanStep) -> None:
-    """Banners every Tier 3 driver tool; falls back to BaseTracer for all others."""
-    if ev.tool in ("send_reply", "modify_emails", "schedule_meeting"):
+    """Banner Tier 3 tools that do not emit their own completion banner."""
+    # send_reply has no completion-event banner; modify_emails / schedule_meeting
+    # banner from EvEmailsModified / EvMeetingScheduled instead.
+    if ev.tool == "send_reply":
         _banner(f"DRIVER  —  FINAL ACTION: {ev.tool}")
     else:
         BaseTracer._on_plan_step(t, ev)
@@ -1415,10 +1230,6 @@ def _universal_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
 
 
 _UNIVERSAL_SPEC = DemoSpec(
-    name="universal",
-    session_prefix="session",   # overridden per-run based on detected pipeline
-    required_env=[],            # checked post-plan in safehouse_cli.app based on tools used
-    default_task=None,          # --task is always required
     event_handlers={
         EvActionFired:          _on_send_summary_fired,
         EvBookingUrlsExtracted: _trip_on_booking_urls_extracted,
@@ -1426,14 +1237,13 @@ _UNIVERSAL_SPEC = DemoSpec(
         EvEmailsModified:       _email_on_emails_modified,
         EvMeetingOptionsReady:  _meeting_on_options_ready,
         EvMeetingConfirmation:  _meeting_on_confirmation,
+        EvActionGranted:        _meeting_on_action_granted,
         EvMeetingScheduled:     _meeting_on_scheduled,
     },
     extra_gate_types={"ACTION_DOMAIN"},
-    slot_written_handler=None,
     plan_step_handler=_universal_plan_step,
     audit_fn=_universal_audit,
     task_banner="TASK  (trusted operator input — the only source of (T,pub) data)",
-    supports_pause=True,
 )
 
 
@@ -1445,7 +1255,7 @@ def detect_pipeline(tools: set[str]) -> str:
     Infer pipeline type from the set of tool names in the concrete plan.
 
     Called by safehouse_cli.app after generate_plan() so the harness can select
-    the right session prefix, env vars, and reset behaviour.
+    the right session prefix and env vars.
     """
     if tools & {"mcp_flight_search", "mcp_hotel_search"}:
         return "trip"
@@ -1474,12 +1284,11 @@ _PIPELINE_ENV: dict[str, list[tuple[str, str]]] = {
 # ══════════════════════════════════════════════════════════════════════
 # 8. PUBLIC FACADE
 # Stable public names for safehouse_cli (no leading underscore).
-# Old private names kept as aliases for one release.
 # ══════════════════════════════════════════════════════════════════════
 
-def make_tracer(spec: DemoSpec, pause: bool = False) -> _DemoTracer:
+def make_tracer(spec: DemoSpec) -> _DemoTracer:
     """Construct a _DemoTracer for `spec`."""
-    return _DemoTracer(spec, pause=pause)
+    return _DemoTracer(spec)
 
 
 def banner(title: str) -> None:

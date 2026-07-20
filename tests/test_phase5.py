@@ -46,10 +46,18 @@ _WITH_TOKEN = ProviderConfig(google_token="fake-token")
 
 def _ctx(store: SlotStore, state: PlanState | None = None,
          config: ProviderConfig = _NO_CREDS,
-         confirm_slot=None) -> _StepContext:
+         confirm_slot=None,
+         *,
+         sources: set[str] | None = None,
+         transform: str | None = None) -> _StepContext:
     state = state or PlanState()
+    policy = IronFlow(store)
+    if "_routing" in state.vars:
+        src = sources or set()
+        xf = transform if transform is not None else ("opaque" if src else None)
+        policy.precommit_routing(state, sources=src, transform=xf)
     kwargs: dict = dict(
-        store=store, policy=IronFlow(store), driver=driver_spec(),
+        store=store, policy=policy, driver=driver_spec(),
         state=state, config=config,
     )
     if confirm_slot is not None:
@@ -99,7 +107,7 @@ def test_send_summary_no_credentials_is_terminal() -> None:
     ))
     store.create("body")
     store.write("body", "body text", Label.U_pub())
-    ctx = _ctx(store, state, _NO_CREDS)
+    ctx = _ctx(store, state, _NO_CREDS, sources={"body"})
 
     _, final = asyncio.run(
         _handle_send_summary({"body_slot": "body"}, ctx)
@@ -107,6 +115,25 @@ def test_send_summary_no_credentials_is_terminal() -> None:
     assert final is not None, "no-credentials path must be terminal"
     assert final["status"] == "error"
     assert "credentials" in final["reason"]
+
+
+def test_send_summary_empty_released_body_is_terminal() -> None:
+    store = SlotStore()
+    state = PlanState()
+    state.set_var("_routing", LVal(
+        {"recipient": "alice@corp.com", "subject": "Hi"},
+        Label.T_pub(),
+    ))
+    store.create("body")
+    store.write("body", "   ", Label.U_pub())
+    ctx = _ctx(store, state, _WITH_TOKEN, sources={"body"})
+
+    _, final = asyncio.run(
+        _handle_send_summary({"body_slot": "body"}, ctx)
+    )
+    assert final is not None
+    assert final["status"] == "error"
+    assert "empty" in final["reason"]
 
 
 def test_send_reply_no_token_is_terminal() -> None:
@@ -118,7 +145,7 @@ def test_send_reply_no_token_is_terminal() -> None:
     ))
     store.create("body")
     store.write("body", "body text", Label.U_pub())
-    ctx = _ctx(store, state, _NO_CREDS)
+    ctx = _ctx(store, state, _NO_CREDS, sources={"body"})
 
     _, final = asyncio.run(
         _handle_send_reply({"body_slot": "body"}, ctx)
@@ -173,7 +200,8 @@ def test_schedule_meeting_choice_zero_email_only() -> None:
     async def _confirm_zero(slots):
         return 0
 
-    ctx = _ctx(store, state, _NO_CREDS, confirm_slot=_confirm_zero)
+    ctx = _ctx(store, state, _NO_CREDS, confirm_slot=_confirm_zero,
+               sources={"slots"}, transform="structured:meeting_proposal")
 
     _, final = asyncio.run(
         _handle_schedule_meeting({"slots_slot": "slots"}, ctx)
@@ -216,16 +244,142 @@ def test_schedule_meeting_choice_one_approved(monkeypatch) -> None:
     async def _confirm_one(slots):
         return 1
 
-    ctx = _ctx(store, state, _WITH_TOKEN, confirm_slot=_confirm_one)
+    ctx = _ctx(store, state, _WITH_TOKEN, confirm_slot=_confirm_one,
+               sources={"slots"}, transform="structured:meeting_proposal")
 
-    _, final = asyncio.run(
-        _handle_schedule_meeting({"slots_slot": "slots"}, ctx)
-    )
+    from safehouse import trace as _trace
+    from safehouse.trace import EvActionGranted, Tracer
+
+    class _Cap(Tracer):
+        def __init__(self) -> None:
+            self.events: list = []
+        def on_event(self, event) -> None:
+            self.events.append(event)
+
+    cap = _Cap()
+    _trace.set_tracer(cap)
+    try:
+        _, final = asyncio.run(
+            _handle_schedule_meeting({"slots_slot": "slots"}, ctx)
+        )
+    finally:
+        _trace.set_tracer(Tracer())
+
     assert final is not None
     assert final.get("status") == "success"
     assert final.get("event_id") == "evt123"
     assert sent[0]["to"] == "alice@corp.com"
     assert sent[0]["body_slot"] == "slots"
+    granted = [e for e in cap.events if isinstance(e, EvActionGranted)]
+    assert len(granted) == 1
+    assert granted[0].fields == {
+        "end_time": "2026-09-07T11:00:00",
+        "start_time": "2026-09-07T10:00:00",
+    }
+
+
+def test_schedule_meeting_confirmer_cannot_mutate_grant_times() -> None:
+    """TOCTOU: mutating slots in confirm_slot must not change ActionGrant values."""
+    store = SlotStore()
+    state = _meeting_plan_state(store)
+
+    async def _mutate_then_confirm(slots):
+        slots[0]["start"] = "2099-01-01T00:00:00"
+        slots[0]["end"] = "2099-01-01T01:00:00"
+        return 1
+
+    from safehouse import trace as _trace
+    from safehouse.trace import EvActionGranted, Tracer
+
+    class _Cap(Tracer):
+        def __init__(self) -> None:
+            self.events: list = []
+        def on_event(self, event) -> None:
+            self.events.append(event)
+
+    cap = _Cap()
+    _trace.set_tracer(cap)
+    ctx = _ctx(store, state, _NO_CREDS, confirm_slot=_mutate_then_confirm,
+               sources={"slots"}, transform="structured:meeting_proposal")
+    try:
+        _, final = asyncio.run(
+            _handle_schedule_meeting({"slots_slot": "slots"}, ctx)
+        )
+    finally:
+        _trace.set_tracer(Tracer())
+
+    assert final is not None
+    assert final["status"] == "success"
+    granted = [e for e in cap.events if isinstance(e, EvActionGranted)]
+    assert granted[0].fields == {
+        "end_time": "2026-09-07T11:00:00",
+        "start_time": "2026-09-07T10:00:00",
+    }
+
+
+def test_schedule_meeting_labelless_slot_completes() -> None:
+    """
+    A valid proposal whose slots carry only start/end (label is optional in the
+    meeting_proposal schema) must complete — regression for a KeyError('label')
+    raised AFTER the calendar/email side effects.
+    """
+    store = SlotStore()
+    state = PlanState()
+    state.set_var("_routing", LVal({
+        "attendee":      "alice@corp.com",
+        "reply_subject": "Meeting",
+        "event_title":   "Sync",
+    }, Label.T_pub()))
+    store.create("slots")
+    store.write("slots", json.dumps({
+        "proposed_slots": [
+            {"start": "2026-09-07T10:00:00", "end": "2026-09-07T11:00:00"},
+        ],
+        "reply_body": "Here are some times",
+    }), Label.U_priv())
+
+    async def _confirm_one(slots):
+        return 1
+
+    ctx = _ctx(store, state, _NO_CREDS, confirm_slot=_confirm_one,
+               sources={"slots"}, transform="structured:meeting_proposal")
+
+    _, final = asyncio.run(
+        _handle_schedule_meeting({"slots_slot": "slots"}, ctx)
+    )
+    assert final is not None
+    assert final["status"] == "success"
+    assert final["slot"] == "2026-09-07T10:00:00 — 2026-09-07T11:00:00"
+
+
+def test_schedule_meeting_declined_without_reply_body_is_terminal() -> None:
+    """choice=0 with no reply_body → terminal error, not an empty email."""
+    store = SlotStore()
+    state = PlanState()
+    state.set_var("_routing", LVal({
+        "attendee":      "alice@corp.com",
+        "reply_subject": "Meeting",
+        "event_title":   "Sync",
+    }, Label.T_pub()))
+    store.create("slots")
+    store.write("slots", json.dumps({
+        "proposed_slots": [
+            {"start": "2026-09-07T10:00:00", "end": "2026-09-07T11:00:00", "label": "Mon 10am"},
+        ],
+    }), Label.U_priv())
+
+    async def _confirm_zero(slots):
+        return 0
+
+    ctx = _ctx(store, state, _NO_CREDS, confirm_slot=_confirm_zero,
+               sources={"slots"}, transform="structured:meeting_proposal")
+
+    _, final = asyncio.run(
+        _handle_schedule_meeting({"slots_slot": "slots"}, ctx)
+    )
+    assert final is not None
+    assert final["status"] == "error"
+    assert "no reply_body" in final["reason"]
 
 
 # ── GmailClient / FakeGmailClient ────────────────────────────────────

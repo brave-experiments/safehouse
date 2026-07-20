@@ -430,8 +430,16 @@ class TestBeforeSpawn:
 
     def test_driver_can_spawn(self):
         policy = IronFlow(SlotStore())
+        state = PlanState()
+        state.set_var("_routing", LVal({"recipient": "safe@example.com"}, T_pub))
+        policy.precommit_routing(state, sources=set())
         driver = driver_spec()
         policy.before_spawn(driver)   # no exception
+
+    def test_driver_cannot_spawn_before_routing_precommit(self):
+        policy = IronFlow(SlotStore())
+        with pytest.raises(IronFlowViolation, match="ROUTING PRECOMMIT REQUIRED"):
+            policy.before_spawn(driver_spec())
 
     def test_reader_cannot_spawn(self):
         policy = IronFlow(SlotStore())
@@ -606,6 +614,29 @@ class TestPlanState:
         state.set_var("x", LVal(1, T_pub))
         state.set_var("x", LVal(2, T_pub), overwrite=True)
         assert state.get_var("x").value == 2
+
+    def test_routing_cannot_be_overwritten(self):
+        """Routing is a one-shot commitment, even when overwrite=True."""
+        state = PlanState()
+        state.set_var("_routing", LVal({"recipient": "safe@example.com"}, T_pub))
+        with pytest.raises(ValueError, match="permanently committed"):
+            state.set_var(
+                "_routing",
+                LVal({"recipient": "other@example.com"}, T_pub),
+                overwrite=True,
+            )
+
+    def test_routing_value_is_immutable(self):
+        """Callers cannot mutate committed routing through the stored value."""
+        state = PlanState()
+        recipients = ["a@example.com", "b@example.com"]
+        state.set_var("_routing", LVal({"recipient": recipients}, T_pub))
+        recipients.append("attacker@example.com")
+
+        routing = state.get_var("_routing").value
+        assert routing["recipient"] == ("a@example.com", "b@example.com")
+        with pytest.raises(TypeError):
+            routing["recipient"] = ("attacker@example.com",)
 
 
 # ══════════════════════════════════════════════════════════════════════
