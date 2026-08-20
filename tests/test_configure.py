@@ -23,19 +23,20 @@ def test_configure_idempotent_on_keep(tmp_path, monkeypatch):
     monkeypatch.setenv("SAFEHOUSE_CONFIG", str(cfg))
 
     # Pass 1: set anthropic key + static token + recipient + duffel + passenger; blank approve/timeout.
-    # getpass order: anthropic key, google access token, duffel token, liteapi key.
-    # input order: mode, recipient, approve, timeout, max_booking, then 7 passenger fields.
+    # getpass order: anthropic key, google access token, duffel token, liteapi key, github token.
+    # input order: mode, recipient, approve, timeout, max_booking, github integrity floor,
+    #              then 7 passenger fields.
     _answer(
         monkeypatch,
-        ["sk-ant-1", "ya29.tok", "duffel_test_1", "sand_test_1"],
-        ["static", "me@x.com", "", "", "300",
+        ["sk-ant-1", "ya29.tok", "duffel_test_1", "sand_test_1", "ghp_test_1"],
+        ["static", "me@x.com", "", "", "300", "approved",
          "mr", "Ali", "Sh", "1990-01-01", "m", "a@x.com", "+441234567890"],
     )
     assert configure.run_configure([]) == 0
     first = cfg.read_bytes()
 
     # Pass 2: Enter to keep everything.
-    _answer(monkeypatch, [""] * 4, [""] * 12)
+    _answer(monkeypatch, [""] * 5, [""] * 13)
     assert configure.run_configure([]) == 0
 
     assert cfg.read_bytes() == first          # keep-current preserved the token (FIX-1)

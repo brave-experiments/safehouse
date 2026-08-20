@@ -72,7 +72,7 @@ from .slots import SlotStore, SlotWriter
 from .secrets import SecretRegistry
 from .ironflow_policy import IronFlow, FlowField, FlowMode, IronFlowViolation, Role
 from .permissions import AgentSpec, driver_spec, fetcher_spec, processor_spec
-from .runner import run_mcp_page_content, run_mcp_email_search, run_mcp_calendar_search, run_processor, run_duffel_flight_search, run_liteapi_hotel_search, _duffel_auth_headers, _liteapi_headers
+from .runner import ProviderAuthError, run_mcp_page_content, run_mcp_email_search, run_mcp_calendar_search, run_processor, run_duffel_flight_search, run_liteapi_hotel_search, run_github_issue_read, run_github_issue_search, run_github_issue_list, run_github_pr_read, run_github_pr_search, _duffel_auth_headers, _liteapi_headers, _github_headers
 from .plan_types import PlanState
 from .release import (
     DRIVER_RELEASE,
@@ -117,6 +117,9 @@ class ProviderConfig:
     liteapi_key:  str = ""
     passenger:    Mapping[str, str] | None = None   # profile from operator config — never a slot
     max_booking_amount: str = ""                     # "<amount> <currency>", e.g. "300 GBP" — see _check_spend_ceiling
+    github_token: str = ""
+    min_github_integrity: str = ""                       # object-integrity floor; "" = gate disabled
+    github_blocked_users: frozenset[str] = frozenset()   # operator blocklist, lowercased logins
     anthropic_api_key: str = ""                      # Tier-2 processor's own credential
 
 
@@ -124,15 +127,15 @@ class ProviderConfig:
 # must appear in exactly one set, so adding one forces a decision about whether it
 # needs containment rather than defaulting to "no".
 _SECRET_CONFIG_FIELDS = frozenset({
-    "google_token", "duffel_token", "liteapi_key", "anthropic_api_key",
+    "google_token", "duffel_token", "liteapi_key", "github_token", "anthropic_api_key",
 })
 _NON_SECRET_CONFIG_FIELDS = frozenset({
-    "passenger", "max_booking_amount",
+    "passenger", "max_booking_amount", "min_github_integrity", "github_blocked_users",
 })
 
 
 def build_secret_registry(*, google_token: str = "", duffel_token: str = "",
-                           liteapi_key: str = "",
+                           liteapi_key: str = "", github_token: str = "",
                            anthropic_api_key: str = "") -> SecretRegistry:
     """Registry for one run. Keyword names are the reportable credential names,
     and are checked against _SECRET_CONFIG_FIELDS by signature introspection."""
@@ -140,6 +143,7 @@ def build_secret_registry(*, google_token: str = "", duffel_token: str = "",
         "google_token":      google_token,
         "duffel_token":      duffel_token,
         "liteapi_key":       liteapi_key,
+        "github_token":      github_token,
         "anthropic_api_key": anthropic_api_key,
     })
 
@@ -670,6 +674,100 @@ async def _handle_liteapi_hotel_search(args: dict, ctx: _StepContext) -> tuple[s
         "McpSearch",
         _run,
     )
+
+_GITHUB_ISSUE_VAR  = "_github_issue_number"
+
+
+_GITHUB_PR_SHA_VAR = "_github_pr_head_sha"
+
+
+_GITHUB_PR_NUM_VAR = "_github_pr_number"
+
+
+@dataclass(frozen=True)
+class _GithubReader:
+    """One Tier-1 GitHub tool.
+
+    `publishes` names the (T,pub) vars its runner returns, in return order. An
+    empty tuple means the tool publishes no routing at all — which is precisely
+    what makes a broad listing safe to run, so it is declared here rather than
+    left implicit in the absence of a set_var call.
+    """
+    runner:    Callable[..., Awaitable[object]]
+    prefix:    str                      # sub-agent id prefix
+    step:      str                      # PlanState step name
+    note:      str                      # audit line
+    publishes: tuple[str, ...] = ()
+
+
+_GITHUB_READERS: dict[str, _GithubReader] = {
+    "mcp_github_issue_read": _GithubReader(
+        run_github_issue_read, "github_issue", "GithubIssueRead",
+        "operator code → GitHub REST /issues (no LLM; provenance-gated by author_association)"),
+    "mcp_github_issue_search": _GithubReader(
+        run_github_issue_search, "github_search", "GithubIssueSearch",
+        "operator code → GitHub REST /issues list+read (no LLM; floor applied during selection)",
+        publishes=(_GITHUB_ISSUE_VAR,)),
+    "mcp_github_issue_list": _GithubReader(
+        run_github_issue_list, "github_list", "GithubIssueList",
+        "operator code → GitHub REST /issues list (no LLM; per-item floor; publishes no routing)"),
+    "mcp_github_pr_read": _GithubReader(
+        run_github_pr_read, "github_pr", "GithubPrRead",
+        "operator code → GitHub REST /pulls + /files (no LLM; diff unvetted by construction)",
+        publishes=(_GITHUB_PR_SHA_VAR, _GITHUB_PR_NUM_VAR)),
+    "mcp_github_pr_search": _GithubReader(
+        run_github_pr_search, "github_prsearch", "GithubPrSearch",
+        "operator code → GitHub REST /pulls list+read (no LLM; floor applied during "
+        "selection; drafts excluded by default)",
+        publishes=(_GITHUB_PR_SHA_VAR, _GITHUB_PR_NUM_VAR)),
+}
+
+
+def _github_reader_handler(tool: str) -> _Handler:
+    """Build the driver handler for one Tier-1 GitHub reader.
+
+    Whatever the runner returns is published under `publishes` as (T,pub).
+    PlanState.set_var accepts nothing weaker, which is the structural check that
+    fetched content can never arrive here: a runner returning author prose rather
+    than a provider-assigned identifier is rejected by the label, not by
+    convention. These values are discovered mid-run, so they are NOT
+    precommitted-before-observation — the Tier-3 handler records which provenance
+    applied via the result's `target_source` field.
+    """
+    reader = _GITHUB_READERS[tool]
+
+    async def _handle(args: dict, ctx: _StepContext) -> tuple[str, dict | None]:
+        domain        = args["domain"]
+        search_params = args.get("search_params", {})
+        slot_id       = args["slot_id"]
+        spec = fetcher_spec(f"{reader.prefix}_{slot_id}",
+                            Capability(args["capability"]), mcp_domain=domain)
+
+        async def _run(w: SlotWriter) -> None:
+            result = await reader.runner(
+                spec, domain, search_params, w, ctx.policy,
+                github_token=ctx.config.github_token,
+                min_integrity=ctx.config.min_github_integrity,
+                blocked_users=ctx.config.github_blocked_users,
+            )
+            if not reader.publishes:
+                return
+            values = result if isinstance(result, tuple) else (result,)
+            # strict=True: a runner returning a different arity than the table
+            # declares is a wiring error, not something to publish partially.
+            for name, value in zip(reader.publishes, values, strict=True):
+                ctx.state.set_var(name, LVal(value, Label.T_pub()))
+
+        return await _run_tier1(
+            ctx, slot_id, spec, "mcp_search",
+            {"domain": domain, "slot_id": slot_id, "search_params": search_params,
+             "note": reader.note},
+            reader.step, _run,
+        )
+
+    return _handle
+
+
 
 async def _handle_mcp_email_search(args: dict, ctx: _StepContext) -> tuple[str, dict | None]:
     store, policy, state = ctx.store, ctx.policy, ctx.state
@@ -1578,6 +1676,241 @@ async def _handle_create_calendar_event(args: dict, ctx: _StepContext) -> tuple[
     return json.dumps(final), final
 
 
+_GITHUB_API_BASE = "https://api.github.com"
+
+
+_PR_REVIEW_EVENTS = ("COMMENT", "REQUEST_CHANGES")
+
+
+async def _handle_add_comment(args: dict, ctx: _StepContext) -> tuple[str, dict | None]:
+    """Driver tool: post a comment on a GitHub issue or pull request.
+
+    repo/issue_number are (T,pub) routing pre-committed before step 0, so injected
+    issue text cannot redirect WHICH issue (or which repo) is commented on — only the
+    body comes from a slot, declassified through the precommitted `opaque` transform
+    and gated as CONTENT. One endpoint serves issues and PRs alike (every PR is an
+    issue in GitHub's data model). Confirmed by a human because a comment is public
+    and only retractable by a separate delete."""
+    store, policy, state = ctx.store, ctx.policy, ctx.state
+    body_slot = args["body_slot"]
+
+    routing = _get_routing(state)
+    if routing is None:
+        return _terminal_error(_ROUTING_MISSING, store)
+    repo = str(routing["repo"])
+
+    try:
+        issue_number, target_source = _resolve_target(
+            routing, state, field="issue_number", var=_GITHUB_ISSUE_VAR)
+    except KeyError:
+        return _terminal_error(
+            "no issue_number: name it in the task, or run mcp_github_issue_search "
+            "first to resolve one", store)
+
+    if not ctx.config.github_token:
+        return _terminal_error("GITHUB_TOKEN is not set", store)
+    if not store.is_written(body_slot):
+        return _terminal_error(f"body_slot '{body_slot}' not written", store)
+
+    try:
+        body_lval = _bridge_body(policy, _release_slot(
+            policy, slot_id=body_slot, state=state, routing=routing,
+            who="repo", not_from="fetched issue content",
+        ))
+    except (ReleaseTransformError, IronFlowViolation) as exc:
+        return _terminal_error(str(exc), store)
+    body = str(body_lval.value).strip()
+    if not body:
+        return _terminal_error("released comment body is empty — nothing to post", store)
+
+    policy.before_action("add_comment", "repo", LVal(repo, Label.T_pub()), Role.ROUTING)
+    policy.before_action("add_comment", "issue_number",
+                         LVal(str(issue_number), Label.T_pub()), Role.ROUTING)
+    policy.before_action("add_comment", "body", body_lval, Role.CONTENT)
+
+    def _not_posted() -> None:
+        """Decline and provider-failure emit the same event; keep them identical."""
+        _trace.emit(_trace.EvGithubCommentAdded(
+            repo=repo, issue_number=issue_number, body_chars=len(body),
+            body_label=str(body_lval.label), comment_id="", comment_url="",
+            confirmed=False))
+
+    # Trace the proposal BEFORE the prompt: the confirmer only reads len(slots),
+    # so this event is the human's only view of what they are approving — and the
+    # human is the enforcement point for a terminal_confirmed tool.
+    _trace.emit(_trace.EvGithubCommentProposed(
+        repo=repo, issue_number=issue_number, body_chars=len(body),
+        body_preview=body[:160],
+        gate=ctx.config.min_github_integrity or "disabled"))
+    choice = await ctx.confirm_slot([{
+        "label": f"comment on {repo}#{issue_number}", "start": "", "end": ""}])
+    if choice != 1:
+        _not_posted()
+        return _terminal_error("comment not confirmed by human", store)
+
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+        resp = await client.post(
+            f"{_GITHUB_API_BASE}/repos/{repo}/issues/{issue_number}/comments",
+            headers=_github_headers(ctx.config.github_token),
+            json={"body": body},
+        )
+    if resp.status_code not in (200, 201):
+        _not_posted()
+        return _provider_error(resp, "GitHub comment", store)
+    try:
+        posted = resp.json()
+    except ValueError:
+        posted = None
+    if not isinstance(posted, dict):
+        return _terminal_error(
+            "GitHub returned 2xx but response was not a JSON object — "
+            "comment may already exist; do not retry", store, comment_id="committed-unparsed")
+    comment_id  = str(posted.get("id", "") or "committed-unparsed")
+    comment_url = str(posted.get("html_url", ""))
+
+    _trace.emit(_trace.EvGithubCommentAdded(
+        repo=repo, issue_number=issue_number, body_chars=len(body),
+        body_label=str(body_lval.label), comment_id=comment_id,
+        comment_url=comment_url, confirmed=True))
+    state.record_step("AddComment")
+    final = {"status": "success", "repo": repo, "issue_number": issue_number,
+             "comment_id": comment_id, "comment_url": comment_url,
+             "body_chars": len(body), "body_label": str(body_lval.label),
+             "target_source": target_source}
+    return json.dumps(final), final
+
+
+async def _handle_submit_pr_review(args: dict, ctx: _StepContext) -> tuple[str, dict | None]:
+    """Driver tool: submit a review on a GitHub pull request.
+
+    APPROVE is structurally unreachable — it is absent from `_PR_REVIEW_EVENTS`
+    and from the planner's literal_fields, checked in both places. An approving
+    review can satisfy branch protection and let an automated merge proceed, so
+    the write surface stays monotonic: it can add friction, never remove it.
+
+    The reviewed commit is bound from the head SHA that mcp_github_pr_read
+    published as (T,pub). Without it a review submitted after a force-push would
+    attach to code nobody read; GitHub resolves an absent commit_id to whatever
+    HEAD is at submission time, which is precisely the race we refuse to run."""
+    store, policy, state = ctx.store, ctx.policy, ctx.state
+    body_slot = args["body_slot"]
+
+    routing = _get_routing(state)
+    if routing is None:
+        return _terminal_error(_ROUTING_MISSING, store)
+    repo = str(routing["repo"])
+
+    # The task-vs-search distinction carries more weight here than for a comment:
+    # REQUEST_CHANGES blocks a pull request.
+    try:
+        pull_number, target_source = _resolve_target(
+            routing, state, field="pull_number", var=_GITHUB_PR_NUM_VAR)
+    except KeyError:
+        return _terminal_error(
+            "no pull_number: name it in the task, or run mcp_github_pr_search "
+            "first to resolve one", store)
+    except (TypeError, ValueError):
+        return _terminal_error("submit_pr_review requires an integer pull_number", store)
+
+    # Default COMMENT: the non-blocking verdict is the safe one to reach by omission.
+    event = str(routing.get("event", "COMMENT")).strip().upper() or "COMMENT"
+    if event not in _PR_REVIEW_EVENTS:
+        return _terminal_error(
+            f"event must be one of {_PR_REVIEW_EVENTS} (got {event!r}) — APPROVE is "
+            f"deliberately not offered", store)
+
+    try:
+        commit_id = str(state.get_var(_GITHUB_PR_SHA_VAR).value)
+        read_number = int(state.get_var(_GITHUB_PR_NUM_VAR).value)
+    except KeyError:
+        return _terminal_error(
+            "no reviewed commit: run mcp_github_pr_read first so the review binds to "
+            "the commit that was actually read", store)
+    # Only meaningful when the plan named the number: on the search path both values
+    # come from the same state var, so they cannot disagree. Both are task-derived,
+    # so a mismatch is a planning error rather than an attack — but posting a SHA
+    # from a different PR would otherwise surface as an opaque 422 on a write path.
+    if target_source == "task" and read_number != pull_number:
+        return _terminal_error(
+            f"plan reviews #{pull_number} but mcp_github_pr_read read #{read_number} — "
+            f"the review would carry a commit from a different pull request", store)
+
+    if not ctx.config.github_token:
+        return _terminal_error("GITHUB_TOKEN is not set", store)
+    if not store.is_written(body_slot):
+        return _terminal_error(f"body_slot '{body_slot}' not written", store)
+
+    try:
+        body_lval = _bridge_body(policy, _release_slot(
+            policy, slot_id=body_slot, state=state, routing=routing,
+            who="repo", not_from="fetched pull request content",
+        ))
+    except (ReleaseTransformError, IronFlowViolation) as exc:
+        return _terminal_error(str(exc), store)
+    body = str(body_lval.value).strip()
+    if not body:
+        return _terminal_error("released review body is empty — nothing to submit", store)
+
+    policy.before_action("submit_pr_review", "repo", LVal(repo, Label.T_pub()), Role.ROUTING)
+    policy.before_action("submit_pr_review", "pull_number",
+                         LVal(str(pull_number), Label.T_pub()), Role.ROUTING)
+    policy.before_action("submit_pr_review", "event", LVal(event, Label.T_pub()), Role.ROUTING)
+    policy.before_action("submit_pr_review", "commit_id",
+                         LVal(commit_id, Label.T_pub()), Role.ROUTING)
+    policy.before_action("submit_pr_review", "body", body_lval, Role.CONTENT)
+
+    def _not_submitted() -> None:
+        """Decline and provider-failure emit the same event; keep them identical."""
+        _trace.emit(_trace.EvGithubReviewSubmitted(
+            repo=repo, pull_number=pull_number, event=event, commit_id=commit_id,
+            body_chars=len(body), body_label=str(body_lval.label),
+            review_id="", review_url="", confirmed=False))
+
+    _trace.emit(_trace.EvGithubReviewProposed(
+        repo=repo, pull_number=pull_number, event=event, commit_id=commit_id,
+        body_chars=len(body), body_preview=body[:160],
+        gate=ctx.config.min_github_integrity or "disabled"))
+    choice = await ctx.confirm_slot([{
+        "label": f"{event} review on {repo}#{pull_number} @ {commit_id[:7]}",
+        "start": "", "end": ""}])
+    if choice != 1:
+        _not_submitted()
+        return _terminal_error("review not confirmed by human", store)
+
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+        resp = await client.post(
+            f"{_GITHUB_API_BASE}/repos/{repo}/pulls/{pull_number}/reviews",
+            headers=_github_headers(ctx.config.github_token),
+            json={"commit_id": commit_id, "body": body, "event": event},
+        )
+    if resp.status_code not in (200, 201):
+        _not_submitted()
+        return _provider_error(resp, "GitHub review", store)
+    try:
+        posted = resp.json()
+    except ValueError:
+        posted = None
+    if not isinstance(posted, dict):
+        return _terminal_error(
+            "GitHub returned 2xx but response was not a JSON object — the review may "
+            "already exist; do not retry", store, review_id="committed-unparsed")
+    review_id  = str(posted.get("id", "") or "committed-unparsed")
+    review_url = str(posted.get("html_url", ""))
+
+    _trace.emit(_trace.EvGithubReviewSubmitted(
+        repo=repo, pull_number=pull_number, event=event, commit_id=commit_id,
+        body_chars=len(body), body_label=str(body_lval.label),
+        review_id=review_id, review_url=review_url, confirmed=True))
+    state.record_step("SubmitPrReview")
+    final = {"status": "success", "repo": repo, "pull_number": pull_number,
+             "event": event, "commit_id": commit_id,
+             "review_id": review_id, "review_url": review_url,
+             "body_chars": len(body), "body_label": str(body_lval.label),
+             "target_source": target_source}
+    return json.dumps(final), final
+
+
+
 _HANDLERS: dict[str, _Handler] = {
     "mcp_page_content":    _handle_mcp_page_content,
     "mcp_email_search":    _handle_mcp_email_search,
@@ -1592,6 +1925,9 @@ _HANDLERS: dict[str, _Handler] = {
     "book_flight":         _handle_book_flight,
     "book_hotel":          _handle_book_hotel,
     "create_calendar_event": _handle_create_calendar_event,
+    **{name: _github_reader_handler(name) for name in _GITHUB_READERS},
+    "add_comment":         _handle_add_comment,
+    "submit_pr_review":    _handle_submit_pr_review,
 }
 
 
@@ -1614,7 +1950,58 @@ _DRIVER_ROUTING_FIELDS: dict[str, list[str]] = {
     "book_flight":      ["provider"],
     "book_hotel":       ["provider"],
     "create_calendar_event": ["event_title", "start", "end"],
+    "add_comment":      ["repo", "issue_number"],
+    "submit_pr_review": ["repo", "pull_number", "event"],
 }
+
+def _resolve_target(
+    routing: Mapping[str, object], state: PlanState, *,
+    field: str, var: str,
+) -> tuple[int, str]:
+    """Resolve a runtime-resolvable routing target, reporting its provenance.
+
+    The two sources are both (T,pub) but NOT equally strong:
+      plan args   — named in the task, precommitted before step 0 (strongest)
+      state.vars  — resolved mid-run by a Tier-1 tool's deterministic filter;
+                    provider-assigned, but discovered after observation
+
+    Returns (value, provenance) where provenance is "task" or "search", so the
+    handler records which applied instead of the audit claiming the stronger one.
+    Raises KeyError when neither source has it; the caller turns that into a
+    terminal error, since only it knows which Tier-1 tool to name.
+
+    One helper rather than a copy per tool: this is the runtime-resolved routing
+    pattern invariant #5 describes, and every _DRIVER_ROUTING_OPTIONAL entry that
+    exists because a Tier-1 tool publishes the value needs exactly this.
+    """
+    if field in routing:
+        return int(routing[field]), "task"          # type: ignore[arg-type]
+    return int(state.get_var(var).value), "search"
+
+
+# Routing fields that MAY be absent from the plan because a Tier 1 tool resolves
+# them mid-run into state.vars as (T,pub) (e.g. mcp_github_issue_search publishing
+# the issue number it selected). Everything else in _DRIVER_ROUTING_FIELDS stays
+# mandatory at plan time. When such a field IS present in the plan it is still
+# routing-locked normally — the handler reports which provenance applied, since a
+# runtime-resolved value is not precommitted-before-observation.
+_DRIVER_ROUTING_OPTIONAL: dict[str, frozenset[str]] = {
+    "add_comment": frozenset({"issue_number"}),
+    # event defaults to COMMENT when the task does not say otherwise; the
+    # non-blocking verdict is the one that should be reachable by omission.
+    # repo and pull_number stay mandatory, so the routing lock still applies.
+    # pull_number is absent when mcp_github_pr_search resolves the target.
+    # repo stays mandatory, so the routing lock still applies.
+    "submit_pr_review": frozenset({"event", "pull_number"}),
+}
+
+
+def _routing_from_args(driver_tool: str, driver_args: Mapping[str, object]) -> tuple[dict, list[str]]:
+    """Collect routing values present in the step args. Returns (routing, missing)."""
+    keys     = _DRIVER_ROUTING_FIELDS.get(driver_tool, [])
+    optional = _DRIVER_ROUTING_OPTIONAL.get(driver_tool, frozenset())
+    missing  = [k for k in keys if k not in driver_args and k not in optional]
+    return {k: driver_args[k] for k in keys if k in driver_args}, missing
 
 def _release_gate_for(
     driver_tool: str, driver_args: Mapping[str, object],
@@ -1644,15 +2031,14 @@ def routing_block_for(plan: dict) -> dict | None:
     driver_step = plan["steps"][-1] if plan.get("steps") else {}
     driver_tool = driver_step.get("tool", "")
     driver_args = driver_step.get("args", {})
-    keys = _DRIVER_ROUTING_FIELDS.get(driver_tool, [])
-    if not keys:
+    if not _DRIVER_ROUTING_FIELDS.get(driver_tool):
         return None
-    missing = [k for k in keys if k not in driver_args]
+    routing, missing = _routing_from_args(driver_tool, driver_args)
     if missing:
         raise ValueError(
             f"routing_block_for: {driver_tool} missing required routing fields: {missing}"
         )
-    return {k: driver_args[k] for k in keys}
+    return routing
 
 
 async def run(
@@ -1663,6 +2049,9 @@ async def run(
     liteapi_key: str = "",
     passenger: Mapping[str, str] | None = None,
     max_booking_amount: str = "",
+    github_token: str = "",
+    min_github_integrity: str = "",
+    github_blocked_users: frozenset[str] = frozenset(),
     anthropic_api_key: str = "",
     confirm_slot: Callable[[list[dict]], Awaitable[int]] = _default_confirm_slot,
     routing: dict | None = None,
@@ -1693,6 +2082,9 @@ async def run(
     config = ProviderConfig(google_token=google_token, duffel_token=duffel_token,
                             liteapi_key=liteapi_key, passenger=passenger,
                             max_booking_amount=max_booking_amount,
+                            github_token=github_token,
+                            min_github_integrity=min_github_integrity,
+                            github_blocked_users=github_blocked_users,
                             anthropic_api_key=anthropic_api_key)
     state  = PlanState(trusted_action_urls=tuple(plan.get("trusted_action_urls", [])))
     ctx    = _StepContext(
@@ -1706,15 +2098,13 @@ async def run(
 
     if routing is None:
         # Single-plan path: extract routing from the manifest step args.
-        driver_args  = driver_step.get("args", {})
-        routing_keys = _DRIVER_ROUTING_FIELDS.get(driver_tool, [])
-        if routing_keys:
-            missing = [k for k in routing_keys if k not in driver_args]
+        driver_args = driver_step.get("args", {})
+        if _DRIVER_ROUTING_FIELDS.get(driver_tool):
+            routing, missing = _routing_from_args(driver_tool, driver_args)
             if missing:
                 return _pipeline_error(
                     f"{driver_tool} missing required routing fields: {missing}", policy, store,
                 )
-            routing = {k: driver_args[k] for k in routing_keys}
 
     if routing is not None:
         # set_var owns the freeze (list→tuple + MappingProxyType); no pre-freeze.
@@ -1770,6 +2160,10 @@ async def run(
                 return _pipeline_error(f"policy violation: {exc}", policy, store)
             except ConfirmationRequired:
                 raise
+            except ProviderAuthError as exc:
+                # Credential rejected (401/403) — operator-fixable, so flag it
+                # rather than letting it read as a generic pipeline failure.
+                return _pipeline_error(str(exc), policy, store, credential_error=True)
             except Exception as exc:
                 return _pipeline_error(str(exc), policy, store)
             finals = [final] if final is not None else []
@@ -1821,6 +2215,9 @@ async def run_manifest(
     liteapi_key: str = "",
     passenger: Mapping[str, str] | None = None,
     max_booking_amount: str = "",
+    github_token: str = "",
+    min_github_integrity: str = "",
+    github_blocked_users: frozenset[str] = frozenset(),
     anthropic_api_key: str = "",
     confirm_slot: Callable[[list[dict]], Awaitable[int]] = _default_confirm_slot,
 ) -> dict:
@@ -1842,7 +2239,8 @@ async def run_manifest(
     # sub-pipelines, and the trace registry is process-scoped anyway.
     secrets = build_secret_registry(
         google_token=google_token, duffel_token=duffel_token,
-        liteapi_key=liteapi_key, anthropic_api_key=anthropic_api_key)
+        liteapi_key=liteapi_key, github_token=github_token,
+        anthropic_api_key=anthropic_api_key)
     _trace.set_secret_registry(secrets)
 
     if sub_plans is None:
@@ -1852,6 +2250,9 @@ async def run_manifest(
                            google_token=google_token,
                            duffel_token=duffel_token, liteapi_key=liteapi_key,
                            passenger=passenger, max_booking_amount=max_booking_amount,
+                           github_token=github_token,
+                           min_github_integrity=min_github_integrity,
+                           github_blocked_users=github_blocked_users,
                            anthropic_api_key=anthropic_api_key, confirm_slot=confirm_slot)
         if result.get("status") != "success" and _world_action_committed(result):
             result = {**result, "do_not_retry": True}
@@ -1886,6 +2287,9 @@ async def run_manifest(
                                google_token=google_token,
                                duffel_token=duffel_token, liteapi_key=liteapi_key,
                            passenger=passenger, max_booking_amount=max_booking_amount,
+                           github_token=github_token,
+                           min_github_integrity=min_github_integrity,
+                           github_blocked_users=github_blocked_users,
                            anthropic_api_key=anthropic_api_key, confirm_slot=confirm_slot, routing=rb)
         results.append(sub_result)
         violations.extend(sub_result.get("violations", []))

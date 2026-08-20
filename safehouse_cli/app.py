@@ -23,6 +23,8 @@ from enum import IntEnum
 
 from safehouse.driver import run_manifest as driver_run_manifest, build_secret_registry
 from safehouse.planner import generate_plan, PlanValidationError, _MISSING_RECIPIENT_SIGNAL
+from safehouse.registry import DUFFEL_TOOLS, GITHUB_TOOLS, LITEAPI_TOOLS
+from safehouse.runner import _GITHUB_INTEGRITY_LEVELS
 from safehouse.trace import emit, set_tracer, set_secret_registry, EvStaticPlan, MultiTracer
 
 from .config import RunConfig
@@ -208,7 +210,9 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
     set_tracer(MultiTracer(console_tracer, sink))
 
     google_token = cfg.google_token or ""
-    if _tracer_mod.pipeline_needs_google(pipeline):
+    # Driven by the tool set, not the pipeline label: a github pipeline that ends
+    # in send_summary needs Gmail even though the github env list does not say so.
+    if _tracer_mod.tools_need_google(tools):
         try:
             if google_provider is not None:
                 google_token = google_provider.get_access_token()
@@ -217,11 +221,63 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
             sink.close()
             return RunResult(ExitCode.CREDENTIAL_ERROR, "error", {"reason": str(exc)}, session, elapsed)
         if not google_token:
-            hint = next(h for v, h in _tracer_mod.pipeline_env(pipeline) if v == "GOOGLE_ACCESS_TOKEN")
+            hint = next((h for v, h in _tracer_mod.pipeline_env(pipeline)
+                         if v == "GOOGLE_ACCESS_TOKEN"),
+                        "Get one from https://developers.google.com/oauthplayground")
             elapsed = time.monotonic() - t0
             sink.close()
             return RunResult(ExitCode.CONFIG_ERROR, "error",
                              {"reason": f"GOOGLE_ACCESS_TOKEN is not set.  {hint}"}, session, elapsed)
+
+    # ── Execution ──────────────────────────────────────────────────────
+    duffel_token = cfg.duffel_token or ""
+    if (tools & DUFFEL_TOOLS) and not duffel_token:
+        elapsed = time.monotonic() - t0
+        sink.close()
+        return RunResult(
+            ExitCode.CONFIG_ERROR, "error",
+            {"reason": "DUFFEL_ACCESS_TOKEN is not set.  Export it (or add [duffel].access_token "
+                       "to config); create a token at Duffel → Developers → Access tokens."},
+            session, elapsed,
+        )
+
+    liteapi_key = cfg.liteapi_key or ""
+    if (tools & LITEAPI_TOOLS) and not liteapi_key:
+        elapsed = time.monotonic() - t0
+        sink.close()
+        return RunResult(
+            ExitCode.CONFIG_ERROR, "error",
+            {"reason": "LITEAPI_SANDBOX_KEY is not set.  Export it (or add [liteapi].api_key "
+                       "to config); sign up free at liteapi.travel → dashboard → API Keys."},
+            session, elapsed,
+        )
+
+    github_token = cfg.github_token or ""
+    if (tools & GITHUB_TOOLS) and not github_token:
+        hint = next(h for v, h in _tracer_mod.pipeline_env(pipeline) if v == "GITHUB_TOKEN")
+        elapsed = time.monotonic() - t0
+        sink.close()
+        return RunResult(
+            ExitCode.CONFIG_ERROR, "error",
+            {"reason": f"GITHUB_TOKEN is not set.  Run `safehouse configure`, or "
+                       f"export it / add [github].access_token to config.  {hint}"},
+            session, elapsed,
+        )
+
+    # Validate the provenance floor here rather than per item: an unrecognised
+    # floor makes _github_meets_floor reject everything, which would otherwise
+    # surface as a silently empty issue the processor drafts a reply from.
+    min_github_integrity = cfg.min_github_integrity or ""
+    if (tools & GITHUB_TOOLS) and min_github_integrity not in ("", *_GITHUB_INTEGRITY_LEVELS):
+        elapsed = time.monotonic() - t0
+        sink.close()
+        return RunResult(
+            ExitCode.CONFIG_ERROR, "error",
+            {"reason": f"min_github_integrity must be one of "
+                       f"{', '.join(_GITHUB_INTEGRITY_LEVELS)} (got {min_github_integrity!r}); "
+                       f"leave it unset to disable the provenance gate."},
+            session, elapsed,
+        )
 
     # ── Static plan emission (always, before dry-run check) ────────────
     # One event for the whole manifest so step N/M stays correct across pipelines.
@@ -241,28 +297,6 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
         return RunResult(ExitCode.OK, "dry_run", {"plan": plan}, session, elapsed)
 
     # ── Execution ──────────────────────────────────────────────────────
-    duffel_token = cfg.duffel_token or ""
-    if "mcp_flight_search" in tools and not duffel_token:
-        elapsed = time.monotonic() - t0
-        sink.close()
-        return RunResult(
-            ExitCode.CONFIG_ERROR, "error",
-            {"reason": "DUFFEL_ACCESS_TOKEN is not set.  Export it (or add [duffel].access_token "
-                       "to config); create a token at Duffel → Developers → Access tokens."},
-            session, elapsed,
-        )
-
-    liteapi_key = cfg.liteapi_key or ""
-    if "mcp_hotel_search" in tools and not liteapi_key:
-        elapsed = time.monotonic() - t0
-        sink.close()
-        return RunResult(
-            ExitCode.CONFIG_ERROR, "error",
-            {"reason": "LITEAPI_SANDBOX_KEY is not set.  Export it (or add [liteapi].api_key "
-                       "to config); sign up free at liteapi.travel → dashboard → API Keys."},
-            session, elapsed,
-        )
-
     driver_kwargs = {
         "confirm_slot": confirmer.confirm_slot,
         "google_token": google_token,
@@ -271,6 +305,10 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
         "passenger": cfg.passenger,
         "max_booking_amount": cfg.max_booking_amount or "",
         "anthropic_api_key": cfg.anthropic_api_key or "",
+        "github_token": github_token,
+        "min_github_integrity": min_github_integrity,
+        "github_blocked_users": frozenset(
+            u.strip().lower() for u in (cfg.github_blocked_users or []) if u.strip()),
     }
 
     # Installed here, in the outer context, so it is inherited by the driver task
@@ -279,7 +317,8 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
     # callers that bypass the CLI.
     secrets = build_secret_registry(
         google_token=google_token, duffel_token=duffel_token,
-        liteapi_key=liteapi_key, anthropic_api_key=cfg.anthropic_api_key or "")
+        liteapi_key=liteapi_key, github_token=github_token,
+        anthropic_api_key=cfg.anthropic_api_key or "")
     set_secret_registry(secrets)
 
     coro = driver_run_manifest(cfg.task, plan, **driver_kwargs)

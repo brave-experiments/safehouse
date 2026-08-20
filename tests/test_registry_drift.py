@@ -49,16 +49,21 @@ BRIEFING_FALLBACK_TOOLS: frozenset[str] = frozenset({
 EXPECTED_PIPELINE_BY_TOOL: dict[str, str] = {
     "mcp_flight_search":   "trip",
     "mcp_hotel_search":    "trip",
-    "mcp_calendar_search": "calendar",
-    "schedule_meeting":    "calendar",
-    "mcp_flight_search":   "trip",
-    "mcp_hotel_search":    "trip",
     "book_flight":         "booking",
     "book_hotel":          "booking",
+    "mcp_calendar_search": "calendar",
+    "schedule_meeting":    "calendar",
     "create_calendar_event": "calendar",
     "mcp_email_search":    "email",
     "send_reply":          "email",
     "modify_emails":       "email",
+    "mcp_github_issue_read": "github",
+    "mcp_github_issue_search": "github",
+    "add_comment":         "github",
+    "mcp_github_issue_list": "github",
+    "mcp_github_pr_read":  "github",
+    "mcp_github_pr_search": "github",
+    "submit_pr_review":    "github",
     **{t: "briefing" for t in BRIEFING_FALLBACK_TOOLS},
 }
 
@@ -153,6 +158,8 @@ def test_every_driver_tool_has_release_slots() -> None:
         "book_flight":      "structured:flight_offer",
         "book_hotel":       "structured:hotel_offer",
         "create_calendar_event": None,
+        "add_comment":      "opaque",
+        "submit_pr_review": "opaque",
     }
 
 
@@ -169,8 +176,103 @@ def test_driver_routing_fields_match_schema_routing_keys() -> None:
         "book_flight":      ["provider"],
         "book_hotel":       ["provider"],
         "create_calendar_event": ["event_title", "start", "end"],
+        "add_comment":      ["repo", "issue_number"],
+        "submit_pr_review": ["repo", "pull_number", "event"],
     }
     assert _DRIVER_ROUTING_FIELDS == expected
+
+
+def test_optional_routing_fields_are_real_routing_fields() -> None:
+    """
+    _DRIVER_ROUTING_OPTIONAL lets a routing field be absent at plan time because a
+    Tier 1 tool resolves it mid-run. An entry naming a field that is NOT in that
+    tool's _DRIVER_ROUTING_FIELDS would make the exemption silently meaningless,
+    and one naming an unknown tool would be dead config.
+    """
+    from safehouse.driver import _DRIVER_ROUTING_OPTIONAL
+
+    for tool, optional in _DRIVER_ROUTING_OPTIONAL.items():
+        assert tool in _DRIVER_ROUTING_FIELDS, (
+            f"_DRIVER_ROUTING_OPTIONAL names {tool!r} which has no routing fields"
+        )
+        stray = set(optional) - set(_DRIVER_ROUTING_FIELDS[tool])
+        assert not stray, (
+            f"{tool}: optional routing fields {sorted(stray)} are not in "
+            f"_DRIVER_ROUTING_FIELDS[{tool!r}] = {_DRIVER_ROUTING_FIELDS[tool]}"
+        )
+        assert set(optional) != set(_DRIVER_ROUTING_FIELDS[tool]), (
+            f"{tool}: every routing field is optional, so the routing lock can be "
+            f"skipped entirely — at least one field must be required at plan time"
+        )
+
+    # Pin the current exemptions so adding one is a deliberate, reviewed decision.
+    assert {t: sorted(v) for t, v in _DRIVER_ROUTING_OPTIONAL.items()} == {
+        "add_comment": ["issue_number"],
+        "submit_pr_review": ["event", "pull_number"],
+    }
+
+
+def test_every_github_fetcher_applies_the_integrity_gate() -> None:
+    """
+    The integrity floor is applied inside each Tier-1 GitHub fetcher, so that
+    below-floor content never enters the slot store at all — stronger confinement
+    than filtering on the way out, but it means a NEW fetcher can silently omit
+    the gate. That is the same class of failure as a driver tool missing from
+    _DRIVER_ROUTING_FIELDS: it degrades a security property instead of erroring.
+
+    Every GITHUB_READ fetcher's source must therefore reach _github_meets_floor,
+    directly or through the shared _github_write_issue helper.
+
+    LIMITATION, so nobody over-trusts this: source inspection proves the gate is
+    *referenced*, not that it is applied to every item. A fetcher that gates its
+    selection but not its content read would still pass here, because the name
+    appears either way. Behavioural coverage for that lives in tests/test_github.py
+    (test_low_integrity_comment_dropped_by_floor,
+    test_floor_applied_during_selection_blocks_capture). This test's job is only to
+    catch the blunt regression: a fetcher that forgets the gate entirely.
+    """
+    import inspect
+    import safehouse.runner as runner_mod
+    from safehouse.labels import Capability
+    from safehouse.registry import DEFAULT_REGISTRY
+
+    github_tools = [
+        spec.name for spec in DEFAULT_REGISTRY._specs.values()
+        if spec.capability is Capability.GITHUB_READ
+    ]
+    assert github_tools, "no GITHUB_READ providers registered — has the capability moved?"
+
+    # Registry tool name → the runner coroutine the driver dispatches it to.
+    runner_for = {
+        "mcp_github_issue_read":   runner_mod.run_github_issue_read,
+        "mcp_github_issue_search": runner_mod.run_github_issue_search,
+        "mcp_github_issue_list":   runner_mod.run_github_issue_list,
+        "mcp_github_pr_read":      runner_mod.run_github_pr_read,
+        "mcp_github_pr_search":    runner_mod.run_github_pr_search,
+    }
+    unmapped = set(github_tools) - set(runner_for)
+    assert not unmapped, (
+        f"GITHUB_READ tools with no runner in this test's map {sorted(unmapped)} — "
+        f"add the mapping so its integrity gate is checked"
+    )
+
+    # Shared projection helpers: a fetcher may reach the floor through one of these
+    # instead of calling it directly, so each must itself be gated.
+    gating_helpers = ("_github_write_issue", "_github_write_pr")
+    for helper in gating_helpers:
+        helper_src = inspect.getsource(getattr(runner_mod, helper))
+        assert "_github_meets_floor" in helper_src, (
+            f"{helper} no longer applies the integrity floor — every GitHub read "
+            f"that funnels through it just became ungated"
+        )
+
+    for tool, fn in runner_for.items():
+        src = inspect.getsource(fn)
+        gated = "_github_meets_floor" in src or any(h in src for h in gating_helpers)
+        assert gated, (
+            f"{fn.__name__} (tool {tool!r}) never reaches _github_meets_floor — "
+            f"below-floor issue/comment content would reach the processor ungated"
+        )
 
 
 def test_grant_required_wired_in_schedule_meeting_handler() -> None:

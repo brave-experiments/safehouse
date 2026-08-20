@@ -853,6 +853,886 @@ async def run_liteapi_hotel_search(
     picks.sort(key=lambda x: float(x["amount"]))
     writer.write(json.dumps(picks[: max(1, limit)], indent=2) if picks else "(no hotel offers found)")
 
+# ── GitHub REST ───────────────────────────────────────────────────────
+
+# ── GitHub REST ───────────────────────────────────────────────────────
+_GITHUB_API_VERSION = "2022-11-28"
+
+# ── Object integrity ──────────────────────────────────────────────────
+#
+# An item's integrity is DERIVED from two independent facts, never from its text:
+#
+#   1. the author's standing in the repo   (GitHub's author_association)
+#   2. whether the content has been vetted (merged to the default branch)
+#
+# (2) matters because it is a property of the CONTENT, not the author: code that
+# survived review and landed is more trustworthy than the same author's unmerged
+# proposal. Author-only scoring would rate an open PR's diff identically to the
+# reviewed code on main — which is how review criteria read from a PR branch
+# could legalise that same PR's violations.
+#
+# The level vocabulary deliberately matches GitHub's own Integrity Filtering, so
+# the names mean what a reader of that model expects. We implement the idea
+# rather than call it: that feature is gh-aw-only and unreachable from a
+# third-party client, self-hosted server included.
+#
+# Ordered most → least trusted. Everything here is deterministic; no LLM.
+_GITHUB_INTEGRITY_LEVELS: tuple[str, ...] = (
+    "merged", "approved", "unapproved", "none", "blocked",
+)
+# Author standing → base level. Anything unrecognised falls through to "none",
+# so an association GitHub adds later cannot out-rank an existing floor.
+_GITHUB_APPROVED_ASSOC   = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+_GITHUB_UNAPPROVED_ASSOC = frozenset({"CONTRIBUTOR"})
+
+# Comment pages to fetch (100/page). Bounds both blast radius and rate-limit use:
+# a popular issue can carry thousands of comments.
+_GITHUB_MAX_COMMENT_PAGES = 3
+_GITHUB_PER_PAGE          = 100
+
+
+def _github_headers(github_token: str = "") -> dict[str, str]:
+    """Bearer + version headers for the GitHub REST API. Token is operator-supplied; never logged."""
+    return {
+        "Authorization":        f"Bearer {github_token}",
+        "Accept":               "application/vnd.github+json",
+        "X-GitHub-Api-Version": _GITHUB_API_VERSION,
+    }
+
+
+def _github_login(item: dict) -> str:
+    """Lowercased author login of an issue/comment/PR item, or '' if absent."""
+    return str((item.get("user") or {}).get("login", "")).strip().lower()
+
+
+def _github_vetted(item: dict) -> bool:
+    """True if this item is a MERGED pull request — the vetting fact.
+
+    GitHub reports it in two different places depending on the endpoint:
+      GET /pulls/{n}        → top-level  "merged_at"
+      GET /issues/{n}       → nested     "pull_request": {"merged_at": …}
+      GET /issues (list)    → nested     "pull_request": {"merged_at": …}
+
+    Every fetch we make uses an issues endpoint, so reading only the top level
+    silently disables the vetting dimension entirely — a merged PR scores as its
+    author's standing alone. Check both.
+    """
+    return bool(item.get("merged_at")
+                or (item.get("pull_request") or {}).get("merged_at"))
+
+
+def _github_integrity(
+    association: str, *, vetted: bool = False, blocked: bool = False,
+) -> str:
+    """Effective integrity level of one fetched item.
+
+    vetted=True means the content reached the default branch (a merged PR), which
+    outranks any author standing — it has been through review. blocked wins over
+    everything: an operator-blocklisted author is never trusted, however merged.
+    """
+    if blocked:
+        return "blocked"
+    if vetted:
+        return "merged"
+    assoc = (association or "").strip().upper()
+    if assoc in _GITHUB_APPROVED_ASSOC:
+        return "approved"
+    if assoc in _GITHUB_UNAPPROVED_ASSOC:
+        return "unapproved"
+    return "none"
+
+
+def _github_meets_floor(level: str, floor: str) -> bool:
+    """True if integrity `level` ranks at or above `floor`.
+
+    An unknown level or an unknown floor both fail closed — an unrecognised value
+    must never be treated as more trusted than the floor.
+
+    "blocked" is an ABSOLUTE deny, checked before the gate-disabled shortcut: an
+    operator blocklist means "never trust this account", which must not silently
+    require a floor to also be configured.
+    """
+    if level == "blocked":
+        return False
+    if not floor:
+        return True                       # no floor configured — gate disabled
+    if floor not in _GITHUB_INTEGRITY_LEVELS or level not in _GITHUB_INTEGRITY_LEVELS:
+        return False
+    return _GITHUB_INTEGRITY_LEVELS.index(level) <= _GITHUB_INTEGRITY_LEVELS.index(floor)
+
+
+def _github_item_level(item: dict, blocked_users: frozenset[str],
+                       *, vetted: bool | None = None) -> str:
+    """Integrity level of one issue / PR / comment.
+
+    The three primitives above compose the same way at every call site, so they
+    compose here once instead. Pass vetted=False for a comment: comments are never
+    merged, and inlining that asymmetry made it invisible.
+    """
+    return _github_integrity(
+        str(item.get("author_association", "")),
+        vetted=_github_vetted(item) if vetted is None else vetted,
+        blocked=_github_login(item) in blocked_users,
+    )
+
+
+def _one_of(search_params: dict, key: str, allowed: tuple[str, ...], default: str) -> str:
+    """Lower-cased param validated against a fixed set, or a uniform RuntimeError."""
+    value = str(search_params.get(key, default)).strip().lower() or default
+    if value not in allowed:
+        raise RuntimeError(f"{key} must be one of {allowed} (got {value!r})")
+    return value
+
+
+def _csv_list(raw) -> list[str]:
+    """Accept a list or a comma-separated string; return trimmed non-empty parts."""
+    if isinstance(raw, (list, tuple)):
+        return [str(x) for x in raw]
+    return [p for p in (s.strip() for s in str(raw or "").split(",")) if p]
+
+
+def _github_repo(search_params: dict, what: str) -> str:
+    """Validate and normalise the 'owner/name' repo argument."""
+    repo = str(search_params.get("repo", "")).strip().strip("/")
+    if repo.count("/") != 1 or not all(repo.split("/")):
+        raise RuntimeError(f"{what} requires repo as 'owner/name' (got {repo!r})")
+    return repo
+
+
+async def _github_write_issue(
+    client, base_url: str, repo: str, number: int, headers: dict,
+    spec: AgentSpec, writer: SlotWriter, policy: IronFlow, min_integrity: str,
+    blocked_users: frozenset[str] = frozenset(),
+) -> None:
+    """Fetch one issue + its comments, provenance-gate them, and write the slot.
+
+    Shared by run_github_issue_read and run_github_issue_search so the projection
+    and the gate have exactly one implementation.
+
+    Issue/PR bodies and comments are attacker-reachable content (the documented
+    indirect-injection surface). Two deterministic defences apply, before anything
+    reaches the processor:
+
+      • Integrity gate — each item is scored INDEPENDENTLY from its own
+        author_association (+ merge state for the issue), then compared against
+        min_integrity. Per-item, not per-thread: a maintainer-filed issue can
+        carry a hostile comment appended later by an anonymous account, so the
+        attacker never needs to file the issue itself.
+
+        A below-floor COMMENT is dropped silently — refusing a whole thread over
+        one low-provenance comment would make the tool unusable on any active
+        public issue, and the issue itself still gives something to act on.
+        A below-floor ISSUE raises: blanking it and continuing would hand the
+        processor {"title": "", "body": ""}, indistinguishable from an issue that
+        is genuinely empty, and it would then draft "this issue is empty" for a
+        human to approve. Filtered-out must never read as absent.
+      • Field projection — only number/title/body/state/integrity/
+        author_association and per-comment body/author/created_at/integrity are
+        kept. Hypermedia (*_url, avatar_url, node_id, reactions, …) is dropped.
+    """
+    issue_url = f"{base_url}/repos/{repo}/issues/{number}"
+    policy.before_network(spec, issue_url)
+    _trace.emit(_trace.EvFetch(agent_id=spec.id, url=issue_url, mcp_tool="issues", shallow=False))
+    iresp = await client.get(issue_url, headers=headers)
+    _require_ok(iresp, "GitHub issue lookup")
+    issue = iresp.json()
+
+    # Fail closed BEFORE fetching comments. Blanking a below-floor issue's title and
+    # body and continuing would hand the processor {"title": "", "body": ""} —
+    # indistinguishable from an issue that is genuinely empty — and it would then
+    # draft "this issue is empty, please add details" for a human to approve.
+    # Filtered-out must never read as absent.
+    #
+    # Checked here rather than after the comment pages because at a floor of
+    # 'approved' on a public repo this outcome is routine, not exceptional: the old
+    # ordering paid 1-3 comment requests on every run that was always going to raise.
+    #
+    # A MERGED pull request is vetted content: it went through review and landed, so
+    # its body outranks an equivalent open proposal from the same author.
+    issue_level = _github_item_level(issue, blocked_users)
+    if not _github_meets_floor(issue_level, min_integrity):
+        raise RuntimeError(
+            f"{repo}#{number}: author integrity {issue_level!r} is below the "
+            f"configured floor {min_integrity!r} — the issue body cannot be read, "
+            f"so there is nothing to act on. Lower min_github_integrity to include "
+            f"it, or target an issue from a more trusted author."
+        )
+
+    comments: list[dict] = []
+    comments_url = f"{issue_url}/comments"
+    policy.before_network(spec, comments_url)
+    _trace.emit(_trace.EvFetch(agent_id=spec.id, url=comments_url,
+                               mcp_tool="issues/comments", shallow=False))
+    body_words = 0
+    for page in range(1, _GITHUB_MAX_COMMENT_PAGES + 1):
+        cresp = await client.get(
+            comments_url, headers=headers,
+            params={"per_page": _GITHUB_PER_PAGE, "page": page})
+        _require_ok(cresp, "GitHub comments lookup")
+        batch = cresp.json()
+        if not isinstance(batch, list):
+            break
+        comments.extend(batch)
+        body_words += sum(len(str(c.get("body", "")).split()) for c in batch)
+        # A short page means there are no more; passing the word budget means
+        # any further page would be fetched only to be dropped below.
+        if len(batch) < _GITHUB_PER_PAGE or body_words >= _MAX_WEB_WORDS:
+            break
+
+    # Integrity gate — per comment, independently. A maintainer-filed issue can carry
+    # a hostile comment appended later by an anonymous account, so the attacker
+    # never needs to file the issue itself. A below-floor COMMENT is dropped quietly:
+    # refusing a whole thread over one low-provenance comment would make the tool
+    # unusable on any active public issue, and the issue itself still gives something
+    # to act on. The issue's own floor check already ran above.
+    kept_comments = []
+    for c in comments:
+        # vetted=False: a comment is never merged, so it is only ever author-scored.
+        level = _github_item_level(c, blocked_users, vetted=False)
+        if _github_meets_floor(level, min_integrity):
+            # `author` is provider-VERIFIED-unique but user-CHOSEN, so it is a
+            # deception vector on its own ("0ctocat" impersonating "octocat").
+            # Carrying `integrity` alongside it defuses that: the claimed identity
+            # and GitHub's verdict on that identity's standing appear together.
+            # Both are content, never routing — they can shape what the reply
+            # says, never where it is posted. `created_at` is provider-assigned
+            # and gives ordering independent of array position.
+            kept_comments.append({
+                "body":       str(c.get("body", "")),
+                "author":     str((c.get("user") or {}).get("login", "")),
+                "created_at": str(c.get("created_at", "")),
+                "integrity":  level,
+            })
+    if min_integrity:
+        # +1 on each side for the issue itself, which reached here having cleared
+        # the floor — a below-floor issue raised before any comment was fetched.
+        kept = len(kept_comments) + 1
+        _trace.emit(_trace.EvGithubItemsFiltered(
+            agent_id=spec.id, slot_id=writer.slot_id, floor=min_integrity,
+            dropped=1 + len(comments) - kept, kept=kept))
+
+    # No conditional blanking here: a below-floor issue raised above, so reaching
+    # this point means the issue cleared the floor and every field is admissible.
+    projected: dict[str, object] = {
+        "repo":            repo,
+        "number":          number,
+        "is_pull_request": "pull_request" in issue,
+        "state":           str(issue.get("state", "")),
+        # Both the derived level (what the gate used) and the raw association
+        # (identity, which the level deliberately collapses) — the floor filters
+        # on integrity; identity filtering is the `author` predicate's job.
+        "integrity":       issue_level,
+        "author_association": str(issue.get("author_association", "")),
+        "title":           str(issue.get("title", "")),
+        "body":            str(issue.get("body") or ""),
+    }
+
+    # Drop whole comments to fit the budget rather than truncating serialized
+    # JSON, which would hand the processor a syntactically invalid slot.
+    budget  = _MAX_WEB_WORDS - len(str(projected["body"]).split())
+    bounded: list[dict] = []
+    for c in kept_comments:
+        budget -= len(c["body"].split())
+        if budget < 0:
+            break
+        bounded.append(c)
+    projected["comments"]           = bounded
+    projected["comments_truncated"] = len(bounded) < len(kept_comments)
+    writer.write(json.dumps(projected, indent=2))
+
+
+async def run_github_issue_read(
+    spec:          AgentSpec,
+    base_url:      str,
+    search_params: dict,
+    writer:        SlotWriter,
+    policy:        IronFlow,
+    *,
+    github_token:  str = "",
+    min_integrity: str = "",
+    blocked_users: frozenset[str] = frozenset(),
+) -> None:
+    """
+    Tier 1 Data Sub-Agent (GitHub REST): operator code only — no LLM.
+
+    Reads ONE issue named explicitly in the task, so the comment target is
+    (T,pub) precommitted before observation — the strongest provenance. Use
+    run_github_issue_search when the task names a predicate instead of a number.
+
+    Works for pull requests too: every PR is an issue in GitHub's data model.
+    Auth: github_token (operator-supplied; injected by the driver, never a slot).
+    """
+    if not github_token:
+        raise RuntimeError("GitHub issue read requires GITHUB_TOKEN (none provided).")
+    repo = _github_repo(search_params, "GitHub issue read")
+    try:
+        number = int(search_params.get("issue_number"))
+    except (TypeError, ValueError):
+        raise RuntimeError(
+            f"GitHub issue read requires an integer issue_number "
+            f"(got {search_params.get('issue_number')!r})")
+
+    headers = _github_headers(github_token)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        await _github_write_issue(client, base_url, repo, number, headers,
+                                  spec, writer, policy, min_integrity, blocked_users)
+
+
+# Filter keys accepted by run_github_issue_search, all resolved by operator code.
+_GITHUB_SELECT = ("latest", "oldest")
+_GITHUB_STATES = ("open", "closed", "all")
+
+
+async def run_github_issue_search(
+    spec:          AgentSpec,
+    base_url:      str,
+    search_params: dict,
+    writer:        SlotWriter,
+    policy:        IronFlow,
+    *,
+    github_token:  str = "",
+    min_integrity: str = "",
+    blocked_users: frozenset[str] = frozenset(),
+) -> int:
+    """
+    Tier 1 Data Sub-Agent (GitHub REST): resolve ONE issue from a task-derived
+    predicate, then write it exactly as run_github_issue_read would. No LLM.
+
+    Filter keys (all optional, all matched deterministically):
+      issue_number   — explicit number; short-circuits every other key
+      state          — open | closed | all           (default open)
+      labels         — comma string or list; ALL must be present (GitHub semantics)
+      title_contains — case-insensitive substring of the title
+      author         — exact login match
+      select         — latest | oldest by creation time (default latest)
+
+    Returns the resolved issue number so the driver can publish it as (T,pub).
+
+    Two properties make returning that number as trusted routing defensible:
+      • it is PROVIDER-assigned (GitHub mints issue numbers; issue authors do not),
+        the same argument that lets run_mcp_email_search hand back a Gmail thread_id;
+      • selection reads only provider metadata (created_at, author_association,
+        labels, state) plus the task's own predicate — never an author's prose,
+        and never an LLM's judgement.
+
+    It is NOT, however, precommitted-before-observation the way an explicitly
+    numbered target is: it is discovered mid-run. The driver records which
+    provenance was used so the audit does not overstate the guarantee.
+
+    The provenance floor is applied DURING selection, not only afterwards: an
+    issue whose author is below the floor is never eligible to be selected. That
+    is what stops "the latest issue" resolving to one an untrusted account filed
+    to capture the action.
+    """
+    if not github_token:
+        raise RuntimeError("GitHub issue search requires GITHUB_TOKEN (none provided).")
+    repo = _github_repo(search_params, "GitHub issue search")
+
+    headers = _github_headers(github_token)
+
+    # Explicit number short-circuits the predicate entirely.
+    if search_params.get("issue_number") not in (None, ""):
+        try:
+            number = int(search_params["issue_number"])
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                f"issue_number must be an integer (got {search_params['issue_number']!r})")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            await _github_write_issue(client, base_url, repo, number, headers,
+                                      spec, writer, policy, min_integrity, blocked_users)
+        return number
+
+    state  = _one_of(search_params, "state", _GITHUB_STATES, "open")
+    select = _one_of(search_params, "select", _GITHUB_SELECT, "latest")
+    title_needle = str(search_params.get("title_contains", "")).strip().lower()
+    author       = str(search_params.get("author", "")).strip().lower()
+    labels       = _csv_list(search_params.get("labels"))
+
+    # Ask GitHub to do the ordering and the label filter; both are provider-side
+    # metadata operations, so the ranking is never influenced by issue prose.
+    query: dict[str, object] = {
+        "state": state, "sort": "created", "per_page": _GITHUB_PER_PAGE,
+        "direction": "desc" if select == "latest" else "asc",
+    }
+    if labels:
+        query["labels"] = ",".join(labels)
+    list_url = f"{base_url}/repos/{repo}/issues"
+    policy.before_network(spec, list_url)
+    _trace.emit(_trace.EvFetch(agent_id=spec.id, url=list_url,
+                               mcp_tool="issues/list", shallow=False))
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        lresp = await client.get(list_url, headers=headers, params=query)
+        _require_ok(lresp, "GitHub issue list")
+        listed = lresp.json()
+        if not isinstance(listed, list):
+            raise RuntimeError("GitHub issue list did not return an array")
+
+        considered = len(listed)
+        # Selection-time gate: a below-floor author is not eligible, so an
+        # untrusted account cannot capture "latest" by filing an issue.
+        eligible = [
+            i for i in listed
+            if _github_meets_floor(_github_item_level(i, blocked_users), min_integrity)
+            and (not title_needle or title_needle in str(i.get("title", "")).lower())
+            and (not author or author == _github_login(i))
+        ]
+        _trace.emit(_trace.EvGithubIssueSelected(
+            agent_id=spec.id, repo=repo, considered=considered,
+            eligible=len(eligible), select=select, floor=min_integrity or "disabled",
+            number=int(eligible[0].get("number", 0)) if eligible else 0,
+            title=str(eligible[0].get("title", "")) if eligible else "",
+            author=str((eligible[0].get("user") or {}).get("login", "")) if eligible else "",
+        ))
+        if not eligible:
+            raise RuntimeError(
+                f"no issue on {repo} matched the filter "
+                f"(state={state}, labels={labels or '-'}, title_contains="
+                f"{title_needle or '-'}, author={author or '-'}, floor="
+                f"{min_integrity or 'disabled'}) — {considered} considered")
+
+        # GitHub already ordered by creation, so the head is the selection.
+        number = int(eligible[0]["number"])
+        await _github_write_issue(client, base_url, repo, number, headers,
+                                  spec, writer, policy, min_integrity, blocked_users)
+    return number
+
+
+_GITHUB_LIST_SORTS      = ("created", "updated", "comments")
+_GITHUB_LIST_KINDS      = ("issue", "pr", "all")
+_GITHUB_LIST_MAX_ITEMS  = 50      # ceiling on items projected into the slot
+_GITHUB_EXCERPT_WORDS   = 60      # per-item body excerpt, in words
+
+
+async def run_github_issue_list(
+    spec:          AgentSpec,
+    base_url:      str,
+    search_params: dict,
+    writer:        SlotWriter,
+    policy:        IronFlow,
+    *,
+    github_token:  str = "",
+    min_integrity: str = "",
+    blocked_users: frozenset[str] = frozenset(),
+) -> None:
+    """
+    Tier 1 Data Sub-Agent (GitHub REST): list MANY issues / PRs matching a
+    task-derived predicate. Operator code only — no LLM.
+
+    Report-only by construction: it publishes **no routing**, so nothing it
+    returns can select the target of a write. That is what makes a broad,
+    many-item query safe to run at all — `mcp_github_issue_search` deliberately
+    resolves exactly one item because its result *does* reach `add_comment`.
+
+    Filter keys (all optional, all matched deterministically):
+      state      — open | closed | all                   (default open)
+      labels     — comma string or list; ALL must be present (GitHub semantics)
+      assignee   — login, or "*" (any) / "none"
+      creator    — login of the author
+      mentioned  — login mentioned in the item
+      kind       — issue | pr | all                      (default all)
+      sort       — created | updated | comments           (default updated)
+      direction  — asc | desc                            (default desc)
+      limit      — max items projected                    (default/ceiling 50)
+
+    `kind` exists because GitHub's issues endpoint returns pull requests too —
+    every PR is an issue in its data model. Splitting them is a projection
+    concern, not a second request.
+
+    Integrity: each item is scored independently and below-floor items are
+    dropped, exactly as comments are. The slot carries `considered` / `listed` /
+    `withheld` so an empty list stays distinguishable from a list that was
+    emptied by the floor — the many-item analogue of the fail-closed rule that
+    makes a filtered-out issue raise rather than read as empty.
+    """
+    if not github_token:
+        raise RuntimeError("GitHub issue list requires GITHUB_TOKEN (none provided).")
+    repo = _github_repo(search_params, "GitHub issue list")
+
+    state     = _one_of(search_params, "state", _GITHUB_STATES, "open")
+    kind      = _one_of(search_params, "kind", _GITHUB_LIST_KINDS, "all")
+    sort      = _one_of(search_params, "sort", _GITHUB_LIST_SORTS, "updated")
+    direction = _one_of(search_params, "direction", ("asc", "desc"), "desc")
+    try:
+        limit = int(search_params.get("limit", _GITHUB_LIST_MAX_ITEMS))
+    except (TypeError, ValueError):
+        raise RuntimeError(f"limit must be an integer (got {search_params.get('limit')!r})")
+    limit = max(1, min(limit, _GITHUB_LIST_MAX_ITEMS))
+
+    labels = _csv_list(search_params.get("labels"))
+
+    query: dict[str, object] = {
+        "state": state, "sort": sort, "direction": direction,
+        "per_page": _GITHUB_PER_PAGE,
+    }
+    if labels:
+        query["labels"] = ",".join(labels)
+    # Passed to GitHub rather than matched locally: these are provider-side
+    # metadata filters, so the selection is never influenced by item prose.
+    for key in ("assignee", "creator", "mentioned"):
+        value = str(search_params.get(key, "")).strip()
+        if value:
+            query[key] = value
+
+    headers  = _github_headers(github_token)
+    list_url = f"{base_url}/repos/{repo}/issues"
+    policy.before_network(spec, list_url)
+    _trace.emit(_trace.EvFetch(agent_id=spec.id, url=list_url,
+                               mcp_tool="issues/list", shallow=False))
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.get(list_url, headers=headers, params=query)
+        _require_ok(resp, "GitHub issue list")
+        listed = resp.json()
+    if not isinstance(listed, list):
+        raise RuntimeError("GitHub issue list did not return an array")
+
+    considered = len(listed)
+    items: list[dict] = []
+    withheld = 0
+    for item in listed:
+        is_pr = "pull_request" in item
+        if kind == "issue" and is_pr:
+            continue
+        if kind == "pr" and not is_pr:
+            continue
+        level = _github_item_level(item, blocked_users)
+        if not _github_meets_floor(level, min_integrity):
+            withheld += 1
+            continue
+        if len(items) >= limit:
+            continue
+        body  = str(item.get("body") or "").split()
+        items.append({
+            "number":          int(item.get("number", 0)),
+            "is_pull_request": is_pr,
+            "state":           str(item.get("state", "")),
+            "title":           str(item.get("title", "")),
+            "body_excerpt":    " ".join(body[:_GITHUB_EXCERPT_WORDS]),
+            "body_truncated":  len(body) > _GITHUB_EXCERPT_WORDS,
+            "author":          str((item.get("user") or {}).get("login", "")),
+            "author_association": str(item.get("author_association", "")),
+            "integrity":       level,
+            "labels":          [str(l.get("name", "")) for l in (item.get("labels") or [])
+                                if isinstance(l, dict)],
+            "comments":        int(item.get("comments", 0) or 0),
+            "created_at":      str(item.get("created_at", "")),
+            "updated_at":      str(item.get("updated_at", "")),
+        })
+
+    if min_integrity:
+        _trace.emit(_trace.EvGithubItemsFiltered(
+            agent_id=spec.id, slot_id=writer.slot_id, floor=min_integrity,
+            dropped=withheld, kept=len(items)))
+
+    # `withheld` is carried into the slot, not just the trace: without it an
+    # all-filtered result is indistinguishable from "nothing matched", and the
+    # processor would report "you have no open issues" as though that were a fact.
+    writer.write(json.dumps({
+        "repo":       repo,
+        "query":      {"state": state, "kind": kind, "labels": labels,
+                       "assignee":  str(search_params.get("assignee", "")).strip(),
+                       "creator":   str(search_params.get("creator", "")).strip(),
+                       "mentioned": str(search_params.get("mentioned", "")).strip(),
+                       "sort": sort, "direction": direction},
+        "floor":      min_integrity or "disabled",
+        "considered": considered,
+        "listed":     len(items),
+        "withheld":   withheld,
+        "items":      items,
+    }, indent=2))
+
+
+_GITHUB_MAX_PR_FILE_PAGES = 3
+_GITHUB_PATCH_MAX_WORDS   = 4000     # total across all patches in one slot
+
+
+async def _github_write_pr(
+    client, base_url: str, repo: str, number: int, headers: dict,
+    spec: AgentSpec, writer: SlotWriter, policy: IronFlow, min_integrity: str,
+    blocked_users: frozenset[str] = frozenset(),
+) -> str:
+    """Fetch one PR + its changed files, gate them, and write the slot.
+
+    Shared by run_github_pr_read and run_github_pr_search so the projection and
+    the gate have exactly one implementation — the same reason
+    `_github_write_issue` exists.
+
+    Returns the head SHA. That is what binds a later `submit_pr_review` to the
+    commit actually reviewed: without it a review posted after a force-push would
+    attach to code nobody read. The SHA qualifies as trusted routing for the same
+    reason an issue number does — provider-assigned, not author-authored.
+
+    **The diff is unvetted by construction.** `_github_vetted` is false for any
+    unmerged PR, so the PR's own level is author-derived and can never reach
+    `merged` while it is open. The projection states this explicitly as
+    `diff_vetted`, because the distinction is the whole point of the vetting
+    axis: a maintainer's proposed diff is still a proposal, and treating it as
+    reviewed code is exactly the mistake author-only scoring would make.
+
+    Fail-closed on a below-floor author, matching `_github_write_issue`: a
+    blanked PR would read as an empty one.
+    """
+    pr_url = f"{base_url}/repos/{repo}/pulls/{number}"
+    policy.before_network(spec, pr_url)
+    _trace.emit(_trace.EvFetch(agent_id=spec.id, url=pr_url, mcp_tool="pulls", shallow=False))
+    presp = await client.get(pr_url, headers=headers)
+    _require_ok(presp, "GitHub PR lookup")
+    pr = presp.json()
+    if not isinstance(pr, dict):
+        raise RuntimeError("GitHub PR lookup did not return an object")
+
+    merged = bool(pr.get("merged") or pr.get("merged_at"))
+    level  = _github_item_level(pr, blocked_users)
+    if not _github_meets_floor(level, min_integrity):
+        raise RuntimeError(
+            f"{repo}#{number}: author integrity {level!r} is below the configured "
+            f"floor {min_integrity!r} — the pull request cannot be read, so there "
+            f"is nothing to review. Lower min_github_integrity to include it, or "
+            f"target a pull request from a more trusted author.")
+
+    files_url = f"{pr_url}/files"
+    policy.before_network(spec, files_url)
+    _trace.emit(_trace.EvFetch(agent_id=spec.id, url=files_url,
+                               mcp_tool="pulls/files", shallow=False))
+    raw_files: list[dict] = []
+    patch_words = 0
+    for page in range(1, _GITHUB_MAX_PR_FILE_PAGES + 1):
+        fresp = await client.get(files_url, headers=headers,
+                                 params={"per_page": _GITHUB_PER_PAGE, "page": page})
+        _require_ok(fresp, "GitHub PR files lookup")
+        batch = fresp.json()
+        if not isinstance(batch, list):
+            break
+        raw_files.extend(batch)
+        patch_words += sum(len(str(f.get("patch") or "").split()) for f in batch)
+        # A short page means there are no more; passing the patch budget means any
+        # further page would be fetched only to have every patch dropped below. A
+        # page of 100 patches is routinely multiple MB, so this is the difference
+        # between one request and three on a large PR.
+        if len(batch) < _GITHUB_PER_PAGE or patch_words >= _GITHUB_PATCH_MAX_WORDS:
+            break
+
+    # Drop whole patches to fit the budget rather than truncating one mid-hunk:
+    # a half-patch reads as a complete change that simply does not apply.
+    budget = _GITHUB_PATCH_MAX_WORDS
+    files: list[dict] = []
+    patches_omitted = 0
+    for f in raw_files:
+        patch = str(f.get("patch") or "")
+        words = len(patch.split())
+        entry = {
+            "filename":  str(f.get("filename", "")),
+            "status":    str(f.get("status", "")),
+            "additions": int(f.get("additions", 0) or 0),
+            "deletions": int(f.get("deletions", 0) or 0),
+        }
+        if patch and words <= budget:
+            budget -= words
+            entry["patch"] = patch
+        elif patch:
+            patches_omitted += 1
+            entry["patch_omitted"] = True
+        files.append(entry)
+
+    head = pr.get("head") or {}
+    base = pr.get("base") or {}
+    head_sha = str(head.get("sha", ""))
+    if not head_sha:
+        raise RuntimeError(
+            f"{repo}#{number}: GitHub returned no head SHA, so a review could not be "
+            f"bound to the reviewed commit")
+
+    writer.write(json.dumps({
+        "repo":            repo,
+        "number":          number,
+        "is_pull_request": True,
+        "state":           str(pr.get("state", "")),
+        "draft":           bool(pr.get("draft")),
+        "merged":          merged,
+        "integrity":       level,
+        "author_association": str(pr.get("author_association", "")),
+        "author":          str((pr.get("user") or {}).get("login", "")),
+        "title":           str(pr.get("title", "")),
+        "body":            str(pr.get("body") or ""),
+        "base_ref":        str(base.get("ref", "")),
+        "head_ref":        str(head.get("ref", "")),
+        "head_sha":        head_sha,
+        # Coincides with `merged` today because merging is the only thing that vets
+        # a diff — kept as its own key because it is the security-relevant reading
+        # and the processor instruction names it. An open PR's diff has not been
+        # reviewed, whatever its author's standing, so a review lens cannot mistake
+        # a proposal for vetted code.
+        "diff_vetted":     merged,
+        "additions":       int(pr.get("additions", 0) or 0),
+        "deletions":       int(pr.get("deletions", 0) or 0),
+        "changed_files":   int(pr.get("changed_files", 0) or 0),
+        "files":           files,
+        # Every fetched file yields an entry, so a partial view can only come from a
+        # dropped patch or an unfetched page — never from a dropped file entry.
+        "files_truncated": patches_omitted > 0 or len(raw_files) >= _GITHUB_PER_PAGE * _GITHUB_MAX_PR_FILE_PAGES,
+        "patches_omitted": patches_omitted,
+    }, indent=2))
+    return head_sha
+
+
+async def run_github_pr_read(
+    spec:          AgentSpec,
+    base_url:      str,
+    search_params: dict,
+    writer:        SlotWriter,
+    policy:        IronFlow,
+    *,
+    github_token:  str = "",
+    min_integrity: str = "",
+    blocked_users: frozenset[str] = frozenset(),
+) -> tuple[str, int]:
+    """
+    Tier 1 Data Sub-Agent (GitHub REST): read ONE pull request named explicitly in
+    the task, plus its changed files. Operator code only — no LLM.
+
+    Returns (head SHA, PR number), both published by the driver as (T,pub). The
+    number is published so submit_pr_review can refuse a plan that reviews a
+    different PR from the one read; the SHA binds the review to the reviewed code.
+
+    Use run_github_pr_search when the task describes the pull request instead of
+    naming its number.
+    """
+    if not github_token:
+        raise RuntimeError("GitHub PR read requires GITHUB_TOKEN (none provided).")
+    repo = _github_repo(search_params, "GitHub PR read")
+    raw  = search_params.get("pull_number", search_params.get("issue_number"))
+    try:
+        number = int(raw)
+    except (TypeError, ValueError):
+        raise RuntimeError(f"GitHub PR read requires an integer pull_number (got {raw!r})")
+
+    headers = _github_headers(github_token)
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        head_sha = await _github_write_pr(
+            client, base_url, repo, number, headers, spec, writer, policy,
+            min_integrity, blocked_users)
+    return head_sha, number
+
+
+async def run_github_pr_search(
+    spec:          AgentSpec,
+    base_url:      str,
+    search_params: dict,
+    writer:        SlotWriter,
+    policy:        IronFlow,
+    *,
+    github_token:  str = "",
+    min_integrity: str = "",
+    blocked_users: frozenset[str] = frozenset(),
+) -> tuple[str, int]:
+    """
+    Tier 1 Data Sub-Agent (GitHub REST): resolve ONE pull request from a
+    task-derived predicate, then read it exactly as run_github_pr_read would.
+
+    Filter keys (all optional, all matched deterministically):
+      pull_number    — explicit number; short-circuits every other key
+      state          — open | closed | all           (default open)
+      base           — base branch name
+      head           — head branch, 'user:ref' form
+      author         — exact login match
+      title_contains — case-insensitive substring of the title
+      select         — latest | oldest by creation   (default latest)
+      include_drafts — draft PRs are excluded unless true
+
+    Returns (head SHA, resolved number), both published as (T,pub).
+
+    The provenance floor is applied DURING selection, so a below-floor author is
+    never eligible: that is what stops "the open pull request" resolving to one an
+    untrusted account opened to capture the review.
+
+    Drafts are excluded by default. A draft is explicitly not ready for review, so
+    selecting one by predicate would target work its author has said is unfinished.
+
+    The resolved number is provider-assigned and chosen by operator code over
+    provider metadata, which is what makes it admissible as (T,pub) routing. It is
+    NOT precommitted-before-observation the way an explicitly numbered target is —
+    it is discovered mid-run. The driver records which provenance applied so the
+    audit does not report the stronger guarantee. That distinction matters more
+    here than for a comment: REQUEST_CHANGES blocks a pull request.
+    """
+    if not github_token:
+        raise RuntimeError("GitHub PR search requires GITHUB_TOKEN (none provided).")
+    repo    = _github_repo(search_params, "GitHub PR search")
+    headers = _github_headers(github_token)
+
+    # Explicit number short-circuits the predicate entirely.
+    if search_params.get("pull_number") not in (None, ""):
+        try:
+            number = int(search_params["pull_number"])
+        except (TypeError, ValueError):
+            raise RuntimeError(
+                f"pull_number must be an integer (got {search_params['pull_number']!r})")
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            head_sha = await _github_write_pr(
+                client, base_url, repo, number, headers, spec, writer, policy,
+                min_integrity, blocked_users)
+        return head_sha, number
+
+    state  = _one_of(search_params, "state", _GITHUB_STATES, "open")
+    select = _one_of(search_params, "select", _GITHUB_SELECT, "latest")
+    title_needle   = str(search_params.get("title_contains", "")).strip().lower()
+    author         = str(search_params.get("author", "")).strip().lower()
+    include_drafts = bool(search_params.get("include_drafts", False))
+
+    query: dict[str, object] = {
+        "state": state, "sort": "created", "per_page": _GITHUB_PER_PAGE,
+        "direction": "desc" if select == "latest" else "asc",
+    }
+    for key in ("base", "head"):
+        value = str(search_params.get(key, "")).strip()
+        if value:
+            query[key] = value
+
+    list_url = f"{base_url}/repos/{repo}/pulls"
+    policy.before_network(spec, list_url)
+    _trace.emit(_trace.EvFetch(agent_id=spec.id, url=list_url,
+                               mcp_tool="pulls/list", shallow=False))
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        lresp = await client.get(list_url, headers=headers, params=query)
+        _require_ok(lresp, "GitHub PR list")
+        listed = lresp.json()
+        if not isinstance(listed, list):
+            raise RuntimeError("GitHub PR list did not return an array")
+
+        considered = len(listed)
+        drafts_skipped = sum(1 for p in listed if p.get("draft") and not include_drafts)
+        eligible = [
+            p for p in listed
+            if (include_drafts or not p.get("draft"))
+            and _github_meets_floor(_github_item_level(p, blocked_users), min_integrity)
+            and (not title_needle or title_needle in str(p.get("title", "")).lower())
+            and (not author or author == _github_login(p))
+        ]
+        _trace.emit(_trace.EvGithubPrSelected(
+            agent_id=spec.id, repo=repo, considered=considered,
+            eligible=len(eligible), drafts_skipped=drafts_skipped, select=select,
+            floor=min_integrity or "disabled",
+            number=int(eligible[0].get("number", 0)) if eligible else 0,
+            title=str(eligible[0].get("title", "")) if eligible else "",
+            author=str((eligible[0].get("user") or {}).get("login", "")) if eligible else "",
+        ))
+        if not eligible:
+            # Report what was excluded and why: at a floor of 'approved' on a public
+            # repo an empty result is routine, and "no PR matched" alone reads as a
+            # broken tool rather than a policy outcome.
+            raise RuntimeError(
+                f"no pull request on {repo} matched the filter "
+                f"(state={state}, base={query.get('base', '-')}, "
+                f"title_contains={title_needle or '-'}, author={author or '-'}, "
+                f"floor={min_integrity or 'disabled'}) — {considered} considered, "
+                f"{drafts_skipped} draft(s) skipped")
+
+        number   = int(eligible[0]["number"])
+        head_sha = await _github_write_pr(
+            client, base_url, repo, number, headers, spec, writer, policy,
+            min_integrity, blocked_users)
+    return head_sha, number
+
+
 # ══════════════════════════════════════════════════════════════════════
 # TIER 2 — PROCESSOR SUB-AGENTS
 # Isolated claude -p, reads slots only, no network.

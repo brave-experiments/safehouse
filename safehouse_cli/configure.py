@@ -11,6 +11,8 @@ import json
 import sys
 from getpass import getpass
 
+from safehouse.runner import _GITHUB_INTEGRITY_LEVELS
+
 from . import settings as _settings
 from .config import _version_string
 from .settings import SECRET_KEYS
@@ -150,6 +152,27 @@ def run_configure(argv: list[str]) -> int:
         defaults.get("max_booking_amount"))
 
     # Update into the loaded dict so any hand-added sections/keys are preserved.
+    # ── GitHub issues/PRs ─────────────────────────────────────────────
+    print("\n  GitHub — read issues/PRs + post comments:")
+    print("    Create a PAT at https://github.com/settings/tokens")
+    print("    Scopes: public_repo for public repositories, repo to include private ones")
+    github = data.get("github", {})
+    github["access_token"] = _prompt("GitHub token", github.get("access_token"), secret=True)
+
+    print("\n  Integrity gate — issue/PR text is attacker-reachable, so each item is")
+    print("  kept only if its derived integrity ranks at or above this floor.")
+    print("  Integrity comes from the author's standing AND whether the content")
+    print("  was merged to the default branch (merged outranks any author).")
+    print(f"    {' > '.join(_GITHUB_INTEGRITY_LEVELS)}")
+    print("    'approved' is a reasonable default; leave unset to DISABLE the gate")
+    print("    (unset means anonymous comments reach the drafting model unfiltered).")
+    floor = _prompt("Minimum GitHub integrity", defaults.get("min_github_integrity"))
+    if floor and floor not in _GITHUB_INTEGRITY_LEVELS:
+        print(f"error: min_github_integrity must be one of {_GITHUB_INTEGRITY_LEVELS}",
+              file=sys.stderr)
+        return 2
+    defaults["min_github_integrity"] = floor
+
     print("\n  Passenger profile — used for flight booking; stays on your machine, never sent to the LLM:")
     passenger = data.get("passenger", {})
     for field, label in (
@@ -167,6 +190,7 @@ def run_configure(argv: list[str]) -> int:
     # Update into the loaded dict so any hand-added sections/keys are preserved.
     data["anthropic"], data["google"], data["defaults"] = anthropic, google, defaults
     data["duffel"], data["liteapi"], data["passenger"] = duffel, liteapi, passenger
+    data["github"] = github
     _settings.write_config(data, path)
     print(f"\nSaved {path}")
     return 0

@@ -74,6 +74,9 @@ class Settings:
     liteapi_key:             str | None   = None
     passenger:               dict | None  = None
     max_booking_amount:      str | None   = None   # "<amount> <currency>", e.g. "300 GBP"
+    github_token:            str | None   = None
+    min_github_integrity:    str | None   = None   # object-integrity floor, e.g. "approved"
+    github_blocked_users:    list | None   = None   # logins never trusted, any integrity
     google_token:            str | None   = None
     google_auth:             str          = "static"
     google_token_command:    str | None   = None
@@ -105,6 +108,9 @@ def load_settings(path: Path | None = None, env: dict | None = None) -> Settings
         google_auth             = google_auth,
         google_token_command    = token_command,
         google_credentials_path = path.parent / "google_credentials.json",
+        github_token            = env.get("GITHUB_TOKEN", "").strip() or data.get("github", {}).get("access_token"),
+        min_github_integrity    = env.get("SAFEHOUSE_MIN_GITHUB_INTEGRITY", "").strip() or defaults.get("min_github_integrity"),
+        github_blocked_users    = data.get("github", {}).get("blocked_users"),
         demo_recipient          = env.get("DEMO_RECIPIENT", "").strip() or defaults.get("demo_recipient"),
         approve                 = defaults.get("approve"),
         timeout                 = defaults.get("timeout"),

@@ -180,6 +180,11 @@ class Capability(Enum):
     # Cannot cross the IronFlow bridge without explicit driver declassification.
     EMAIL_READ     = "EMAIL_READ"
     CALENDAR_READ  = "CALENDAR_READ"
+    # GITHUB_READ is priv even for public repos: this map is fixed at plan time,
+    # so repo visibility (only knowable after the fetch) cannot select the label.
+    # Over-labelling public content costs one explicit declassify; under-labelling
+    # a private repo would leak it across the bridge.
+    GITHUB_READ    = "GITHUB_READ"
 
 
 CAPABILITY_LABEL: dict[Capability, Label] = {
@@ -188,6 +193,7 @@ CAPABILITY_LABEL: dict[Capability, Label] = {
     Capability.HOTEL_SEARCH:  Label.U_pub(),
     Capability.EMAIL_READ:    Label.U_priv(),
     Capability.CALENDAR_READ: Label.U_priv(),
+    Capability.GITHUB_READ:   Label.U_priv(),
 }
 
 
