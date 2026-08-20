@@ -1,6 +1,6 @@
 # SafeHouse — Claude Code Reference
 
-> IPI-resistant multi-agent pipeline. Three tiers of execution: **Tier 1** deterministic data sub-agents (no LLM) → **Tier 2** isolated processor sub-agents (sandboxed `claude -p`) → **Tier 3** driver tools (act on the world). IronFlow enforces information-flow labels `L = I × C` at every boundary in pure Python — the LLM cannot reason past it.
+> IPI-resistant multi-agent pipeline. Three tiers of execution: **Tier 1** deterministic data sub-agents (no LLM) → **Tier 2** isolated processor sub-agents (in-process Anthropic SDK, no tools) → **Tier 3** driver tools (act on the world). IronFlow enforces information-flow labels `L = I × C` at every boundary in pure Python — the LLM cannot reason past it.
 
 ---
 
@@ -21,7 +21,7 @@ python3 -c "from safehouse.planner import build_planner_system_prompt; print(bui
 | `safehouse/driver.py` | Manifest executor; all `_handle_*` tool handlers; `_HANDLERS`; `_DRIVER_ROUTING_FIELDS`; `ProviderConfig`; `GmailClient` |
 | `safehouse/release.py` | Tier-3 release transforms — `DRIVER_RELEASE`, `opaque` / `structured:*`, `apply_release_transform()` |
 | `safehouse/ironflow_policy.py` | `IronFlow` engine — gates, `precommit_routing`, `declassify_slot`, `issue_action_grant`, `apply_bridge_field`; `Role` enum (`ROUTING`/`CONTENT`) |
-| `safehouse/runner.py` | All sub-agent execution — `run_mcp_*` (Tier 1), `run_processor` (Tier 2) |
+| `safehouse/runner.py` | All sub-agent execution — `run_mcp_*` / GitHub / booking fetchers (Tier 1), `run_processor` (Tier 2) |
 | `safehouse/planner.py` | Three-phase manifest planner — `TOOL_SCHEMA`; `_PIPELINE_SHAPES`; `_map_to_concrete`; `_validate_plan` |
 | `safehouse/registry.py` | `MCPSpec`; `CatalogSpec`; `ToolRegistry`; `DEFAULT_REGISTRY`; `CAPABILITY_DESCRIPTION` |
 | `safehouse/labels.py` | Label lattice `L = I × C`; `Capability` enum; `CAPABILITY_LABEL`; `taint_all` |
@@ -29,7 +29,7 @@ python3 -c "from safehouse.planner import build_planner_system_prompt; print(bui
 | `safehouse/plan_types.py` | `PlanState` (trusted vars + step audit trail) |
 | `safehouse/permissions.py` | `AgentSpec`; `fetcher_spec` / `processor_spec` / `driver_spec` factories; capability tokens |
 | `safehouse/trace.py` | Typed event system — all `Ev*` dataclasses; `Event` union; `emit` / `set_tracer` |
-| `safehouse_cli/` | CLI: `config.py` (flags + `RunConfig`); `app.py` (`ExitCode`, `RunResult`, `run_task`); `cli.py` (entry point) |
+| `safehouse_cli/` | CLI: `config.py` (flags + `RunConfig`); `app.py` (`ExitCode`, `RunResult`, `run_task`); `cli.py` (entry point); `settings.py` (sole env reader); `configure.py` |
 | `tracer.py` | All display logic; `DemoSpec`; `detect_pipeline`; `_PIPELINE_ENV` |
 | `tests/test_registry_drift.py` | Cross-module consistency guard — **update this when adding any new tool or pipeline** |
 
@@ -94,7 +94,11 @@ Steps are ordered; each one has a downstream dependency on the previous.
 4. **`safehouse/permissions.py`** — add `CanCallTool("<tool_name>")` to `driver_spec()`
 5. **`safehouse/driver.py`** — add `_handle_<tool_name>() -> tuple[str, dict]`; register in `_HANDLERS`; add entry to `_DRIVER_ROUTING_FIELDS` with the exact routing field names; add `ReleaseGate` to `safehouse/release.py` `DRIVER_RELEASE` (slot arg names + `opaque` / `structured:<id>` / `None`)
 6. **`tracer.py`** — add event handler(s) to `_UNIVERSAL_SPEC` / the matching audit; if this is a new pipeline type, update `detect_pipeline()` and add an entry to `_PIPELINE_ENV`
-7. **`tests/test_registry_drift.py`** — add tool to `EXPECTED_PIPELINE_BY_TOOL`
+7. **`safehouse/registry.py`** — add the tool to its provider's credential set (`GITHUB_TOOLS`, `GOOGLE_TOOLS`, `DUFFEL_TOOLS`, `LITEAPI_TOOLS`); a tool absent from all four gets no CLI preflight and fails mid-action with an empty token
+8. **`tracer.py`** — add the provider's env var to `_PIPELINE_ENV` for any pipeline that can now need it (operator hints, not preflight)
+9. **`tests/test_registry_drift.py`** — add tool to `EXPECTED_PIPELINE_BY_TOOL`
+
+`_TIER1_TOOLS` needs no edit: it is derived from `TOOL_SCHEMA`'s shape.
 
 Run `python3 -m pytest tests/ -v` after each step. `test_registry_drift.py` will tell you exactly which registry is missing the new tool.
 

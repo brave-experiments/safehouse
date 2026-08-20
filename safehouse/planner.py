@@ -42,13 +42,13 @@ planner.py — Three-phase manifest planner.
                           mark_read · mark_unread · star · unstar
       • is_driver_tool     driver tool mid-plan → error (unreachable steps after it)
     Post-loop
-      • final step must have is_driver_tool=True (one of: send_summary · send_reply ·
-          schedule_meeting · modify_emails); plans ending without a driver tool are rejected
+      • final step must have is_driver_tool=True (see TOOL_SCHEMA); plans ending
+          without a driver tool are rejected
     Not checked here (intentional)
       • trusted_action_urls — validated by IronFlow before_action gates at use time
       • modify_emails.sender — Gmail query param, not an addressee; may be a domain, not a full address
-      • spawn_processor instruction/output_format semantics — validated by the subprocess runner
-      • search_params key/value semantics — provider-specific, validated by MCP handler at runtime
+      • spawn_processor instruction/output_format semantics — validated by the in-process processor
+      • search_params key/value semantics — provider-specific, validated by the fetcher at runtime
 
 
 ═══════════════════════════════════════════════════════════════
@@ -138,7 +138,8 @@ class PipelinePattern:
     example:     str   # prompt text; {timezone} replaced by build_patterns_section
 
 
-# Four shapes — one per Tier 3 driver tool currently exposed to the abstract planner.
+# One shape per Tier 3 driver tool currently exposed to the abstract planner,
+# plus variants where a Tier-1 search resolves routing mid-run.
 _PIPELINE_SHAPES: list[PipelinePattern] = [
 
     PipelinePattern(
@@ -864,8 +865,8 @@ def _validate_plan(
     Not checked here (intentional):
       trusted_action_urls       — IronFlow before_action gates enforce at use time.
       modify_emails.sender      — Gmail query param, not an addressee; may be a domain.
-      spawn_processor semantics — subprocess runner validates instruction/output_format.
-      search_params content     — provider-specific; MCP handler validates at runtime.
+      spawn_processor semantics — in-process processor validates instruction/output_format.
+      search_params content     — provider-specific; the fetcher validates at runtime.
     """
     steps = plan.get("steps")
     if not isinstance(steps, list) or not steps:
@@ -1174,11 +1175,12 @@ def _map_to_concrete(abstract_plan: dict, registry: ToolRegistry) -> dict:
       mcp_email_search / mcp_calendar_search (REST):
         filter={...}  →  api_url=<registry domain>, filter={...}
 
-      mcp_flight_search / mcp_hotel_search (MCP):
-        params={origin,...}  →  domain=<registry>, mcp_tool=<registry>,
-                                search_params={flyFrom,...}
-        (params renamed per MCPSpec.param_map; dates converted per date_fmt;
-         values translated per value_maps; unmapped names pass through unchanged)
+      mcp_flight_search / mcp_hotel_search / mcp_github_* (params-style REST):
+        params={...}  →  domain=<registry>, mcp_tool=<registry>,
+                                search_params={... renamed per MCPSpec.param_map}
+        (dates converted per date_fmt; values translated per value_maps;
+         unmapped names pass through unchanged). GitHub is REST, not MCP —
+         tool_type "mcp" here means the params→search_params mapping shape.
 
       mcp_page_content  — capability label injected; URL is caller-supplied, no provider URL added
 

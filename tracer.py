@@ -297,7 +297,7 @@ class BaseTracer(Tracer):
         _banner("DRIVER  —  EXECUTION MANIFEST  (planning complete · 3 phases)")
         print(f"  session: {ev.session_id}")
         print(f"  steps:   {self._total_steps}")
-        print(f"  model:   claude-sonnet-4-6  |  sub-agents: claude -p --tools \"\"")
+        print(f"  model:   claude-sonnet-4-6  |  sub-agents: Anthropic SDK (no tools)")
         self._render_task_template(ev.steps)
         w = _w()
         print(f"\n  {'─'*(w-2)}")
@@ -557,7 +557,7 @@ class BaseTracer(Tracer):
         elif isinstance(ev, EvAgentSpawned):
             trust = _fmt_trust(ev.trust)
             if ev.kind == "processor":
-                exec_note = '(claude -p --tools "")'
+                exec_note = "(Anthropic SDK · no tools)"
             elif ev.kind == "mcp_search":
                 exec_note = "(operator code · LLM rank by metadata only)"
             else:
@@ -746,10 +746,10 @@ def _on_send_summary_fired(t: _DemoTracer, ev: EvActionFired) -> None:
 
 
 # ── Trip ──────────────────────────────────────────────────────────────
-# Searches flights (Kiwi MCP) and hotels (trivago MCP), cross-products
-# combinations, validates booking URLs, emails the best options.
-# IPI defence: booking URLs domain-validated against registry whitelist
-# (trusted_action_urls from MCPSpec.booking_domain) before any fetch occurs.
+# Searches flights (Duffel REST) and hotels (LiteAPI REST), then emails
+# the best options. IPI defence: booking URLs domain-validated against
+# registry whitelist (trusted_action_urls from MCPSpec.booking_domain)
+# before any fetch occurs.
 
 
 def _trip_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
@@ -1473,12 +1473,6 @@ def _github_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
     print(f"  elapsed: {elapsed:.1f}s")
 
 
-def _github_req() -> tuple[str, str]:
-    return ("GITHUB_TOKEN",
-            "Create a PAT at https://github.com/settings/tokens\n"
-            "  Scopes required: repo (or public_repo for public repositories only)")
-
-
 def _universal_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
     """Dispatch to the right audit function based on pipeline type."""
     pipeline = t._state.get("_pipeline", "briefing")
@@ -1525,12 +1519,14 @@ _UNIVERSAL_SPEC = DemoSpec(
 
 
 # ── Pipeline detection and requirements ───────────────────────────────────────
-# All pipeline-specific knowledge lives here — safehouse_cli.app has no hardcoded tool names.
+# Pipeline classification lives here (session prefix + env *hints*).
+# Credential *preflight* is tool-driven in safehouse_cli.app from the
+# registry frozensets (GITHUB_TOOLS, GOOGLE_TOOLS, …) — a github plan that
+# ends in send_summary still needs Gmail even though this map's github
+# entry does not list GOOGLE_ACCESS_TOKEN.
 
-# Credential→tool mapping lives in safehouse.registry, beside the tools it
-# describes; imported here because detect_pipeline is the other consumer.
 from safehouse.registry import (          # noqa: E402  (kept next to its use)
-    GITHUB_TOOLS, GOOGLE_TOOLS, DUFFEL_TOOLS, LITEAPI_TOOLS,
+    GITHUB_TOOLS, GOOGLE_TOOLS,
 )
 
 
@@ -1547,7 +1543,9 @@ def detect_pipeline(tools: set[str]) -> str:
     the right session prefix and env vars.
     """
     # Booking first: every booking plan also carries a search tool, so testing
-    # trip first would make "booking" unreachable.
+    # trip first would make "booking" unreachable. GitHub is last among named
+    # pipelines so a mixed email+github plan keeps the email session prefix;
+    # GITHUB_TOOLS preflight in app.py still requires the token either way.
     if tools & {"book_flight", "book_hotel"}:
         return "booking"
     if tools & {"mcp_flight_search", "mcp_hotel_search"}:
@@ -1561,39 +1559,37 @@ def detect_pipeline(tools: set[str]) -> str:
     return "briefing"
 
 
-# Required env vars per detected pipeline.
-# All pipelines now use Gmail (Resend removed), so every pipeline that sends email
-# requires GOOGLE_ACCESS_TOKEN.  Empty list means no vars beyond ANTHROPIC_API_KEY.
+# Required env vars per detected pipeline — operator hints for the intro banner,
+# not the preflight. Preflight is keyed by tool (see registry credential sets),
+# because a pipeline's label does not determine every credential it will need.
 def _duffel_req() -> tuple[str, str]:
     return ("DUFFEL_ACCESS_TOKEN",
             "Create a token at Duffel → Developers → Access tokens (test mode = duffel_test_...).")
+
+def _liteapi_req() -> tuple[str, str]:
+    return ("LITEAPI_SANDBOX_KEY",
+            "Sign up at liteapi.travel → dashboard → API Keys.")
 
 def _gmail_req(scopes: str) -> tuple[str, str]:
     return ("GOOGLE_ACCESS_TOKEN",
             "Get one from https://developers.google.com/oauthplayground\n"
             f"  Scopes required: {scopes}")
 
-_PIPELINE_ENV: dict[str, list[tuple[str, str]]] = {
-    "briefing":  [_gmail_req("gmail.send")],
-    "trip":      [_gmail_req("gmail.send"), _duffel_req()],
-    "email":     [_gmail_req("gmail.modify + gmail.send")],
-    "calendar":  [_gmail_req("calendar + gmail.readonly + gmail.send")],
-    "booking":   [_duffel_req()],
-    "github":    [_github_req()],
-    "github":    [_github_req()],
-}
-
-# ══════════════════════════════════════════════════════════════════════
-# 8. PUBLIC FACADE
-# Stable public names for safehouse_cli (no leading underscore).
-# ══════════════════════════════════════════════════════════════════════
+# Hints for operators — actual preflight in app.py is tool-driven, so a
+# hotel-only trip still skips Duffel when mcp_flight_search is absent.
+# This map must still *mention* every provider a pipeline type can need,
+# or a mixed plan classified under that name looks like it needs nothing.
+def _github_req() -> tuple[str, str]:
+    return ("GITHUB_TOKEN",
+            "Create a PAT at https://github.com/settings/tokens\n"
+            "  Scopes required: repo (or public_repo for public repositories only)")
 
 
 _PIPELINE_ENV: dict[str, list[tuple[str, str]]] = {
     "briefing":  [_gmail_req("gmail.send")],
-    "booking":   [_duffel_req()],
+    "booking":   [_duffel_req(), _liteapi_req()],
     "github":    [_github_req()],
-    "trip":      [_gmail_req("gmail.send"), _duffel_req()],
+    "trip":      [_gmail_req("gmail.send"), _duffel_req(), _liteapi_req()],
     "email":     [_gmail_req("gmail.modify + gmail.send")],
     "calendar":  [_gmail_req("calendar + gmail.readonly + gmail.send")],
 }

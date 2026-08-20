@@ -2,9 +2,10 @@
 slots.py — Write-once labelled slot store + capability facets.
 
 Two privilege layers:
-  Subprocess boundary — Tier 2 LLM has no Python references; nothing here is
-                        load-bearing against a malicious model.
-  In-process          — runner code receives SlotReader/SlotWriter facets, never
+  Model isolation     — the Tier 2 LLM is an in-process Anthropic SDK call
+                        with no tools and no Python references; nothing here
+                        is load-bearing against a malicious model.
+  Facet isolation     — runner code receives SlotReader/SlotWriter facets, never
                         the store directly. Slot access control is structural:
                           SlotWriter is fixed to one output slot and one label.
                           SlotReader exposes only the declared input slots; reads

@@ -14,6 +14,7 @@ def test_all_core_modules_import() -> None:
     import safehouse.runner
     import safehouse.trace
     import safehouse.registry
+    import safehouse.secrets
 
 
 def test_dispatch_registries_are_aligned() -> None:

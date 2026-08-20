@@ -3,9 +3,9 @@ permissions.py — Permission model.
 
 Permissions are granted by the driver at spawn time and are immutable.
 Sub-agents cannot grant permissions to themselves or to others — enforced
-by the subprocess boundary: Tier 1 and Tier 2 sub-agents run inside an
-isolated `claude -p` process that holds no Python reference to AgentSpec
-or IronFlow. See safehouse/runner.py for the spawn boundary.
+structurally: Tier 1 is operator code with a single-use SlotWriter; Tier 2
+is an in-process Anthropic SDK call with no tools argument and no Python
+reference to AgentSpec or IronFlow. See safehouse/runner.py.
 
 Slot access control is structural, not token-based:
   Tier 1 fetchers receive a single-use SlotWriter fixed to one output slot.

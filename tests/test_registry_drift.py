@@ -361,7 +361,8 @@ def test_detect_pipeline_is_exhaustive() -> None:
 
 def test_detect_pipeline_precedence_is_stable() -> None:
     """
-    detect_pipeline's branches are ordered: booking > trip > calendar > email > briefing.
+    detect_pipeline's branches are ordered:
+    booking > trip > calendar > email > github > briefing.
     Mixed tool sets resolve by that precedence. Pin it so a reorder of the
     if-chain is a conscious, test-breaking decision.
     """
@@ -371,6 +372,8 @@ def test_detect_pipeline_precedence_is_stable() -> None:
         {"mcp_calendar_search", "mcp_email_search", "send_summary"}
     ) == "calendar"
     assert tracer.detect_pipeline({"mcp_email_search", "send_summary"}) == "email"
+    assert tracer.detect_pipeline({"mcp_github_issue_read", "add_comment"}) == "github"
+    assert tracer.detect_pipeline({"mcp_email_search", "add_comment"}) == "email"  # email before github
     assert tracer.detect_pipeline({"mcp_page_content", "send_summary"}) == "briefing"
     assert tracer.detect_pipeline(set()) == "briefing"  # degenerate fall-through
 
@@ -406,6 +409,116 @@ def test_handlers_are_granted_or_internal() -> None:
         f"handlers not granted in driver_spec(): {sorted(ungoverned)} — "
         f"add a CanCallTool grant in driver_spec()"
     )
+
+
+# ── 5. Closed maps that silently skip a security check if they drift ──
+
+def test_credential_tool_sets_cover_the_tools_that_consume_them() -> None:
+    """Preflight keys off these frozensets. Omitting a terminal tool means a
+    search-less plan (structurally valid: offer_slot from another fetcher)
+    skips CONFIG_ERROR and fails mid-action with an empty token."""
+    from safehouse.registry import DUFFEL_TOOLS, LITEAPI_TOOLS, GITHUB_TOOLS, GOOGLE_TOOLS
+
+    # Writers need the token even without a read step in the same plan: a
+    # search-less booking plan would otherwise skip CONFIG_ERROR and fail
+    # mid-action with an empty token.
+    assert {"mcp_flight_search", "book_flight"} <= DUFFEL_TOOLS
+    assert {"mcp_hotel_search", "book_hotel"} <= LITEAPI_TOOLS
+    assert {"add_comment", "submit_pr_review"} <= GITHUB_TOOLS
+    assert {"send_summary", "create_calendar_event"} <= GOOGLE_TOOLS
+    unknown = (DUFFEL_TOOLS | LITEAPI_TOOLS | GITHUB_TOOLS | GOOGLE_TOOLS) - set(TOOL_SCHEMA)
+    assert not unknown, f"credential sets name unknown tools {sorted(unknown)}"
+
+
+def test_pipeline_env_mentions_every_provider_a_pipeline_can_need() -> None:
+    """pipeline_env is hints, not preflight — but an incomplete list is how an
+    operator concludes a hotel booking needs no LiteAPI key. Pin var names."""
+    vars_of = {p: [v for v, _ in tracer.pipeline_env(p)] for p in DETECTABLE_PIPELINES}
+    assert "DUFFEL_ACCESS_TOKEN" in vars_of["booking"]
+    assert "LITEAPI_SANDBOX_KEY" in vars_of["booking"]
+    assert "DUFFEL_ACCESS_TOKEN" in vars_of["trip"]
+    assert "LITEAPI_SANDBOX_KEY" in vars_of["trip"]
+    assert "GITHUB_TOKEN" in vars_of["github"]
+    assert "GOOGLE_ACCESS_TOKEN" in vars_of["email"]
+
+
+def test_event_union_includes_every_ev_dataclass() -> None:
+    """CLAUDE.md checklist: add Ev* to the Event union. A booking event omitted
+    here still emits at runtime but is invisible to typed sinks."""
+    import inspect
+    import safehouse.trace as trace_mod
+    from dataclasses import is_dataclass
+
+    ev_classes = {
+        obj for name, obj in vars(trace_mod).items()
+        if inspect.isclass(obj) and name.startswith("Ev") and is_dataclass(obj)
+    }
+    union_args = set(trace_mod.Event.__args__)
+    missing = ev_classes - union_args
+    stale = union_args - ev_classes
+    assert not missing, (
+        f"Ev* dataclasses missing from Event union {sorted(c.__name__ for c in missing)} — "
+        f"add them to safehouse/trace.py Event"
+    )
+    assert not stale, (
+        f"Event union names unknown types {sorted(c.__name__ for c in stale)}"
+    )
+
+
+def test_tier1_batch_set_agrees_with_the_registry() -> None:
+    """_TIER1_TOOLS is derived from TOOL_SCHEMA's shape (writes a slot, reads none,
+    not terminal), so it cannot disagree with the schema. The drift that remains is
+    against the *registry*: a tool registered as a fetcher but shaped otherwise in
+    the schema — or the reverse — would batch inconsistently with how it is declared.
+    """
+    from safehouse.driver import _TIER1_TOOLS
+    from safehouse.registry import DEFAULT_REGISTRY
+
+    registered = {s.name for s in DEFAULT_REGISTRY.all_specs()}
+    assert registered == _TIER1_TOOLS, (
+        f"registry fetchers not batchable {sorted(registered - _TIER1_TOOLS)}; "
+        f"batchable but not registered fetchers {sorted(_TIER1_TOOLS - registered)} — "
+        f"a tool's registry category and its TOOL_SCHEMA shape disagree"
+    )
+
+
+
+def test_capability_summary_lists_every_fetcher() -> None:
+    """Sharing a Capability must not hide a tool: GITHUB_READ has five providers
+    that do different things. A first-provider-wins summary tells the planner
+    that GitHub is only mcp_github_issue_read."""
+    from safehouse.registry import DEFAULT_REGISTRY
+
+    summary = DEFAULT_REGISTRY.capability_summary()
+    # Match the start of a rendered entry, not the whole string: several catalog
+    # descriptions cross-reference other tools by name ("bound automatically from
+    # mcp_github_pr_read"), so a substring check passes even when the tool has no
+    # entry of its own — which is precisely the regression being guarded.
+    listed = {line.split()[0] for line in summary.splitlines()
+              if line.startswith("  ") and not line.startswith("   ") and line.split()}
+    missing = [s.name for s in DEFAULT_REGISTRY.all_specs() if s.name not in listed]
+    assert not missing, (
+        f"fetchers absent from capability_summary() {missing} — a first-provider-wins "
+        f"summary tells the planner these tools do not exist"
+    )
+
+
+def test_catalog_required_args_match_schema_for_non_fetchers() -> None:
+    """TOOL CATALOG is what the planner sees. If it marks issue_number required
+    while TOOL_SCHEMA (and the search-resolved few-shots) treat it as optional,
+    the planner over-specifies fields the driver is designed to omit."""
+    from safehouse.registry import DEFAULT_REGISTRY
+
+    for spec in DEFAULT_REGISTRY.all_catalog_specs():
+        if spec.category == "fetcher":
+            continue  # catalog args (params/filter) are rewritten in Phase 2
+        schema = TOOL_SCHEMA[spec.name]
+        catalog_required = {a.name for a in spec.args if a.required}
+        schema_required = set(schema.required)
+        assert catalog_required == schema_required, (
+            f"{spec.name}: catalog required {sorted(catalog_required)} != "
+            f"TOOL_SCHEMA.required {sorted(schema_required)}"
+        )
 
 
 if __name__ == "__main__":

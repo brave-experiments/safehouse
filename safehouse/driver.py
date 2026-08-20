@@ -14,6 +14,7 @@ driver.py — Manifest executor and tool handlers.
       _handle_mcp_calendar_search()    Calendar REST API → (U,priv) slot
       _handle_duffel_flight_search()   Duffel REST → (U,pub) slot
       _handle_liteapi_hotel_search()   LiteAPI REST → (U,pub) slot
+      _github_reader_handler()         GitHub REST issue/PR read/search/list → (U,priv) slot
 
     Tier 2 — Processor Sub-Agents (isolated SDK call, no tools):
       _handle_spawn_processor()        synthesise/transform → slot
@@ -26,6 +27,8 @@ driver.py — Manifest executor and tool handlers.
       _handle_book_flight()            re-validate offer + ceiling + grant → Duffel order
       _handle_book_hotel()             re-search + prebook + ceiling + grant → LiteAPI booking
       _handle_create_calendar_event()  routing-only calendar write (no slot content)
+      _handle_add_comment()            declassify body + confirm → GitHub issue/PR comment
+      _handle_submit_pr_review()       declassify body + SHA bind + confirm → GitHub review
 
   _HANDLERS                            tool name → handler function
   _dispatch()                          before_tool gate → handler lookup → call
@@ -73,6 +76,7 @@ from .secrets import SecretRegistry
 from .ironflow_policy import IronFlow, FlowField, FlowMode, IronFlowViolation, Role
 from .permissions import AgentSpec, driver_spec, fetcher_spec, processor_spec
 from .runner import ProviderAuthError, run_mcp_page_content, run_mcp_email_search, run_mcp_calendar_search, run_processor, run_duffel_flight_search, run_liteapi_hotel_search, run_github_issue_read, run_github_issue_search, run_github_issue_list, run_github_pr_read, run_github_pr_search, _duffel_auth_headers, _liteapi_headers, _github_headers
+from .planner import TOOL_SCHEMA
 from .plan_types import PlanState
 from .release import (
     DRIVER_RELEASE,
@@ -1301,14 +1305,17 @@ async def _handle_modify_emails(args: dict, ctx: _StepContext) -> tuple[str, dic
 
 
 # Tier 1 tools that produce a single slot output and have no slot_inputs.
-# Only these are eligible for parallel batching in run().
-_TIER1_TOOLS: frozenset[str] = frozenset({
-    "mcp_page_content",
-    "mcp_email_search",
-    "mcp_calendar_search",
-    "mcp_flight_search",
-    "mcp_hotel_search",
-})
+# Only these are eligible for parallel batching in run(). Drift-tested against
+# TOOL_SCHEMA (slot_output set, slot_inputs empty, not a driver tool).
+# Fetchers eligible for parallel batching: they write a slot, read none, and are
+# not terminal — so neighbouring ones have no ordering dependency. Derived from
+# TOOL_SCHEMA rather than listed, because a hand-maintained copy of a predicate
+# the schema already states is one a new fetcher can silently fall out of, and
+# the only symptom is a lost round-trip.
+_TIER1_TOOLS: frozenset[str] = frozenset(
+    name for name, sc in TOOL_SCHEMA.items()
+    if sc.slot_output is not None and not sc.slot_inputs and not sc.is_driver_tool
+)
 
 
 def _next_batch_end(steps: list[dict], start: int) -> int:

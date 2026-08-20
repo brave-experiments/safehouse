@@ -7,6 +7,9 @@ Three sections, matching the architecture:
     run_mcp_page_content     — HTTP fetch + HTML denoising → (U,pub) slot
     run_mcp_email_search     — Gmail REST API → (U,priv) slot
     run_mcp_calendar_search  — Google Calendar REST API → (U,priv) slot
+    run_duffel_flight_search — Duffel REST → (U,pub) slot
+    run_liteapi_hotel_search — LiteAPI REST → (U,pub) slot
+    run_github_*             — GitHub REST issues/PRs, provenance-gated → (U,priv) slot
 
   TIER 2 — PROCESSOR SUB-AGENTS (isolated SDK call, no tools, reads slots only):
     run_processor   — synthesise / transform (used by spawn_processor)
@@ -1735,7 +1738,7 @@ async def run_github_pr_search(
 
 # ══════════════════════════════════════════════════════════════════════
 # TIER 2 — PROCESSOR SUB-AGENTS
-# Isolated claude -p, reads slots only, no network.
+# Isolated Anthropic SDK call, reads slots only, no network.
 # ══════════════════════════════════════════════════════════════════════
 
 async def run_processor(

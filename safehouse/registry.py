@@ -96,8 +96,10 @@ GOOGLE_TOOLS: frozenset[str] = frozenset({
     "modify_emails", "create_calendar_event",
 })
 
-DUFFEL_TOOLS:  frozenset[str] = frozenset({"mcp_flight_search"})
-LITEAPI_TOOLS: frozenset[str] = frozenset({"mcp_hotel_search"})
+# Search AND the terminal booking tool: a plan can theoretically book without a
+# search step (offer_slot from some other fetcher), and preflight must still fire.
+DUFFEL_TOOLS:  frozenset[str] = frozenset({"mcp_flight_search", "book_flight"})
+LITEAPI_TOOLS: frozenset[str] = frozenset({"mcp_hotel_search", "book_hotel"})
 
 
 # ── Concrete provider spec ─────────────────────────────────────────────────────
@@ -173,7 +175,15 @@ _CATALOG_CATEGORY_HEADERS: dict[str, str] = {
     "terminal_confirmed": "TIER 3 — DRIVER TOOLS (confirmed — pause for human approval before acting)",
     "utility":            "UTILITY",
 }
-_CATALOG_NAME_W = 18   # column width (longest: "schedule_meeting" = 16 chars)
+
+
+def _spec_text(spec: MCPSpec) -> str:
+    """Per-provider description, falling back to the capability default.
+
+    Shared by both renderers: an override added to one spec must read the same
+    way in REGISTERED CAPABILITIES and in TOOL CATALOG.
+    """
+    return spec.description or CAPABILITY_DESCRIPTION[spec.capability]
 
 
 def _mcp_to_catalog(spec: MCPSpec) -> CatalogSpec:
@@ -183,14 +193,14 @@ def _mcp_to_catalog(spec: MCPSpec) -> CatalogSpec:
     Three structural patterns based on domain and tool_type:
       domain == "*"       → url fetcher   (mcp_page_content)
       tool_type == "rest" → filter-based  (mcp_email_search, mcp_calendar_search)
-      tool_type == "mcp"  → params dict   (mcp_flight_search, mcp_hotel_search)
+      tool_type == "mcp"  → params dict   (mcp_flight_search, mcp_hotel_search,
+                                           mcp_github_* — REST, same arg shape)
 
     Description combines CAPABILITY_DESCRIPTION (text) and CAPABILITY_LABEL (label string).
     Both are single sources of truth; never duplicated here.
     """
     label       = str(CAPABILITY_LABEL[spec.capability])
-    text        = spec.description or CAPABILITY_DESCRIPTION[spec.capability]
-    description = f"{text}; writes {label} slot."
+    description = f"{_spec_text(spec)}; writes {label} slot."
 
     if spec.domain == "*":
         args: tuple[ArgSpec, ...] = (
@@ -330,23 +340,22 @@ class ToolRegistry:
         Generates the REGISTERED CAPABILITIES section injected into the Phase 1 planner prompt.
 
         Covers all three tiers:
-          Tier 1 — Data sub-agents (MCPSpecs): name, description, output label, params.
+          Tier 1 — Data sub-agents (MCPSpecs): every registered fetcher, including
+                   multiple tools that share a Capability (GitHub read/search/list/PR).
                    Never includes provider domains, MCP tool names, or raw schemas.
-                   Uses the first registered provider per capability.
           Tier 2 — Processor sub-agents (CatalogSpecs, category="processor"): name + description.
           Tier 3 — Driver tools (CatalogSpecs, category="terminal_auto/confirmed"): name + description + [auto/confirmed].
 
         Full arg schemas for all tools are in tool_catalog() / TOOL CATALOG below.
         """
-        # Tier 1 — data sub-agents
-        tier1:     list[str]       = []
-        seen_caps: set[Capability] = set()
+        # Tier 1 — every registered fetcher. Sharing a Capability (GITHUB_READ) does
+        # not make two tools interchangeable: list/search/read/PR each have their
+        # own params and must appear, or the planner only sees the first one.
+        tier1: list[str] = []
         for spec in self._specs.values():
             cap = spec.capability
-            if cap in seen_caps:
-                continue
-            seen_caps.add(cap)
             label = str(CAPABILITY_LABEL[cap])
+            text = _spec_text(spec)
             if spec.param_map:
                 params = ", ".join(spec.param_map)
             else:
@@ -355,8 +364,8 @@ class ToolRegistry:
                     if a.name not in ("slot_id", "system_prompt")
                 ) or "—"
             tier1.append(
-                f"  {spec.name:<22}  {CAPABILITY_DESCRIPTION[cap]}  →  {label}\n"
-                f"  {'':22}  params: {params}"
+                f"  {spec.name:<{_CATALOG_NAME_W}}  {text}  →  {label}\n"
+                f"  {'':{_CATALOG_NAME_W}}  params: {params}"
             )
 
         # Tier 2 and Tier 3 — single pass over catalog specs
@@ -364,10 +373,10 @@ class ToolRegistry:
         tier3: list[str] = []
         for spec in self._catalog_specs:
             if spec.category == "processor":
-                tier2.append(f"  {spec.name:<22}  {spec.description}")
+                tier2.append(f"  {spec.name:<{_CATALOG_NAME_W}}  {spec.description}")
             elif spec.category in ("terminal_auto", "terminal_confirmed"):
                 tag = "[auto]" if spec.category == "terminal_auto" else "[confirmed]"
-                tier3.append(f"  {spec.name:<22}  {spec.description}  {tag}")
+                tier3.append(f"  {spec.name:<{_CATALOG_NAME_W}}  {spec.description}  {tag}")
 
         sections: list[str] = []
         if tier1:
@@ -591,10 +600,11 @@ _CATALOG_SPECS: list[CatalogSpec] = [
     CatalogSpec(
         name        = "add_comment",
         category    = "terminal_confirmed",
-        description = "Post a comment on a GitHub issue OR pull request (one endpoint serves both). Routing (repo, issue_number) pre-committed (T,pub) from the task — never derived from fetched issue content. Body comes from a slot.",
+        description = "Post a comment on a GitHub issue OR pull request (one endpoint serves both). Routing (repo, and issue_number when named in the task) is (T,pub) — never derived from fetched issue content. Body comes from a slot.",
         args        = (
             ArgSpec("repo",         "str", description="'owner/name' verbatim from task, e.g. 'octocat/Hello-World'"),
-            ArgSpec("issue_number", "int", description="issue or PR number from task"),
+            ArgSpec("issue_number", "int", required=False,
+                    description="issue or PR number from task; omit when mcp_github_issue_search resolves it"),
             ArgSpec("body_slot",    "str"),
         ),
     ),
@@ -602,11 +612,13 @@ _CATALOG_SPECS: list[CatalogSpec] = [
     CatalogSpec(
         name        = "submit_pr_review",
         category    = "terminal_confirmed",
-        description = "Submit a review on a GitHub pull request. event is COMMENT or REQUEST_CHANGES only — APPROVE is not offered, because an approving review can satisfy branch protection and unblock an automated merge. Routing (repo, pull_number, event) pre-committed (T,pub) from the task. The reviewed commit is bound automatically from mcp_github_pr_read, which must run first. Body comes from a slot.",
+        description = "Submit a review on a GitHub pull request. event is COMMENT or REQUEST_CHANGES only — APPROVE is not offered, because an approving review can satisfy branch protection and unblock an automated merge. Routing (repo, and pull_number/event when named in the task) is (T,pub). The reviewed commit is bound automatically from mcp_github_pr_read, which must run first. Body comes from a slot.",
         args        = (
             ArgSpec("repo",        "str", description="'owner/name' verbatim from task"),
-            ArgSpec("pull_number", "int", description="pull request number from task"),
-            ArgSpec("event",       "str", description="COMMENT (default; leaves a review without blocking) or REQUEST_CHANGES (blocks the PR)"),
+            ArgSpec("pull_number", "int", required=False,
+                    description="pull request number from task; omit when mcp_github_pr_search resolves it"),
+            ArgSpec("event",       "str", required=False,
+                    description="COMMENT (default; leaves a review without blocking) or REQUEST_CHANGES (blocks the PR)"),
             ArgSpec("body_slot",   "str"),
         ),
     ),
@@ -643,5 +655,9 @@ _CATALOG_SPECS: list[CatalogSpec] = [
     ),
 
 ]
+
+# Column width for rendered tool names. Derived rather than pinned: a longer tool
+# name would otherwise silently push the description column out of alignment.
+_CATALOG_NAME_W = max(len(s.name) for s in _MCP_SPECS + _CATALOG_SPECS) + 3
 
 DEFAULT_REGISTRY = ToolRegistry.from_specs(_MCP_SPECS, _CATALOG_SPECS)

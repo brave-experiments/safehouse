@@ -254,7 +254,8 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
 
     github_token = cfg.github_token or ""
     if (tools & GITHUB_TOOLS) and not github_token:
-        hint = next(h for v, h in _tracer_mod.pipeline_env(pipeline) if v == "GITHUB_TOKEN")
+        hint = next(h for v, h in _tracer_mod.pipeline_env("github")
+                    if v == "GITHUB_TOKEN")
         elapsed = time.monotonic() - t0
         sink.close()
         return RunResult(

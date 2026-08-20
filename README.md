@@ -44,7 +44,7 @@ $ safehouse "Fetch https://news.example.com/story and email a briefing to alice@
   │ page written to quarantined slot — injection included, still (U,pub)
 
 [TIER 2]  spawn_processor  →  slot:summary  (U,pub)
-  │ isolated claude -p; reads declared slots only
+  │ isolated processor (Anthropic SDK, no tools); reads declared slots only
 
 [TIER 3]  send_summary
   │ before_action  recipient   ROUTING   (T,pub)  OK
@@ -80,7 +80,7 @@ TASK STRING (only trusted input)
          │                        │
          ▼                        ▼
   TIER 1 — DATA SUB-AGENTS    TIER 2 — PROCESSOR SUB-AGENTS
-  Operator code, no LLM       Isolated claude -p subprocess
+  Operator code, no LLM       In-process Anthropic SDK, no tools
   Web / email / calendar /    No network, no tools, no memory
   flight / hotel fetch        Reads declared slots only
   → labelled slots
@@ -89,6 +89,8 @@ TASK STRING (only trusted input)
                     ▼
            TIER 3 — DRIVER TOOLS
            send_summary · send_reply · schedule_meeting · modify_emails
+           book_flight · book_hotel · create_calendar_event
+           add_comment · submit_pr_review
            IronFlow-gated before any external side effect
 ```
 
@@ -179,7 +181,7 @@ Prompt-based defences must win every adversarial exchange. SafeHouse removes the
 
 ## Quickstart
 
-**Needs:** Python 3.12+ (CVE-2023-24329 floor in `urlsplit`), an Anthropic API key, and the [Claude Code CLI](https://docs.anthropic.com/en/docs/claude-code/overview) (`claude` on `PATH`) for Tier‑2 processors. Google credentials only for mail/calendar tasks. Full auth walkthrough: [SETUP.md](SETUP.md).
+**Needs:** Python 3.12+ (CVE-2023-24329 floor in `urlsplit`) and an Anthropic API key. The Tier‑2 processor is an in-process SDK call — no Claude Code CLI. Google credentials only for mail/calendar tasks. Full auth walkthrough: [SETUP.md](SETUP.md).
 
 Recommended, with [uv](https://docs.astral.sh/uv/):
 
@@ -226,7 +228,7 @@ Pipeline type is detected from the validated plan. Unsupported tool sets are rej
 
 Exit codes distinguish success, pipeline error, config, planning, **policy violation**, confirmation required, and credential failure — see [SETUP.md](SETUP.md).
 
-Flight/hotel search use Kiwi and trivago MCP servers (Tier 1); Gmail and Calendar use Google REST APIs (Tier 3).
+Flight/hotel search and booking use Duffel and LiteAPI REST APIs (Tier 1 search, Tier 3 book). Gmail, Calendar, and GitHub use their REST APIs.
 
 ---
 
@@ -256,8 +258,9 @@ safehouse/
   ironflow_policy.py    IronFlow — gates, declassify_slot, ActionGrant
   release.py            Tier-3 release transforms (opaque / structured:*)
   planner.py            Three-phase planner: abstract → concrete → verify
-  runner.py             Tier 1 fetchers and Tier 2 processor subprocess
+  runner.py             Tier 1 fetchers and in-process Tier 2 processor
   driver.py             Manifest executor; Tier 3 handlers
+  secrets.py            Credential containment at slot and trace boundaries
   plan_types.py         PlanState — trusted vars and step audit trail
   trace.py              Typed audit events
   exceptions.py         Kernel exceptions (e.g. ConfirmationRequired)
@@ -284,5 +287,5 @@ results/                Runtime transcripts and JSONL (gitignored)
 ## Documentation
 
 - [Specification](https://docs.google.com/document/d/1BPfTHklw9Fu4x0efExJeOwSPQNFTspWyYy0bFiedjfY/edit?usp=sharing) — full design specification
-- [SETUP.md](SETUP.md) — installation, Google OAuth, Claude Code, CLI reference, exit codes
+- [SETUP.md](SETUP.md) — installation, Google OAuth, CLI reference, exit codes
 - [CLAUDE.md](CLAUDE.md) — development invariants, hard rules, and per-tool checklists
