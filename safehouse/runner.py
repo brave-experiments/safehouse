@@ -65,6 +65,14 @@ class ProviderAuthError(RuntimeError):
     """
 
 
+def _require_ok(resp, what: str) -> None:
+    """Raise on a non-2xx provider response, classifying auth failures."""
+    if resp.status_code < 400:
+        return
+    msg = f"{what} failed (status {resp.status_code}): {resp.text[:200]}"
+    raise (ProviderAuthError if resp.status_code in (401, 403) else RuntimeError)(msg)
+
+
 # ── Module-level constants ─────────────────────────────────────────────
 
 _MAX_STREAM_LINES      = 20              # live sub-agent output lines shown on terminal
@@ -468,7 +476,7 @@ async def run_mcp_email_search(
         list_resp = await client.get(
             list_url, headers=auth, params={"q": query, "maxResults": limit},
         )
-        list_resp.raise_for_status()
+        _require_ok(list_resp, "Gmail message list")
 
         try:
             message_ids = [m["id"] for m in list_resp.json().get("messages", [])]
@@ -494,7 +502,7 @@ async def run_mcp_email_search(
 
         async def _fetch_one(url: str) -> dict:
             resp = await client.get(url, headers=auth, params={"format": "full"})
-            resp.raise_for_status()
+            _require_ok(resp, "Gmail message fetch")
             return _gmail_parse_message(resp.json())
 
         emails: list[dict] = list(await asyncio.gather(*(_fetch_one(u) for u in msg_urls)))
@@ -572,7 +580,7 @@ async def run_mcp_calendar_search(
             cl_url = f"{_GCAL_V3}/users/me/calendarList"
             policy.before_network(spec, cl_url)
             cl_resp = await client.get(cl_url, headers=auth)
-            cl_resp.raise_for_status()
+            _require_ok(cl_resp, "Calendar list")
             calendar_ids = [
                 c["id"] for c in cl_resp.json().get("items", [])
                 if not c.get("hidden") and c.get("accessRole") in ("owner", "writer", "reader")
@@ -596,7 +604,7 @@ async def run_mcp_calendar_search(
                 resp = await client.get(cal_url, headers=auth, params=page_params)
                 if resp.status_code == 404:
                     break  # calendar exists in list but has no events endpoint
-                resp.raise_for_status()
+                _require_ok(resp, "Calendar events")
                 try:
                     body = resp.json()
                 except (json.JSONDecodeError, ValueError):

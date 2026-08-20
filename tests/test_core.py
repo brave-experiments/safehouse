@@ -867,5 +867,77 @@ class TestRunnerAuditFixes:
         assert "of {total}" in src or "of {len(emails)}" in src or "of total" in src
 
 
+class TestProviderAuthClassification:
+    """Every provider call now routes through one of two helpers, so classifying
+    401/403 in these two places covers every provider at once — Gmail and Calendar
+    today, and each REST provider added later for free. Without it an expired token is indistinguishable from a task that
+    cannot succeed — both exit 1."""
+
+    class _R:
+        def __init__(self, status):
+            self.status_code, self.text = status, "body"
+
+    def test_require_ok_passes_2xx(self):
+        from safehouse.runner import _require_ok
+        assert _require_ok(self._R(200), "x") is None
+        assert _require_ok(self._R(204), "x") is None
+
+    def test_require_ok_raises_auth_error_on_401_403(self):
+        from safehouse.runner import ProviderAuthError, _require_ok
+        for status in (401, 403):
+            with pytest.raises(ProviderAuthError):
+                _require_ok(self._R(status), "provider call")
+
+    def test_require_ok_raises_plain_runtime_error_otherwise(self):
+        from safehouse.runner import ProviderAuthError, _require_ok
+        for status in (400, 404, 422, 500, 503):
+            with pytest.raises(RuntimeError) as ei:
+                _require_ok(self._R(status), "provider call")
+            assert not isinstance(ei.value, ProviderAuthError), status
+
+    def test_require_ok_message_keeps_the_response_body(self):
+        """raise_for_status() drops the body; the remedy usually needs it."""
+        from safehouse.runner import _require_ok
+        with pytest.raises(RuntimeError, match="body"):
+            _require_ok(self._R(500), "provider call")
+
+    def test_auth_extra_flags_only_auth_statuses(self):
+        from safehouse.driver import _auth_extra
+        assert _auth_extra(401) == {"credential_error": True}
+        assert _auth_extra(403) == {"credential_error": True}
+        for status in (200, 400, 404, 422, 500):
+            assert _auth_extra(status) == {}
+
+    def test_provider_error_returns_terminal_pair_and_flags_auth(self):
+        """Driver tools must return (json_str, dict) on every path — invariant #1."""
+        from safehouse.driver import _provider_error
+        from safehouse.slots import SlotStore
+        store = SlotStore()
+        js, d = _provider_error(self._R(401), "Calendar event create", store)
+        assert isinstance(js, str) and isinstance(d, dict)
+        assert d["credential_error"] is True and d["status"] == "error"
+        _, d2 = _provider_error(self._R(500), "Calendar event create", store)
+        assert "credential_error" not in d2
+
+    def test_cli_maps_credential_error_to_its_own_exit_code(self):
+        """The point of the classification: a supervisor can tell "refresh the
+        token" (exit 6) from "this task cannot succeed" (exit 1). Without this the
+        two helpers above would set a flag nothing acts on.
+        """
+        from safehouse_cli.app import ExitCode, _to_run_result
+        cred = {"status": "error", "reason": "x", "credential_error": True, "violations": []}
+        assert _to_run_result(cred, None, 0.0).exit_code == ExitCode.CREDENTIAL_ERROR
+        plain = {"status": "error", "reason": "x", "violations": []}
+        assert _to_run_result(plain, None, 0.0).exit_code == ExitCode.PIPELINE_ERROR
+
+    def test_a_policy_violation_outranks_a_credential_error(self):
+        """A fired gate is the more important signal: it says the pipeline refused,
+        not that a token needs refreshing."""
+        from safehouse_cli.app import ExitCode, _to_run_result
+        both = {"status": "error", "reason": "x",
+                "credential_error": True, "violations": ["[Confinement] ..."]}
+        assert _to_run_result(both, None, 0.0).exit_code == ExitCode.POLICY_VIOLATION
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])
