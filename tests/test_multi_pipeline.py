@@ -657,7 +657,7 @@ def test_run_task_pipelines_fresh_state_per_pipeline(tmp_path, monkeypatch):
 
     with patch("safehouse_cli.app.generate_plan", return_value=plan), \
          patch("safehouse_cli.app.driver_run_manifest", new=_fake_manifest), \
-         patch("safehouse_cli.app._tracer_mod.pipeline_needs_google", return_value=False):
+         patch("safehouse_cli.app._tracer_mod.tools_need_google", return_value=False):
         result = asyncio.run(run_task(_run_cfg(tmp_path), DenyConfirmer()))
 
     assert len(manifest_calls) == 1
@@ -681,7 +681,7 @@ def test_run_task_pipelines_partial_failure(tmp_path):
 
     with patch("safehouse_cli.app.generate_plan", return_value=_pipelines_plan()), \
          patch("safehouse_cli.app.driver_run_manifest", new=_fake), \
-         patch("safehouse_cli.app._tracer_mod.pipeline_needs_google", return_value=False):
+         patch("safehouse_cli.app._tracer_mod.tools_need_google", return_value=False):
         result = asyncio.run(run_task(_run_cfg(tmp_path), DenyConfirmer()))
 
     assert result.detail["status"] == "partial"
@@ -702,7 +702,7 @@ def test_run_task_pipelines_all_failed(tmp_path):
 
     with patch("safehouse_cli.app.generate_plan", return_value=_pipelines_plan()), \
          patch("safehouse_cli.app.driver_run_manifest", new=_fake), \
-         patch("safehouse_cli.app._tracer_mod.pipeline_needs_google", return_value=False):
+         patch("safehouse_cli.app._tracer_mod.tools_need_google", return_value=False):
         result = asyncio.run(run_task(_run_cfg(tmp_path), DenyConfirmer()))
 
     assert result.detail["status"] == "error"
@@ -762,7 +762,7 @@ def test_confirmation_required_maps_to_exit5(tmp_path):
 
     with patch("safehouse_cli.app.generate_plan", return_value=_pipelines_plan()), \
          patch("safehouse_cli.app.driver_run_manifest", new=_fake), \
-         patch("safehouse_cli.app._tracer_mod.pipeline_needs_google", return_value=False):
+         patch("safehouse_cli.app._tracer_mod.tools_need_google", return_value=False):
         result = asyncio.run(run_task(_run_cfg(tmp_path), DenyConfirmer()))
 
     assert result.exit_code == ExitCode.CONFIRMATION_REQUIRED
@@ -783,7 +783,7 @@ def test_run_task_emits_one_static_plan_for_pipelines(tmp_path, monkeypatch):
 
     with patch("safehouse_cli.app.generate_plan", return_value=_pipelines_plan()), \
          patch("safehouse_cli.app.driver_run_manifest", new=_fake), \
-         patch("safehouse_cli.app._tracer_mod.pipeline_needs_google", return_value=False):
+         patch("safehouse_cli.app._tracer_mod.tools_need_google", return_value=False):
         result = asyncio.run(run_task(_run_cfg(tmp_path), DenyConfirmer()))
 
     assert result.exit_code == ExitCode.OK

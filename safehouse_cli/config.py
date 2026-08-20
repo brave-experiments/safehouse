@@ -70,6 +70,9 @@ class RunConfig:
     liteapi_key:       str | None     # resolved: env > config file (LiteAPI hotels)
     passenger:         dict | None    # trusted passenger/guest profile from config
     max_booking_amount: str | None    # operator spend ceiling
+    github_token:      str | None     # resolved: env > config file (GitHub REST)
+    min_github_integrity: str | None  # object-integrity floor for GitHub reads; None = gate off
+    github_blocked_users: list | None # logins never trusted at any integrity level
     google_token:      str | None     # resolved: env > config file
 
     @classmethod
@@ -204,6 +207,9 @@ class RunConfig:
             liteapi_key       = settings.liteapi_key,
             passenger         = settings.passenger,
             max_booking_amount = settings.max_booking_amount,
+            github_token      = settings.github_token,
+            min_github_integrity = settings.min_github_integrity,
+            github_blocked_users = settings.github_blocked_users,
             google_token      = settings.google_token,
         )
 

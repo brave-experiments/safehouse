@@ -67,7 +67,37 @@ CAPABILITY_DESCRIPTION: dict[Capability, str] = {
     Capability.HOTEL_SEARCH:  "Search available hotels by city and dates",
     Capability.EMAIL_READ:    "Read emails from a registered mailbox, filtered by sender/date",
     Capability.CALENDAR_READ: "Read calendar events for a user or account",
+    # Capability-level line: the providers differ enough that each overrides it
+    # with MCPSpec.description, so this stays deliberately broad.
+    Capability.GITHUB_READ:   "Read GitHub issues and pull requests — one item with its "
+                              "comments, many by predicate, or a pull request diff",
 }
+
+
+# ── Credential requirements ────────────────────────────────────────────────────
+#
+# Which tools need which provider credential. Declared here, beside the tools, so
+# the CLI preflight and tracer.detect_pipeline read one source: a tool listed in
+# one place but not the other either runs with no credential check or reports
+# under the wrong pipeline banner.
+
+GITHUB_TOOLS: frozenset[str] = frozenset({
+    "mcp_github_issue_read", "mcp_github_issue_search", "mcp_github_issue_list",
+    "mcp_github_pr_read", "mcp_github_pr_search",
+    "add_comment", "submit_pr_review",
+})
+
+# The requirement belongs to the TOOL, not the pipeline label: a github pipeline
+# ending in send_summary needs Gmail even though the github env list does not
+# mention GOOGLE_ACCESS_TOKEN.
+GOOGLE_TOOLS: frozenset[str] = frozenset({
+    "mcp_email_search", "mcp_calendar_search",
+    "send_summary", "send_reply", "schedule_meeting",
+    "modify_emails", "create_calendar_event",
+})
+
+DUFFEL_TOOLS:  frozenset[str] = frozenset({"mcp_flight_search"})
+LITEAPI_TOOLS: frozenset[str] = frozenset({"mcp_hotel_search"})
 
 
 # ── Concrete provider spec ─────────────────────────────────────────────────────
@@ -99,6 +129,9 @@ class MCPSpec:
                            e.g. {"cabinClass": {"economy": "M", "business": "C"}}.
         filter_description — override the default filter arg description for REST tools;
                              if empty, the email-style default is used
+        description        — override CAPABILITY_DESCRIPTION for this provider's TOOL
+                             CATALOG line. Set it when providers of the same capability
+                             do materially different things.
     """
     name:               str
     capability:         Capability
@@ -111,6 +144,7 @@ class MCPSpec:
     date_fmt:           str                        = ""
     value_maps:         dict[str, dict[str, str]]  = field(default_factory=dict)
     filter_description: str                        = ""
+    description:        str                        = ""
 
 
 # ── Rendering layer ────────────────────────────────────────────────────────────
@@ -155,7 +189,8 @@ def _mcp_to_catalog(spec: MCPSpec) -> CatalogSpec:
     Both are single sources of truth; never duplicated here.
     """
     label       = str(CAPABILITY_LABEL[spec.capability])
-    description = f"{CAPABILITY_DESCRIPTION[spec.capability]}; writes {label} slot."
+    text        = spec.description or CAPABILITY_DESCRIPTION[spec.capability]
+    description = f"{text}; writes {label} slot."
 
     if spec.domain == "*":
         args: tuple[ArgSpec, ...] = (
@@ -397,6 +432,101 @@ _MCP_SPECS: list[MCPSpec] = [
         },
     ),
 
+    # GitHub issues via REST (authenticated). tool_type stays "mcp" so the
+    # concrete-mapping (params → search_params) is reused; the DRIVER handler
+    # routes to run_github_issue_read (REST), not an MCP call — same pattern as
+    # the Duffel/LiteAPI entries above. Issue bodies and comments are the
+    # injection surface, so each item is provenance-filtered before it is written.
+    MCPSpec(
+        name           = "mcp_github_issue_read",
+        capability     = Capability.GITHUB_READ,
+        description    = ("Read ONE GitHub issue or pull request named by number, with its "
+                          "comments. Use mcp_github_pr_read instead when the task needs the diff"),
+        tool_type      = "mcp",
+        domain         = "https://api.github.com",
+        mcp_tool       = "issues",
+        # Identity mapping: GitHub needs no field rename, but param_map keys are
+        # what capability_summary() renders as the accepted `params` for the
+        # planner — declaring them here is what stops the prompt printing the
+        # useless "params: params" fallback.
+        param_map      = {"repo": "repo", "issue_number": "issue_number"},
+    ),
+
+    # Same provider, same capability — but resolves ONE issue from a task-derived
+    # predicate instead of requiring the number up front. Selection is operator
+    # code over provider metadata with the provenance floor applied, and the
+    # resolved number reaches add_comment via state.vars as (T,pub).
+    MCPSpec(
+        name           = "mcp_github_issue_search",
+        capability     = Capability.GITHUB_READ,
+        description    = ("Resolve ONE GitHub issue from a predicate (state, labels, "
+                          "title_contains, author, select), then read it and its comments. "
+                          "Publishes the resolved issue number for add_comment"),
+        tool_type      = "mcp",
+        domain         = "https://api.github.com",
+        mcp_tool       = "issues/list",
+        param_map      = {
+            "repo": "repo", "issue_number": "issue_number", "state": "state",
+            "labels": "labels", "title_contains": "title_contains",
+            "author": "author", "select": "select",
+        },
+    ),
+
+    # Report-only listing: MANY items, and it publishes no routing, so nothing it
+    # returns can select the target of a write. That is what makes a broad query
+    # safe here where issue_search deliberately resolves exactly one item.
+    MCPSpec(
+        name           = "mcp_github_issue_list",
+        capability     = Capability.GITHUB_READ,
+        description    = ("List MANY GitHub issues and/or pull requests matching a predicate "
+                          "(state, labels, assignee, creator, mentioned, kind). Metadata plus a "
+                          "short body excerpt per item; no comments. Report-only — publishes no "
+                          "routing, so it cannot select the target of a write"),
+        tool_type      = "mcp",
+        domain         = "https://api.github.com",
+        mcp_tool       = "issues/list",
+        param_map      = {
+            "repo": "repo", "state": "state", "labels": "labels",
+            "assignee": "assignee", "creator": "creator", "mentioned": "mentioned",
+            "kind": "kind", "sort": "sort", "direction": "direction", "limit": "limit",
+        },
+    ),
+
+    # One pull request plus its changed files. Publishes the head SHA as (T,pub)
+    # so submit_pr_review binds to the commit actually reviewed.
+    MCPSpec(
+        name           = "mcp_github_pr_read",
+        capability     = Capability.GITHUB_READ,
+        description    = ("Read ONE pull request named by number, with its changed files and "
+                          "diff. Required before submit_pr_review — it publishes the head SHA "
+                          "that binds the review to the reviewed commit"),
+        tool_type      = "mcp",
+        domain         = "https://api.github.com",
+        mcp_tool       = "pulls",
+        param_map      = {"repo": "repo", "pull_number": "pull_number"},
+    ),
+
+    # Same provider, same capability — resolves ONE pull request from a
+    # task-derived predicate. Publishes both the number and the head SHA, so
+    # submit_pr_review gets its target and its commit binding from one
+    # deterministic resolution.
+    MCPSpec(
+        name           = "mcp_github_pr_search",
+        capability     = Capability.GITHUB_READ,
+        description    = ("Resolve ONE pull request from a predicate (state, base, head, author, "
+                          "title_contains, select), then read it with its diff. Drafts excluded "
+                          "unless include_drafts. Publishes the resolved number and head SHA"),
+        tool_type      = "mcp",
+        domain         = "https://api.github.com",
+        mcp_tool       = "pulls/list",
+        param_map      = {
+            "repo": "repo", "pull_number": "pull_number", "state": "state",
+            "base": "base", "head": "head", "author": "author",
+            "title_contains": "title_contains", "select": "select",
+            "include_drafts": "include_drafts",
+        },
+    ),
+
 ]
 
 _CATALOG_SPECS: list[CatalogSpec] = [
@@ -455,6 +585,29 @@ _CATALOG_SPECS: list[CatalogSpec] = [
             ArgSpec("sender",     "str", description="verbatim sender name or email from task (Gmail from: filter accepts both)"),
             ArgSpec("action",     "str", description="add_label | remove_label | archive | mark_read | mark_unread | star | unstar"),
             ArgSpec("label_name", "str", required=False, description="verbatim Gmail label name — required for add_label and remove_label only"),
+        ),
+    ),
+
+    CatalogSpec(
+        name        = "add_comment",
+        category    = "terminal_confirmed",
+        description = "Post a comment on a GitHub issue OR pull request (one endpoint serves both). Routing (repo, issue_number) pre-committed (T,pub) from the task — never derived from fetched issue content. Body comes from a slot.",
+        args        = (
+            ArgSpec("repo",         "str", description="'owner/name' verbatim from task, e.g. 'octocat/Hello-World'"),
+            ArgSpec("issue_number", "int", description="issue or PR number from task"),
+            ArgSpec("body_slot",    "str"),
+        ),
+    ),
+
+    CatalogSpec(
+        name        = "submit_pr_review",
+        category    = "terminal_confirmed",
+        description = "Submit a review on a GitHub pull request. event is COMMENT or REQUEST_CHANGES only — APPROVE is not offered, because an approving review can satisfy branch protection and unblock an automated merge. Routing (repo, pull_number, event) pre-committed (T,pub) from the task. The reviewed commit is bound automatically from mcp_github_pr_read, which must run first. Body comes from a slot.",
+        args        = (
+            ArgSpec("repo",        "str", description="'owner/name' verbatim from task"),
+            ArgSpec("pull_number", "int", description="pull request number from task"),
+            ArgSpec("event",       "str", description="COMMENT (default; leaves a review without blocking) or REQUEST_CHANGES (blocks the PR)"),
+            ArgSpec("body_slot",   "str"),
         ),
     ),
 

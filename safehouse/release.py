@@ -52,6 +52,10 @@ DRIVER_RELEASE: dict[str, ReleaseGate] = {
     "book_hotel":       ReleaseGate(("offer_slot",), "structured:hotel_offer"),
     # No slot content — event_title/start/end are routing fields only.
     "create_calendar_event": ReleaseGate(()),
+    # Comment and review bodies are free prose, like an email body; repo/number/
+    # event are routing and are never released from a slot.
+    "add_comment":      ReleaseGate(("body_slot",), "opaque"),
+    "submit_pr_review": ReleaseGate(("body_slot",), "opaque"),
 }
 
 

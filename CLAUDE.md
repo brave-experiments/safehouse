@@ -59,6 +59,8 @@ All output from `safehouse/` goes through `trace.emit()`. `print()` belongs only
 ### 5 — `_DRIVER_ROUTING_FIELDS` and `DRIVER_RELEASE` must cover every driver tool
 A driver tool absent from `_DRIVER_ROUTING_FIELDS` gets an empty routing-key list — the routing lock is **silently skipped**. A tool absent from `DRIVER_RELEASE` cannot precommit sources/transform. Both are security regressions. `test_registry_drift.py` catches them.
 
+**Runtime-resolved routing fields.** `_DRIVER_ROUTING_OPTIONAL` declares the routing fields a Tier-1 tool may resolve mid-run into `state.vars` as `(T,pub)` (e.g. `mcp_github_issue_search` publishing the issue number it selected), so they may be absent from the plan. Such a value is **not** precommitted-before-observation — the handler must record which provenance applied rather than reporting the stronger guarantee. Never mark *every* field of a tool optional: that skips the routing lock entirely, and `test_optional_routing_fields_are_real_routing_fields` rejects it.
+
 ### 6 — Credential isolation
 Credentials are resolved in the CLI layer and passed into core as explicit parameters. They must never appear in a slot, label, task string, trace event payload, or any Tier 1/2 sub-agent input.
 
@@ -110,4 +112,5 @@ Run `python3 -m pytest tests/ -v` after each step. `test_registry_drift.py` will
 | `"[Confinement] … confidentiality=priv"` | `(_, priv)` slot crossed the bridge without declassification | Call `policy.declassify_slot(slot_id, ...)` before `apply_bridge_field()` |
 | `"var '…' is already committed"` | `set_var()` called twice for the same key without `overwrite=True` | Check for duplicate routing-lock calls in `run()` |
 | `"slot '…' already written"` | `SlotStore.write()` called twice for same `slot_id` | Duplicate `slot_id` in plan — `_validate_plan` should catch this at plan time |
+| `"Slot '…': content contains the … credential"` | A fetcher wrote a raw provider response into its slot and the provider echoed the rejected credential | Project the response into the fields you need instead of writing the body; never write an error payload to a slot |
 | `"Planning var '…' not in state.vars"` | `get_var()` called before `set_var()` | Ensure routing lock (`step 0`) runs before the handler that reads it |

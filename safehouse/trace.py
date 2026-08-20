@@ -315,6 +315,127 @@ class EvCalendarEventCreated:
     confirmed:   bool
 
 
+@dataclass
+class EvGithubIssueSelected:
+    """A deterministic filter resolved one issue from a task-derived predicate.
+
+    Emitted by run_github_issue_search. `eligible` counts issues that cleared the
+    provenance floor AND the predicate — the gap between `considered` and
+    `eligible` is what the floor and filter excluded from selection.
+    """
+    agent_id:   str
+    repo:       str
+    considered: int
+    eligible:   int
+    select:     str
+    floor:      str
+    number:     int          # 0 when nothing matched
+    title:      str
+    author:     str
+
+
+@dataclass
+class EvGithubCommentProposed:
+    """add_comment is about to ask for human approval.
+
+    The confirmer only reads len(slots), so anything the approver needs must be
+    traced before the prompt — this is the human's only view of what they are
+    endorsing, including whether the draft was written from provenance-filtered
+    text or from unfiltered third-party prose.
+    """
+    repo:         str
+    issue_number: int
+    body_chars:   int
+    body_preview: str
+    gate:         str          # provenance floor in effect, or "disabled"
+
+
+@dataclass
+class EvGithubCommentAdded:
+    """Comment posted on a GitHub issue/PR by add_comment.
+
+    repo/issue_number are the (T,pub) routing values; body is declassified slot
+    content. comment_id is "" when the post was declined or failed.
+    """
+    repo:         str
+    issue_number: int
+    body_chars:   int
+    body_label:   str
+    comment_id:   str
+    comment_url:  str
+    confirmed:    bool
+
+
+@dataclass
+class EvGithubPrSelected:
+    """A deterministic filter resolved one pull request from a task-derived predicate.
+
+    `drafts_skipped` is reported separately from the floor: a draft excluded
+    because its author said it is unfinished is a different outcome from one
+    excluded by provenance, and an operator debugging an empty result needs to
+    tell them apart.
+    """
+    agent_id:       str
+    repo:           str
+    considered:     int
+    eligible:       int
+    drafts_skipped: int
+    select:         str
+    floor:          str
+    number:         int
+    title:          str
+    author:         str
+
+
+@dataclass
+class EvGithubReviewProposed:
+    """submit_pr_review is about to ask for human approval.
+
+    Carries `event` because REQUEST_CHANGES and COMMENT differ in consequence:
+    one blocks the pull request, the other does not. The approver sees which.
+    """
+    repo:         str
+    pull_number:  int
+    event:        str          # COMMENT | REQUEST_CHANGES — never APPROVE
+    commit_id:    str
+    body_chars:   int
+    body_preview: str
+    gate:         str          # provenance floor in effect, or "disabled"
+
+
+@dataclass
+class EvGithubReviewSubmitted:
+    """Review posted on a pull request by submit_pr_review.
+
+    `commit_id` is the head SHA published by mcp_github_pr_read, so the audit
+    records which commit the review was bound to rather than only which PR.
+    review_id is "" when the submission was declined or failed.
+    """
+    repo:         str
+    pull_number:  int
+    event:        str
+    commit_id:    str
+    body_chars:   int
+    body_label:   str
+    review_id:    str
+    review_url:   str
+    confirmed:    bool
+
+
+@dataclass
+class EvGithubItemsFiltered:
+    """Provenance gate dropped issue/comment items below the integrity floor.
+
+    Deterministic operator code, no LLM: each item's author_association is
+    compared against the operator-configured floor before the slot is written.
+    """
+    agent_id: str
+    slot_id:  str
+    floor:    str
+    dropped:  int
+    kept:     int
+
+
 Event = (
     EvPlanPhase1Start | EvPlanChunk | EvPlanPhase2 | EvPlanPhase3 |
     EvStaticPlan | EvDriverStart | EvPlanStep | EvAgentSpawned |
@@ -323,6 +444,10 @@ Event = (
     EvRoutingLocked | EvDeclassify | EvReplyActionFired |
     EvMeetingOptionsReady | EvMeetingConfirmation | EvActionGranted | EvMeetingScheduled |
     EvCalendarEventCreated |
+    EvGithubIssueSelected | EvGithubPrSelected |
+    EvGithubCommentProposed | EvGithubCommentAdded |
+    EvGithubReviewProposed | EvGithubReviewSubmitted |
+    EvGithubItemsFiltered |
     EvAutoApproved | EvEmailsModified |
     EvPipelineEnd
 )

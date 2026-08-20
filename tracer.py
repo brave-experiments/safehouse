@@ -33,6 +33,9 @@ from safehouse.planner import TOOL_SCHEMA
 from safehouse.trace import (
     EvBookingProposed, EvBookFlight, EvBookHotel,
     EvCalendarEventCreated,
+    EvGithubIssueSelected, EvGithubPrSelected, EvGithubItemsFiltered,
+    EvGithubCommentProposed, EvGithubCommentAdded,
+    EvGithubReviewProposed, EvGithubReviewSubmitted,
     Tracer,
     EvPlanPhase1Start, EvPlanChunk, EvPlanPhase2, EvPlanPhase3,
     EvStaticPlan, EvDriverStart, EvPlanStep, EvAgentSpawned,
@@ -1339,9 +1342,148 @@ def _calendar_event_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
     print(f"  elapsed: {elapsed:.1f}s")
 
 
+def _github_on_items_filtered(t: _DemoTracer, ev: EvGithubItemsFiltered) -> None:
+    print(f"  [{ev.agent_id}] integrity  floor={ev.floor}  "
+          f"kept {ev.kept}, dropped {ev.dropped}  ← author_association gate (no LLM)")
+
+
+def _github_on_issue_selected(t: _DemoTracer, ev: EvGithubIssueSelected) -> None:
+    print(f"  [{ev.agent_id}] select  {ev.select}  floor={ev.floor}  "
+          f"{ev.eligible}/{ev.considered} eligible  ← deterministic, no LLM")
+    if ev.number:
+        print(f"  {'':22}  → #{ev.number}  {ev.title[:60]!r}  by {ev.author}")
+
+
+def _github_on_comment_proposed(t: _DemoTracer, ev: EvGithubCommentProposed) -> None:
+    warn = "  ⚠ unfiltered third-party text" if ev.gate == "disabled" else ""
+    print(f"  ✎  post comment on  {ev.repo}#{ev.issue_number}  —  {ev.body_chars:,} chars")
+    print(f"     provenance gate:  {ev.gate}{warn}")
+    print(f"     preview:          {ev.body_preview.replace(chr(10), ' ')[:120]}…")
+
+
+def _github_on_comment_added(t: _DemoTracer, ev: EvGithubCommentAdded) -> None:
+    t._state.setdefault("github_comments", []).append(vars(ev))
+    _banner("DRIVER  —  FINAL ACTION: add_comment")
+    print(f"  target:      {ev.repo}#{ev.issue_number}  [(T,pub)]  ← routing, pre-committed from task")
+    print(f"  body:        {ev.body_chars:,} chars  [{ev.body_label}]  ← declassified by DRIVER")
+    if ev.confirmed:
+        print(f"  comment:     id={ev.comment_id!r}  url={ev.comment_url!r}")
+    else:
+        print(f"  ✗  comment not posted")
+
+
+def _github_on_pr_selected(t: _DemoTracer, ev: EvGithubPrSelected) -> None:
+    drafts = f"  {ev.drafts_skipped} draft(s) skipped" if ev.drafts_skipped else ""
+    print(f"  [{ev.agent_id}] select  {ev.select}  floor={ev.floor}  "
+          f"{ev.eligible}/{ev.considered} eligible{drafts}  ← deterministic, no LLM")
+    if ev.number:
+        print(f"  {'':22}  → #{ev.number}  {ev.title[:60]!r}  by {ev.author}")
+
+
+def _github_on_review_proposed(t: _DemoTracer, ev: EvGithubReviewProposed) -> None:
+    warn = "  ⚠ unfiltered third-party text" if ev.gate == "disabled" else ""
+    block = "  (blocks the PR)" if ev.event == "REQUEST_CHANGES" else "  (non-blocking)"
+    print(f"  ✎  {ev.event} review on  {ev.repo}#{ev.pull_number}{block}  —  {ev.body_chars:,} chars")
+    print(f"     reviewed commit:  {ev.commit_id[:12]}  ← head SHA from mcp_github_pr_read (T,pub)")
+    print(f"     provenance gate:  {ev.gate}{warn}")
+    print(f"     preview:          {ev.body_preview.replace(chr(10), ' ')[:120]}…")
+
+
+def _github_on_review_submitted(t: _DemoTracer, ev: EvGithubReviewSubmitted) -> None:
+    t._state.setdefault("github_reviews", []).append(vars(ev))
+    _banner("DRIVER  —  FINAL ACTION: submit_pr_review")
+    print(f"  target:      {ev.repo}#{ev.pull_number}  [(T,pub)]  ← routing, pre-committed from task")
+    print(f"  event:       {ev.event}  [(T,pub)]  ← APPROVE is not in the enum")
+    print(f"  commit:      {ev.commit_id}  [(T,pub)]  ← binds the review to the reviewed code")
+    print(f"  body:        {ev.body_chars:,} chars  [{ev.body_label}]  ← declassified by DRIVER")
+    if ev.confirmed:
+        print(f"  review:      id={ev.review_id!r}  url={ev.review_url!r}")
+    else:
+        print(f"  ✗  review not submitted")
+
+
+def _github_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
+    if result.get("status") not in ("success", None):
+        _section("PIPELINE ERROR")
+        print(f"  status: {result.get('status')}")
+        print(f"  reason: {result.get('reason', '(unknown)')}")
+        print()
+    _banner("POST-EXECUTION AUDIT")
+
+    comments = t._state.setdefault("github_comments", [])
+    gc       = comments.pop(0) if comments else {}
+    if gc:
+        # A search-resolved target is (T,pub) provider metadata but is NOT
+        # precommitted-before-observation; say so rather than claiming the
+        # stronger guarantee that an explicitly numbered target has.
+        via_search = result.get("target_source") == "search"
+        _section("ROUTING OUTCOME  (at add_comment)")
+        _audit_row("repo",         "(T,pub)", gc["repo"],
+                   "from task string — NEVER derived from issue/comment content")
+        _audit_row("issue_number", "(T,pub)", str(gc["issue_number"]),
+                   "resolved by deterministic filter (provider-assigned number, "
+                   "floor applied at selection) — NOT precommitted before observation"
+                   if via_search else
+                   "from task string — pre-committed before step 0; injected text "
+                   "cannot retarget the comment")
+        _audit_row("body",         gc["body_label"], f"{gc['body_chars']:,} chars",
+                   "slot content declassified by DRIVER; cannot affect routing")
+
+    reviews = t._state.setdefault("github_reviews", [])
+    gr      = reviews.pop(0) if reviews else {}
+    if gr:
+        _section("ROUTING OUTCOME  (at submit_pr_review)")
+        _audit_row("repo",        "(T,pub)", gr["repo"],
+                   "from task string — NEVER derived from PR or diff content")
+        via_search = result.get("target_source") == "search"
+        _audit_row("pull_number", "(T,pub)", str(gr["pull_number"]),
+                   "resolved by deterministic filter (provider-assigned number, "
+                   "floor applied at selection, drafts excluded) — NOT precommitted "
+                   "before observation"
+                   if via_search else
+                   "from task string — pre-committed before step 0")
+        _audit_row("event",       "(T,pub)", gr["event"],
+                   "APPROVE absent from the enum — the write surface can add "
+                   "friction, never remove it")
+        _audit_row("commit_id",   "(T,pub)", gr["commit_id"],
+                   "head SHA published by mcp_github_pr_read — binds the review to "
+                   "the commit actually read, not to whatever HEAD is now")
+        _audit_row("body",        gr["body_label"], f"{gr['body_chars']:,} chars",
+                   "slot content declassified by DRIVER; cannot affect routing")
+
+    viols  = t._pop_end().get("violations", [])
+    # A github run ends in a review, a comment, or neither — mcp_github_issue_list
+    # reports through send_summary and writes nothing to GitHub at all. Asserting a
+    # comment target unconditionally would fail every read-only run.
+    if gr:
+        target_check = ("review target + commit are (T,pub) routing", True)
+    elif gc:
+        target_check = ("comment target is (T,pub) routing", True)
+    else:
+        target_check = ("report-only run — nothing written to GitHub", True)
+    checks = [
+        target_check,
+        ("no policy violations",              len(viols) == 0),
+        ("pipeline succeeded",                result.get("status") == "success"),
+    ]
+    print_invariants(checks)
+    print_violations(viols)
+    all_ok = all(ok for _, ok in checks)
+    _banner("ALL CHECKS PASSED" if all_ok else "SOME CHECKS FAILED")
+    print(f"  elapsed: {elapsed:.1f}s")
+
+
+def _github_req() -> tuple[str, str]:
+    return ("GITHUB_TOKEN",
+            "Create a PAT at https://github.com/settings/tokens\n"
+            "  Scopes required: repo (or public_repo for public repositories only)")
+
+
 def _universal_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
     """Dispatch to the right audit function based on pipeline type."""
     pipeline = t._state.get("_pipeline", "briefing")
+    if pipeline == "github":
+        return _github_audit(t, result, elapsed)
     if pipeline == "booking":
         return _booking_audit(t, result, elapsed)
     if pipeline == "trip":
@@ -1358,6 +1500,13 @@ _UNIVERSAL_SPEC = DemoSpec(
     event_handlers={
         EvActionFired:          _on_send_summary_fired,
         EvCalendarEventCreated: _calendar_on_event_created,
+        EvGithubItemsFiltered:  _github_on_items_filtered,
+        EvGithubIssueSelected:  _github_on_issue_selected,
+        EvGithubPrSelected:     _github_on_pr_selected,
+        EvGithubCommentProposed: _github_on_comment_proposed,
+        EvGithubCommentAdded:   _github_on_comment_added,
+        EvGithubReviewProposed: _github_on_review_proposed,
+        EvGithubReviewSubmitted: _github_on_review_submitted,
         EvBookingProposed:      _booking_on_proposed,
         EvBookFlight:           _booking_on_booked,
         EvBookHotel:            _booking_on_hotel_booked,
@@ -1378,6 +1527,18 @@ _UNIVERSAL_SPEC = DemoSpec(
 # ── Pipeline detection and requirements ───────────────────────────────────────
 # All pipeline-specific knowledge lives here — safehouse_cli.app has no hardcoded tool names.
 
+# Credential→tool mapping lives in safehouse.registry, beside the tools it
+# describes; imported here because detect_pipeline is the other consumer.
+from safehouse.registry import (          # noqa: E402  (kept next to its use)
+    GITHUB_TOOLS, GOOGLE_TOOLS, DUFFEL_TOOLS, LITEAPI_TOOLS,
+)
+
+
+def tools_need_google(tools: set[str]) -> bool:
+    """True if any tool in the plan requires a Google access token."""
+    return bool(tools & GOOGLE_TOOLS)
+
+
 def detect_pipeline(tools: set[str]) -> str:
     """
     Infer pipeline type from the set of tool names in the concrete plan.
@@ -1395,6 +1556,8 @@ def detect_pipeline(tools: set[str]) -> str:
         return "calendar"
     if tools & {"mcp_email_search", "send_reply", "modify_emails"}:
         return "email"
+    if tools & GITHUB_TOOLS:
+        return "github"
     return "briefing"
 
 
@@ -1412,7 +1575,24 @@ def _gmail_req(scopes: str) -> tuple[str, str]:
 
 _PIPELINE_ENV: dict[str, list[tuple[str, str]]] = {
     "briefing":  [_gmail_req("gmail.send")],
+    "trip":      [_gmail_req("gmail.send"), _duffel_req()],
+    "email":     [_gmail_req("gmail.modify + gmail.send")],
+    "calendar":  [_gmail_req("calendar + gmail.readonly + gmail.send")],
     "booking":   [_duffel_req()],
+    "github":    [_github_req()],
+    "github":    [_github_req()],
+}
+
+# ══════════════════════════════════════════════════════════════════════
+# 8. PUBLIC FACADE
+# Stable public names for safehouse_cli (no leading underscore).
+# ══════════════════════════════════════════════════════════════════════
+
+
+_PIPELINE_ENV: dict[str, list[tuple[str, str]]] = {
+    "briefing":  [_gmail_req("gmail.send")],
+    "booking":   [_duffel_req()],
+    "github":    [_github_req()],
     "trip":      [_gmail_req("gmail.send"), _duffel_req()],
     "email":     [_gmail_req("gmail.modify + gmail.send")],
     "calendar":  [_gmail_req("calendar + gmail.readonly + gmail.send")],
