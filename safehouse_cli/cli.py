@@ -11,7 +11,6 @@ from __future__ import annotations
 
 import asyncio
 import json
-import os
 import sys
 from pathlib import Path
 
@@ -62,13 +61,6 @@ def main() -> None:
     except ConfigError as exc:
         print(f"error: {exc}", file=sys.stderr)
         sys.exit(ExitCode.CONFIG_ERROR)
-
-    # Materialize the resolved Anthropic key so the Tier-2 `claude -p` sub-agent
-    # (which reads ANTHROPIC_API_KEY from its allowlisted env) gets it even when
-    # it came from the config file. The Google token is never bridged — the
-    # sub-agent env allowlist drops it regardless.
-    if settings.anthropic_api_key:
-        os.environ["ANTHROPIC_API_KEY"] = settings.anthropic_api_key
 
     confirmer = _select_confirmer(cfg)
 

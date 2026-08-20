@@ -61,6 +61,8 @@ A driver tool absent from `_DRIVER_ROUTING_FIELDS` gets an empty routing-key lis
 ### 6 — Credential isolation
 Credentials are resolved in the CLI layer and passed into core as explicit parameters. They must never appear in a slot, label, task string, trace event payload, or any Tier 1/2 sub-agent input.
 
+`safehouse_cli/settings.py` is the **only** module that may read the environment; `safehouse/` must not, so a caller that forgets to thread a key fails loudly instead of silently falling back. Nothing anywhere may *write* a credential into `os.environ` — a process-wide environment is ambient to everything in the process and inherited by anything spawned later, which is precisely the channel explicit parameters exist to remove. `tests/test_credential_isolation.py` sweeps both directories on the AST for either violation.
+
 The Tier-2 processor runs **in-process via the Anthropic SDK** (`runner._llm_processor`), not as a subprocess. Isolation is by omission: no `tools` argument is passed, so the model has nothing to call, and nothing is read from disk — no settings file, no `CLAUDE.md`/auto-memory, no hooks, no MCP servers. Its own credential is the `api_key` parameter, never an environment variable. Re-introducing a subprocess here is a regression: it reloads all of that from user *and* project scope, a configured hook executes regardless of any tool restriction, and the binary is PATH-shimmable. `tests/test_subagent_isolation.py` asserts this on the AST — `runner.py` must not import `subprocess` or call any spawn primitive.
 
 ### 7 — Policy identity is per pipeline run

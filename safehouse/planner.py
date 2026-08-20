@@ -107,6 +107,12 @@ def _recipient_recovery_field(msg: object) -> str | None:
 
 
 def _get_client(api_key: str | None = None) -> anthropic.Anthropic:
+    # Left as None the SDK resolves a key from the environment itself, below this
+    # package, where the sweep in test_credential_isolation.py cannot see it.
+    # Both model call sites take the key from the CLI or fail.
+    if not api_key:
+        raise RuntimeError(
+            "planner requires an explicit API key; none was threaded from the CLI layer")
     return anthropic.Anthropic(api_key=api_key)
 
 
