@@ -22,14 +22,20 @@ def test_configure_idempotent_on_keep(tmp_path, monkeypatch):
     cfg = tmp_path / "config.toml"
     monkeypatch.setenv("SAFEHOUSE_CONFIG", str(cfg))
 
-    # Pass 1: set anthropic key + static token + recipient; blank approve/timeout.
-    # getpass order: anthropic key, google access token.  input order: mode, recipient, approve, timeout.
-    _answer(monkeypatch, ["sk-ant-1", "ya29.tok"], ["static", "me@x.com", "", ""])
+    # Pass 1: set anthropic key + static token + recipient + duffel + passenger; blank approve/timeout.
+    # getpass order: anthropic key, google access token, duffel token, liteapi key.
+    # input order: mode, recipient, approve, timeout, max_booking, then 7 passenger fields.
+    _answer(
+        monkeypatch,
+        ["sk-ant-1", "ya29.tok", "duffel_test_1", "sand_test_1"],
+        ["static", "me@x.com", "", "", "300",
+         "mr", "Ali", "Sh", "1990-01-01", "m", "a@x.com", "+441234567890"],
+    )
     assert configure.run_configure([]) == 0
     first = cfg.read_bytes()
 
     # Pass 2: Enter to keep everything.
-    _answer(monkeypatch, ["", ""], ["", "", "", ""])
+    _answer(monkeypatch, [""] * 4, [""] * 12)
     assert configure.run_configure([]) == 0
 
     assert cfg.read_bytes() == first          # keep-current preserved the token (FIX-1)
@@ -41,6 +47,6 @@ def test_configure_preserves_unknown_sections(tmp_path, monkeypatch):
     cfg.chmod(0o600)
     monkeypatch.setenv("SAFEHOUSE_CONFIG", str(cfg))
 
-    _answer(monkeypatch, ["", ""], ["static", "", "", ""])
+    _answer(monkeypatch, [""] * 5, ["static", *[""] * 12])
     assert configure.run_configure([]) == 0
     assert 'keep = "me"' in cfg.read_text()   # hand-added section survived (FIX-6a)
