@@ -182,7 +182,16 @@ def test_oauth_missing_dependency(tmp_path):
 # ── FIX-2: token_command works keyless; token reaches the header, not Tier-2 ──
 
 def test_token_command_reaches_header_not_subagent(monkeypatch):
-    from safehouse.runner import _google_auth_headers, _subagent_env
+    """A token_command-resolved token reaches the Authorization header and nothing else.
+
+    The Tier-2 half of this used to check that the token was absent from the
+    sub-agent's scrubbed environment. The processor no longer runs as a subprocess,
+    so there is no environment to scrub — and no tool the model could read one with.
+    The Tier-2 property is now asserted directly in
+    tests/test_subagent_isolation.py::test_foreign_credential_cannot_reach_the_processor,
+    which checks the token cannot appear in the outgoing SDK request at all.
+    """
+    from safehouse.runner import _google_auth_headers
     from safehouse_cli.settings import Settings
     sentinel = "ya29.SENTINEL_TOKEN_XYZ"                     # GOOGLE_ACCESS_TOKEN cleared by conftest
     provider = build_provider(Settings(google_auth="token_command",
@@ -190,5 +199,3 @@ def test_token_command_reaches_header_not_subagent(monkeypatch):
     token = provider.get_access_token()
     assert token == sentinel                                 # keyless token_command resolves
     assert _google_auth_headers(token) == {"Authorization": f"Bearer {sentinel}"}
-    monkeypatch.setenv("ANTHROPIC_API_KEY", "sk-ant-x")
-    assert not any(sentinel in v for v in _subagent_env().values())   # never in Tier-2 env

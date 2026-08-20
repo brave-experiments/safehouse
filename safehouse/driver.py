@@ -13,8 +13,10 @@ driver.py — Manifest executor and tool handlers.
       _handle_mcp_search()             MCP call → (U,pub) slot  [flight/hotel/any MCP search]
       _handle_mcp_email_search()       Mailbox API → (U,priv) slot + thread_meta
       _handle_mcp_calendar_search()    Calendar REST API → (U,priv) slot
+      _handle_duffel_flight_search()   Duffel REST → (U,pub) slot
+      _handle_liteapi_hotel_search()   LiteAPI REST → (U,pub) slot
 
-    Tier 2 — Processor Sub-Agents (isolated claude -p):
+    Tier 2 — Processor Sub-Agents (isolated SDK call, no tools):
       _handle_spawn_processor()        synthesise/transform → slot
 
     Tier 3 — Driver Tools (pure Python, no LLM, no network except the action itself):
@@ -22,6 +24,9 @@ driver.py — Manifest executor and tool handlers.
       _handle_send_reply()             slot-bound declassify + bridge + mailbox send
       _handle_schedule_meeting()       human slot confirm + calendar event + reply email
       _handle_modify_emails()          bulk Gmail action on all messages from sender (no content read)
+      _handle_book_flight()            re-validate offer + ceiling + grant → Duffel order
+      _handle_book_hotel()             re-search + prebook + ceiling + grant → LiteAPI booking
+      _handle_create_calendar_event()  routing-only calendar write (no slot content)
 
   _HANDLERS                            tool name → handler function
   _dispatch()                          before_tool gate → handler lookup → call
@@ -105,8 +110,10 @@ _BODY_FLOW_FIELD = FlowField(
 
 @dataclass(frozen=True)
 class ProviderConfig:
-    """Immutable snapshot of email-provider credentials."""
+    """Immutable snapshot of provider credentials. Resolved in the CLI layer;
+    never placed in a slot, label, trace payload, or sub-agent input (invariant #6)."""
     google_token: str
+    anthropic_api_key: str = ""      # Tier-2 processor's own credential
 
 
 class GmailSendError(RuntimeError):
@@ -619,7 +626,9 @@ async def _handle_spawn_processor(args: dict, ctx: _StepContext) -> tuple[str, d
     _emit_spawned(spec, "processor", {"reads": reads, "out_slot": out_slot, "out_label": str(out_label)})
     reader = store.reader_for(reads, agent_id=spec.id, max_label=spec.max_label)
     writer = store.writer_for(out_slot, out_label, agent_id=spec.id)
-    await run_processor(reads, reader, writer, system_prompt=spec.system_prompt, agent_id=spec.id, timeout=300)
+    await run_processor(reads, reader, writer, system_prompt=spec.system_prompt,
+                        agent_id=spec.id, timeout=300,
+                        api_key=ctx.config.anthropic_api_key)
     return _slot_result(store, state, out_slot, "SpawnProcessor")
 
 
@@ -1188,6 +1197,7 @@ async def run(
     task: str, plan: dict, store: SlotStore, policy: IronFlow,
     *,
     google_token: str = "",
+    anthropic_api_key: str = "",
     confirm_slot: Callable[[list[dict]], Awaitable[int]] = _default_confirm_slot,
     routing: dict | None = None,
 ) -> dict:
@@ -1214,7 +1224,8 @@ async def run(
         )
 
     driver = driver_spec()
-    config = ProviderConfig(google_token=google_token)
+    config = ProviderConfig(google_token=google_token,
+                            anthropic_api_key=anthropic_api_key)
     state  = PlanState(trusted_action_urls=tuple(plan.get("trusted_action_urls", [])))
     ctx    = _StepContext(
         store=store, policy=policy, driver=driver, state=state,
@@ -1338,6 +1349,7 @@ async def run_manifest(
     plan: dict,
     *,
     google_token: str = "",
+    anthropic_api_key: str = "",
     confirm_slot: Callable[[list[dict]], Awaitable[int]] = _default_confirm_slot,
 ) -> dict:
     """
@@ -1358,7 +1370,8 @@ async def run_manifest(
         store  = SlotStore()
         policy = IronFlow(store)
         result = await run(task, plan, store, policy,
-                           google_token=google_token, confirm_slot=confirm_slot)
+                           google_token=google_token,
+                           anthropic_api_key=anthropic_api_key, confirm_slot=confirm_slot)
         if result.get("status") != "success" and _world_action_committed(result):
             result = {**result, "do_not_retry": True}
         return result
@@ -1389,7 +1402,8 @@ async def run_manifest(
         store  = SlotStore()
         policy = IronFlow(store)
         sub_result = await run(task, sub, store, policy,
-                               google_token=google_token, confirm_slot=confirm_slot, routing=rb)
+                               google_token=google_token,
+                               anthropic_api_key=anthropic_api_key, confirm_slot=confirm_slot, routing=rb)
         results.append(sub_result)
         violations.extend(sub_result.get("violations", []))
 

@@ -9,7 +9,7 @@ Three sections, matching the architecture:
     run_mcp_calendar_search  — Google Calendar REST API → (U,priv) slot
     run_mcp_search           — MCP call + deterministic URL extract → (U,pub) slot
 
-  TIER 2 — PROCESSOR SUB-AGENTS (isolated claude -p, reads slots only, no network):
+  TIER 2 — PROCESSOR SUB-AGENTS (isolated SDK call, no tools, reads slots only):
     run_processor   — synthesise / transform (used by spawn_processor)
 
 Key safety properties:
@@ -25,17 +25,15 @@ Key safety properties:
 from __future__ import annotations
 import asyncio
 import base64
-import contextlib
 import html as _html
+import contextlib
 import json
-import os
 import re
 import shutil
-import subprocess
 import sys
-import threading
 from urllib.parse import urlparse, urljoin, quote
 
+import anthropic
 import httpx
 
 from .labels import Label
@@ -56,6 +54,15 @@ try:
     _logging.getLogger("httpx").setLevel(_logging.WARNING)
 except ImportError:
     _MCP_AVAILABLE = False
+
+
+class ProviderAuthError(RuntimeError):
+    """A provider rejected the credential (401/403).
+
+    Operator-fixable and worth retrying after a refresh, unlike a 4xx/5xx on a
+    valid credential — so the CLI maps it to ExitCode.CREDENTIAL_ERROR rather
+    than PIPELINE_ERROR.
+    """
 
 
 # ── Module-level constants ─────────────────────────────────────────────
@@ -177,104 +184,83 @@ def _ensure_tz(ts: str) -> str:
 
 # ── Sub-agent spawner ──────────────────────────────────────────────────
 
-# Non-secret vars the Tier-2 sub-agent needs; ANTHROPIC_*/CLAUDE_* added in _subagent_env.
-_SUBAGENT_ENV_KEEP = frozenset({
-    "HOME", "PATH", "USER", "LOGNAME", "SHELL", "TERM", "TMPDIR",
-    "LANG", "LC_ALL", "LC_CTYPE",
-    "HTTP_PROXY", "HTTPS_PROXY", "NO_PROXY", "http_proxy", "https_proxy", "no_proxy",
-})
+# Tier-2 model is pinned here, not inherited from ambient CLI configuration, so a
+# run is reproducible across machines and the model is a property of the code
+# rather than of whoever's laptop it ran on.
+_PROCESSOR_MODEL      = "claude-sonnet-4-6"
+_PROCESSOR_MAX_TOKENS = 8192
 
 
-def _subagent_env() -> dict[str, str]:
-    """Allowlisted env for the Tier-2 sub-agent — drops GOOGLE_ACCESS_TOKEN et al."""
-    return {k: v for k, v in os.environ.items()
-            if k in _SUBAGENT_ENV_KEEP or k.startswith(("ANTHROPIC_", "CLAUDE_"))}
-
-
-def _claude_subagent(system: str, user: str, *, timeout: int = 300) -> str:
+async def _llm_processor(
+    system: str, user: str, *, timeout: int = 300, api_key: str | None = None,
+) -> str:
     """
-    Spawn an isolated Claude Code sub-agent: claude -p --tools "".
-    No memory, no tools, no slot access — pure text generation.
-    Streams output to terminal with "  │ " prefix for live progress.
-    Returns the complete response text.
+    Run the isolated Tier-2 processor via the Anthropic SDK. Pure text generation.
+    Streams to the terminal with "  │ " prefix for live progress; returns the
+    complete response text.
 
-    Security: user content (slot data, which may be (U,priv)) is passed via
-    stdin — NOT as a positional argv argument — so it does not appear in ps
-    output or /proc/*/cmdline and is not subject to ARG_MAX limits. The child
-    runs with an allowlisted environment (_subagent_env) so ambient credentials
-    such as GOOGLE_ACCESS_TOKEN never reach it.
+    Isolation by omission: no `tools` argument, and nothing read from disk. See
+    CLAUDE.md invariant #6 for why this must not become a subprocess again.
 
-    --system-prompt intentionally replaces Claude's entire default system
-    prompt (including default tool guidance) — correct for isolated processors
-    whose tool access must be empty ("").
+    Slot content, which may be (U,priv), travels as a message body rather than an
+    argv element, so it cannot surface in `ps` output or /proc/*/cmdline.
     """
-    proc = subprocess.Popen(
-        # Static short prompt in argv; actual slot content arrives via stdin.
-        ["claude", "-p", "Process the input per the system instructions.",
-         "--system-prompt", system,
-         "--tools", "",
-         "--output-format", "text",
-         "--dangerously-skip-permissions"],
-        stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-        text=True, bufsize=1,
-        env=_subagent_env(),
-    )
-
-    # Write stdin on a thread: if the child starts streaming stdout before it
-    # has consumed all stdin (which claude does), the parent blocks in stdin.write
-    # while the child blocks writing stdout — a classic pipe deadlock. BrokenPipeError
-    # is benign (child already exited).
-    def _write_stdin() -> None:
-        try:
-            proc.stdin.write(user)   # type: ignore[union-attr]
-            proc.stdin.close()       # type: ignore[union-attr]
-        except BrokenPipeError:
-            pass
-
-    threading.Thread(target=_write_stdin, daemon=True).start()
-
-    # Drain stderr on a thread — an unread PIPE deadlocks the child once the OS buffer fills.
-    err_buf: list[str] = []
-    err_thread = threading.Thread(
-        target=lambda: err_buf.append(proc.stderr.read()),  # type: ignore[union-attr]
-        daemon=True,
-    )
-    err_thread.start()
-
-    # Kill timer: enforces the wall-clock timeout even when the child produces
-    # no stdout (a silently hanging sub-agent never reaches proc.wait()).
-    killer = threading.Timer(timeout, proc.kill)
-    killer.start()
+    # Explicit key only: left as None the SDK reads the environment itself, below
+    # this package, where the sweep in test_credential_isolation.py cannot see it.
+    if not api_key:
+        raise RuntimeError(
+            "Tier-2 processor requires an explicit API key; none was threaded "
+            "from the CLI layer")
+    client = anthropic.AsyncAnthropic(api_key=api_key, timeout=float(timeout))
 
     parts: list[str] = []
     col = min(shutil.get_terminal_size(fallback=(120, 40)).columns - 6, 134)
-    shown = 0
-    suppressed = 0
-    try:
-        for line in proc.stdout:        # type: ignore[union-attr]
-            parts.append(line)
-            if shown < _MAX_STREAM_LINES:
-                display = line.rstrip("\n")
-                if len(display) > col:
-                    display = display[:col - 1] + "…"
-                sys.stdout.write("  │ " + display + "\n")
-                sys.stdout.flush()
-                shown += 1
-            else:
-                suppressed += 1
-        if suppressed:
-            sys.stdout.write(f"  │  … (+{suppressed} more lines)\n")
-            sys.stdout.flush()
-        proc.wait()
-    finally:
-        killer.cancel()
+    shown = suppressed = 0
+    pending = ""
 
-    if proc.returncode and proc.returncode < 0:   # killed by the timer
-        raise RuntimeError(f"sub-agent timed out after {timeout}s")
-    if proc.returncode != 0:
-        err_thread.join(timeout=2)
-        stderr_diag = (err_buf[0] if err_buf else "")[:200]
-        raise RuntimeError(f"sub-agent failed (exit {proc.returncode}): {stderr_diag}")
+    def _emit_line(line: str) -> None:
+        nonlocal shown, suppressed
+        if shown < _MAX_STREAM_LINES:
+            display = line if len(line) <= col else line[: col - 1] + "…"
+            sys.stdout.write("  │ " + display + "\n")
+            sys.stdout.flush()
+            shown += 1
+        else:
+            suppressed += 1
+
+    try:
+        async with client.messages.stream(
+            model      = _PROCESSOR_MODEL,
+            max_tokens = _PROCESSOR_MAX_TOKENS,
+            system     = system,
+            messages   = [{"role": "user", "content": user}],
+        ) as stream:
+            async for chunk in stream.text_stream:
+                parts.append(chunk)
+                # Display is line-oriented; the stream is token-oriented. Buffer
+                # until a newline so a wrapped line is measured against `col` once.
+                pending += chunk
+                while "\n" in pending:
+                    line, pending = pending.split("\n", 1)
+                    _emit_line(line)
+    except anthropic.APIStatusError as exc:
+        # Typed separately from a generic failure because the remedy differs: an
+        # expired or under-scoped key is operator-fixable. Callers that want a
+        # distinct exit code catch ProviderAuthError.
+        raise (ProviderAuthError if exc.status_code in (401, 403) else RuntimeError)(
+            f"processor sub-agent failed (status {exc.status_code}): {str(exc)[:200]}"
+        ) from exc
+    except anthropic.APITimeoutError as exc:
+        raise RuntimeError(f"sub-agent timed out after {timeout}s") from exc
+    except anthropic.APIError as exc:
+        raise RuntimeError(f"processor sub-agent failed: {str(exc)[:200]}") from exc
+
+    if pending:
+        _emit_line(pending)
+    if suppressed:
+        sys.stdout.write(f"  │  … (+{suppressed} more lines)\n")
+        sys.stdout.flush()
+
     return "".join(parts).strip()
 
 
@@ -935,6 +921,7 @@ async def run_processor(
     system_prompt: str,
     agent_id:      str,
     timeout:       int = 300,
+    api_key:       str | None = None,
 ) -> None:
     """
     Read dirty slots into context, run isolated LLM, write output slot.
@@ -949,14 +936,12 @@ async def run_processor(
         context_parts.append(f"[{slot_id}]\n{lval.value}")
         input_labels.append(lval.label)
 
-    # _claude_subagent is blocking (subprocess + synchronous pipe reads). Run it
-    # in a thread so concurrent asyncio.gather calls (e.g. fetcher + processor)
-    # are not stalled for the processor's full duration.
-    output = await asyncio.to_thread(
-        _claude_subagent,
+    # Natively async — no thread hop.
+    output = await _llm_processor(
         system_prompt,
         "\n\n".join(context_parts),
         timeout=timeout,
+        api_key=api_key,
     )
 
     _trace.emit(_trace.EvTaint(
