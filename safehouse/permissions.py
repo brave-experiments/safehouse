@@ -191,6 +191,7 @@ def driver_spec() -> AgentSpec:
             CanCallTool("modify_emails"),
             CanCallTool("book_flight"),
             CanCallTool("book_hotel"),
+            CanCallTool("create_calendar_event"),
         ]),
         max_label   = Label.T_priv(),
     )

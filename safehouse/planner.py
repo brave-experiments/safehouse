@@ -142,6 +142,24 @@ class PipelinePattern:
 _PIPELINE_SHAPES: list[PipelinePattern] = [
 
     PipelinePattern(
+        driver_tool = "create_calendar_event",
+        description = (
+            "Add a personal block to the operator's OWN calendar — no attendee, no "
+            "email thread, no meeting request. Use this (NOT schedule_meeting) whenever "
+            "the task says add/block/put something on 'my' calendar rather than schedule "
+            "a meeting with someone else. event_title/start/end come straight from the "
+            "task text (verbatim dates converted to ISO8601 with the local UTC offset) — "
+            "never from a slot, so no processor step and no human confirmation loop are needed."
+        ),
+        example     = """\
+{"steps": [
+  {"tool": "create_calendar_event", "args": {
+    "event_title": "<short title from task, e.g. 'Trip to <city>'>",
+    "start": "<first day, verbatim date from task, 00:00 local offset, ISO8601>",
+    "end": "<last day, verbatim date from task, 23:59 local offset, ISO8601>"}}
+]}""",
+    ),
+    PipelinePattern(
         driver_tool = "book_flight",
         description = (
             "BOOK/RESERVE/PURCHASE a flight (not just search or email). "
@@ -479,6 +497,7 @@ class ToolContract:
     literal_fields: dict[str, frozenset[str]] = field(
         default_factory=dict, hash=False, compare=False,
     )
+    datetime_fields: tuple[str, ...] = ()  # must be a tz-aware ISO8601 string
     is_driver_tool:  bool            = False
     max_uses:        int | None     = None   # Tier 1 tools: 1 (Rule 6)
     max_email_list:  int | None     = None   # max addresses in email_fields; None = unlimited
@@ -593,6 +612,12 @@ TOOL_SCHEMA: dict[str, ToolContract] = {
         max_email_list  = 10,
         is_driver_tool  = True,
     ),
+    "create_calendar_event": ToolContract(
+        required        = ("event_title", "start", "end"),
+        string_fields   = ("event_title",),
+        datetime_fields = ("start", "end"),
+        is_driver_tool  = True,
+    ),
     "book_flight": ToolContract(
         required        = ("provider", "offer_slot"),
         slot_refs       = ("offer_slot",),
@@ -620,6 +645,22 @@ TOOL_SCHEMA: dict[str, ToolContract] = {
 # Fields that _map_to_concrete must inject from the registry.
 # Tools that list these in required but have no registry entry → descriptive error in Phase 2.
 _PROVIDER_REQUIRED_ARGS = frozenset({"api_url", "domain"})
+
+
+def _is_iso8601_datetime(value: object) -> bool:
+    """True if value is a timezone-aware ISO8601 datetime string.
+
+    Requires an explicit offset (or Z) — the Google Calendar API's dateTime field is
+    ambiguous without one, and this is a planner-emitted routing field (no processor
+    re-validation downstream), so malformed input must be caught here, not at the API.
+    """
+    if not isinstance(value, str):
+        return False
+    try:
+        dt = datetime.fromisoformat(value)
+    except ValueError:
+        return False
+    return dt.tzinfo is not None
 
 
 def _validate_plan(
@@ -766,6 +807,13 @@ def _validate_plan(
         for f, allowed in sc.literal_fields.items():
             if f in args and args[f] not in allowed:
                 raise PlanValidationError(f"{ctx}: '{f}' must be one of {sorted(allowed)}, got '{args[f]}'", field=f)
+
+        for f in sc.datetime_fields:
+            if not _is_iso8601_datetime(args[f]):
+                raise PlanValidationError(
+                    f"{ctx}: '{f}'='{args[f]}' must be a timezone-aware ISO8601 datetime "
+                    f"(e.g. 2026-10-11T09:00:00+01:00)", field=f,
+                )
 
         if sc.is_driver_tool and i != last_idx:
             raise ValueError(f"{ctx}: driver tool must be the last step ({last_idx - i} unreachable step(s) follow)")

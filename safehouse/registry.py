@@ -459,6 +459,17 @@ _CATALOG_SPECS: list[CatalogSpec] = [
     ),
 
     CatalogSpec(
+        name        = "create_calendar_event",
+        category    = "terminal_confirmed",
+        description = "Add a personal block to the operator's OWN calendar — no attendee, no email thread, no meeting request. Use this (NOT schedule_meeting) for 'add this to my calendar' tasks. event_title/start/end are (T,pub) from the task text, converted to ISO8601 — never derived from a slot.",
+        args        = (
+            ArgSpec("event_title", "str", description="short title from task context, e.g. 'Trip to Madrid'"),
+            ArgSpec("start",       "str", description="tz-aware ISO8601 datetime, e.g. 2026-10-11T00:00:00+01:00"),
+            ArgSpec("end",         "str", description="tz-aware ISO8601 datetime, must be after start"),
+        ),
+    ),
+
+    CatalogSpec(
         name        = "book_flight",
         category    = "terminal_confirmed",
         description = "Book the flight offer chosen by spawn_processor (Duffel), paid from the operator's prepaid Duffel balance, after human confirmation. provider is (T,pub); the amount is re-validated against Duffel and human-endorsed. Passenger details and the spend ceiling come from operator config, never the task or a slot.",
