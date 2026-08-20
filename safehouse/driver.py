@@ -10,7 +10,6 @@ driver.py — Manifest executor and tool handlers.
 
     Tier 1 — Data Sub-Agents (operator code, no LLM):
       _handle_mcp_page_content()       HTTP fetch → (U,pub) slot
-      _handle_mcp_search()             MCP call → (U,pub) slot  [flight/hotel/any MCP search]
       _handle_mcp_email_search()       Mailbox API → (U,priv) slot + thread_meta
       _handle_mcp_calendar_search()    Calendar REST API → (U,priv) slot
       _handle_duffel_flight_search()   Duffel REST → (U,pub) slot
@@ -72,7 +71,7 @@ from .labels import LVal, Label, I, C, taint_all, Capability
 from .slots import SlotStore, SlotWriter
 from .ironflow_policy import IronFlow, FlowField, FlowMode, IronFlowViolation, Role
 from .permissions import AgentSpec, driver_spec, fetcher_spec, processor_spec
-from .runner import run_mcp_page_content, run_mcp_search, run_mcp_email_search, run_mcp_calendar_search, run_processor
+from .runner import run_mcp_page_content, run_mcp_email_search, run_mcp_calendar_search, run_processor, run_duffel_flight_search, run_liteapi_hotel_search, _duffel_auth_headers, _liteapi_headers
 from .plan_types import PlanState
 from .release import (
     DRIVER_RELEASE,
@@ -113,7 +112,11 @@ class ProviderConfig:
     """Immutable snapshot of provider credentials. Resolved in the CLI layer;
     never placed in a slot, label, trace payload, or sub-agent input (invariant #6)."""
     google_token: str
-    anthropic_api_key: str = ""      # Tier-2 processor's own credential
+    duffel_token: str = ""
+    liteapi_key:  str = ""
+    passenger:    Mapping[str, str] | None = None   # profile from operator config — never a slot
+    max_booking_amount: str = ""                     # "<amount> <currency>", e.g. "300 GBP" — see _check_spend_ceiling
+    anthropic_api_key: str = ""                      # Tier-2 processor's own credential
 
 
 class GmailSendError(RuntimeError):
@@ -554,33 +557,94 @@ async def _handle_mcp_page_content(args: dict, ctx: _StepContext) -> tuple[str, 
     )
 
 
-async def _handle_mcp_search(args: dict, ctx: _StepContext) -> tuple[str, dict | None]:
-    """Shared handler for mcp_flight_search, mcp_hotel_search, and any future MCP search tool."""
+def _check_spend_ceiling(cap_config: str, amount: str, currency: str, what: str) -> str | None:
+    """Validate a provider fare/rate against the operator's spend ceiling.
+
+    Returns an error message if the booking must be aborted, else None. The
+    ceiling must be configured as "<amount> <currency>" (e.g. "300 GBP") — a
+    bare number cannot be safely compared against a fare in an unknown
+    currency, so a currency-less or currency-mismatched ceiling is treated as
+    a hard stop rather than silently comparing raw numbers across currencies.
+    """
+    cap_config = cap_config.strip()
+    if not cap_config:
+        return None
+    parts = cap_config.split()
+    if len(parts) != 2:
+        return (
+            f"max_booking_amount must be '<amount> <currency>' (e.g. '300 GBP'), "
+            f"got {cap_config!r} — add the ceiling's currency to your config"
+        )
+    cap_str, cap_ccy = parts
+    try:
+        cap_val = float(cap_str)
+    except ValueError:
+        return f"max_booking_amount has an unparseable amount {cap_str!r}"
+    try:
+        amt_val = float(amount)
+    except ValueError:
+        return f"unparseable {what} amount {amount!r}"
+    if cap_ccy.upper() != currency.upper():
+        return (
+            f"{what} is {amount} {currency}, but the spend ceiling is configured in "
+            f"{cap_ccy.upper()} — cannot safely compare different currencies; "
+            f"set max_booking_amount in {currency} or disable the ceiling"
+        )
+    if amt_val > cap_val:
+        return f"{what} {amount} {currency} exceeds ceiling {cap_val:g} {cap_ccy.upper()}"
+    return None
+
+
+async def _handle_duffel_flight_search(args: dict, ctx: _StepContext) -> tuple[str, dict | None]:
+    """Tier 1 Duffel flight search (authenticated REST) → (U,pub) slot.
+
+    Concrete args keep the MCP shape (domain + search_params) from _map_to_concrete,
+    but the transport is Duffel REST, not an MCP call. duffel_token is injected from
+    ctx.config — never a slot or a sub-agent env."""
     store, policy, state = ctx.store, ctx.policy, ctx.state
     domain        = args["domain"]
-    mcp_tool      = args["mcp_tool"]
     search_params = args.get("search_params", {})
-    location_tool = args.get("location_tool")
     slot_id       = args["slot_id"]
 
-    spec = fetcher_spec(f"mcp_search_{slot_id}", Capability(args["capability"]), mcp_domain=domain)
+    spec = fetcher_spec(f"duffel_flight_{slot_id}", Capability(args["capability"]), mcp_domain=domain)
 
     async def _run(w: SlotWriter) -> None:
-        await run_mcp_search(
-            spec, domain, mcp_tool, search_params, w, policy,
-            trusted_action_urls=list(state.trusted_action_urls),
-            location_tool=location_tool,
+        await run_duffel_flight_search(
+            spec, domain, search_params, w, policy, duffel_token=ctx.config.duffel_token,
         )
 
     return await _run_tier1(
         ctx, slot_id, spec, "mcp_search",
-        {"domain": domain, "mcp_tool": mcp_tool, "slot_id": slot_id,
-         "search_params": search_params, "location_tool": location_tool,
-         "note": "operator code → MCP call + deterministic URL extract (no LLM; ranking via spawn_processor)"},
+        {"domain": domain, "slot_id": slot_id, "search_params": search_params,
+         "note": "operator code → Duffel REST offer_requests (no LLM; ranking via spawn_processor)"},
         "McpSearch",
         _run,
     )
 
+async def _handle_liteapi_hotel_search(args: dict, ctx: _StepContext) -> tuple[str, dict | None]:
+    """Tier 1 LiteAPI hotel search (authenticated REST) → (U,pub) slot.
+
+    Same MCP arg shape (domain + search_params) but the transport is LiteAPI REST.
+    liteapi_key is injected from ctx.config — never a slot or a sub-agent env."""
+    store, policy, state = ctx.store, ctx.policy, ctx.state
+    domain        = args["domain"]
+    search_params = args.get("search_params", {})
+    slot_id       = args["slot_id"]
+
+    spec = fetcher_spec(f"liteapi_hotel_{slot_id}", Capability(args["capability"]), mcp_domain=domain)
+
+    async def _run(w: SlotWriter) -> None:
+        await run_liteapi_hotel_search(
+            spec, domain, search_params, w, policy, liteapi_key=ctx.config.liteapi_key,
+        )
+
+    return await _run_tier1(
+        ctx, slot_id, spec, "mcp_search",
+        {"domain": domain, "slot_id": slot_id, "search_params": search_params,
+         "note": "operator code → LiteAPI REST /hotels/rates (no LLM; ranking via spawn_processor)"},
+        "McpSearch",
+        _run,
+    )
 
 async def _handle_mcp_email_search(args: dict, ctx: _StepContext) -> tuple[str, dict | None]:
     store, policy, state = ctx.store, ctx.policy, ctx.state
@@ -1149,17 +1213,284 @@ def _next_batch_end(steps: list[dict], start: int) -> int:
     return j
 
 
+_LITEAPI_BASE = "https://api.liteapi.travel/v3.0"
+_DUFFEL_AIR_BASE = "https://api.duffel.com/air"
+
+async def _handle_book_flight(args: dict, ctx: _StepContext) -> tuple[str, dict | None]:
+    """Driver tool: book the processor-chosen Duffel offer, paid from the operator's
+    prepaid Duffel balance, after re-validating the price and human confirmation.
+
+    provider is (T,pub) routing (pre-committed). The offer pick is (U,pub) — a hint
+    for WHICH offer, re-validated against Duffel before any charge. amount is
+    grant-required (endorsed at action time). Passenger PII and the spend ceiling are
+    trusted operator config (ctx.config) — never a slot, the task, or the LLM."""
+    store, policy, state = ctx.store, ctx.policy, ctx.state
+    offer_slot = args["offer_slot"]
+
+    routing = _get_routing(state)
+    if routing is None:
+        return _terminal_error(_ROUTING_MISSING, store)
+    provider = str(routing["provider"])
+    policy.before_action("book_flight", "provider", LVal(provider, Label.T_pub()), Role.ROUTING)
+
+    token = ctx.config.duffel_token
+    if not token:
+        return _terminal_error("DUFFEL_ACCESS_TOKEN is not set", store)
+    passenger = ctx.config.passenger
+    if not passenger:
+        return _terminal_error(
+            "no passenger profile configured — set [passenger] "
+            "(given_name, family_name, born_on, gender, email, phone_number, title)", store)
+
+    if not store.is_written(offer_slot):
+        return _terminal_error(f"offer_slot '{offer_slot}' not written", store)
+    try:
+        released = _release_slot(
+            policy, slot_id=offer_slot, state=state, routing=routing,
+            who="provider", not_from="fetched flight offers",
+        )
+    except (ReleaseTransformError, IronFlowViolation) as exc:
+        return _terminal_error(str(exc), store)
+    offer_id = str(released.value["offer_id"])
+
+    headers = _duffel_auth_headers(token)
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+        offer_resp = await client.get(f"{_DUFFEL_AIR_BASE}/offers/{offer_id}", headers=headers)
+    if offer_resp.status_code >= 400:
+        return _provider_error(offer_resp, f"offer {offer_id} no longer bookable", store)
+    offer    = offer_resp.json().get("data", {})
+    amount   = str(offer.get("total_amount", ""))
+    currency = str(offer.get("total_currency", ""))
+    owner    = (offer.get("owner") or {}).get("name", "")
+    _legs    = []
+    for _sl in (offer.get("slices") or []):
+        _s = _sl.get("segments") or []
+        if _s:
+            origin = (_s[0].get("origin") or {}).get("iata_code", "?")
+            dest   = (_s[-1].get("destination") or {}).get("iata_code", "?")
+            _legs.append(f"{origin}->{dest}")
+    route    = " / ".join(_legs)   # both legs for a round trip, one for one-way
+
+    if err := _check_spend_ceiling(ctx.config.max_booking_amount or "", amount, currency, "fare"):
+        return _terminal_error(err, store)
+
+    label  = f"{owner} {route} — {amount} {currency} (offer {offer_id})"
+    _trace.emit(_trace.EvBookingProposed(owner=owner, route=route, amount=amount,
+                                         currency=currency, offer_id=offer_id))
+    _slices = offer.get("slices") or []
+    _first  = (_slices[0].get("segments") or [{}])[0] if _slices else {}
+    _last   = (_slices[-1].get("segments") or [{}])[-1] if _slices else {}
+    choice = await ctx.confirm_slot([{
+        "label": label,
+        "start": _first.get("departing_at", ""),
+        "end":   _last.get("arriving_at", ""),
+    }])
+    if choice != 1:
+        _trace.emit(_trace.EvBookFlight(provider=provider, offer_id=offer_id, amount=amount,
+            currency=currency, owner=owner, route=route, order_id="", booking_reference="", confirmed=False))
+        return _terminal_error("flight booking not confirmed by human", store)
+
+    try:
+        policy.issue_action_grant(state, tool="book_flight", fields={"amount": amount})
+    except IronFlowViolation as exc:
+        return _terminal_error(str(exc), store)
+    policy.before_action("book_flight", "amount", LVal(amount, Label.T_pub()), Role.ROUTING)
+
+    pax = dict(passenger)
+    pax_ids = [p.get("id") for p in offer.get("passengers", []) if p.get("id")]
+    if pax_ids:
+        pax["id"] = pax_ids[0]
+    order_body = {"data": {
+        "type":            "instant",
+        "selected_offers": [offer_id],
+        "payments":        [{"type": "balance", "amount": amount, "currency": currency}],
+        "passengers":      [pax],
+    }}
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+        order_resp = await client.post(f"{_DUFFEL_AIR_BASE}/orders", headers=headers, json=order_body)
+    if order_resp.status_code >= 400:
+        _trace.emit(_trace.EvBookFlight(provider=provider, offer_id=offer_id, amount=amount,
+            currency=currency, owner=owner, route=route, order_id="", booking_reference="", confirmed=False))
+        return _provider_error(order_resp, "Duffel order", store)
+    order    = order_resp.json().get("data", {})
+    order_id = str(order.get("id", ""))
+    pnr      = str(order.get("booking_reference", ""))
+
+    _trace.emit(_trace.EvBookFlight(provider=provider, offer_id=offer_id, amount=amount,
+        currency=currency, owner=owner, route=route, order_id=order_id,
+        booking_reference=pnr, confirmed=True))
+    final = {"provider": provider, "order_id": order_id, "booking_reference": pnr,
+             "amount": amount, "currency": currency, "route": route, "owner": owner}
+    return json.dumps(final), final
+
+async def _handle_book_hotel(args: dict, ctx: _StepContext) -> tuple[str, dict | None]:
+    """Driver tool: book the processor-chosen LiteAPI hotel offer, paid from the
+    operator's LiteAPI wallet, after re-validating the price (prebook) and human
+    confirmation. Structural twin of book_flight."""
+    store, policy, state = ctx.store, ctx.policy, ctx.state
+    offer_slot = args["offer_slot"]
+
+    routing = _get_routing(state)
+    if routing is None:
+        return _terminal_error(_ROUTING_MISSING, store)
+    provider = str(routing["provider"])
+    policy.before_action("book_hotel", "provider", LVal(provider, Label.T_pub()), Role.ROUTING)
+
+    key = ctx.config.liteapi_key
+    if not key:
+        return _terminal_error("LITEAPI_SANDBOX_KEY is not set", store)
+    guest = ctx.config.passenger
+    if not guest:
+        return _terminal_error(
+            "no guest profile configured — set [passenger] (given_name, family_name, email)", store)
+
+    if not store.is_written(offer_slot):
+        return _terminal_error(f"offer_slot '{offer_slot}' not written", store)
+    try:
+        released = _release_slot(
+            policy, slot_id=offer_slot, state=state, routing=routing,
+            who="provider", not_from="fetched hotel offers",
+        )
+    except (ReleaseTransformError, IronFlowViolation) as exc:
+        return _terminal_error(str(exc), store)
+    pick     = released.value
+    hotel_id = str(pick["hotel_id"])
+    checkin  = str(pick["checkin"])
+    checkout = str(pick["checkout"])
+    country  = str(pick.get("country_code", "")) or "GB"
+    currency = str(pick.get("currency", "")) or "GBP"
+    hotel    = str(pick.get("hotel", "")) or hotel_id
+    try:
+        adults = max(1, int(pick.get("adults", 1) or 1))
+    except (TypeError, ValueError):
+        adults = 1
+
+    headers = _liteapi_headers(key)
+    # Re-search THIS hotel for a FRESH offer — LiteAPI rate offers expire quickly and
+    # the plan→execute latency can stale the processor's pick. The fresh search picks
+    # the cheapest current offer; prebook then returns the authoritative price, and
+    # that is what the ceiling and the human grant bind to.
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+        rt_resp = await client.post(f"{_LITEAPI_BASE}/hotels/rates", headers=headers,
+            json={"hotelIds": [hotel_id], "checkin": checkin, "checkout": checkout,
+                  "occupancies": [{"adults": adults}], "currency": currency,
+                  "guestNationality": country})
+    if rt_resp.status_code >= 400:
+        return _provider_error(rt_resp, "hotel re-search", store)
+    fresh_offer, fresh_amount = "", None
+    for h in rt_resp.json().get("data", []):
+        for rtp in h.get("roomTypes", []):
+            for r in rtp.get("rates", []):
+                tot = (r.get("retailRate") or {}).get("total") or []
+                if not tot or tot[0].get("amount") is None:
+                    continue
+                amt = tot[0]["amount"]
+                if fresh_amount is None or float(amt) < float(fresh_amount):
+                    fresh_amount, fresh_offer = amt, rtp.get("offerId", "")
+                    currency = tot[0].get("currency", currency)
+    if not fresh_offer:
+        return _terminal_error(f"{hotel} no longer available for {checkin}–{checkout}", store)
+
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+        pre_resp = await client.post(f"{_LITEAPI_BASE}/rates/prebook",
+                                     headers=headers, json={"offerId": fresh_offer, "usePaymentSdk": False})
+    if pre_resp.status_code >= 400:
+        return _provider_error(pre_resp, "hotel offer not bookable (prebook)", store)
+    pre        = pre_resp.json().get("data", {})
+    prebook_id = str(pre.get("prebookId", ""))
+    amount     = str(pre.get("price", "") or fresh_amount)
+    currency   = str(pre.get("currency", "") or currency)
+    offer_id   = fresh_offer
+    if not prebook_id:
+        return _terminal_error("prebook returned no prebookId", store)
+
+    if err := _check_spend_ceiling(ctx.config.max_booking_amount or "", amount, currency, "rate"):
+        return _terminal_error(err, store)
+
+    _trace.emit(_trace.EvBookingProposed(owner=hotel, route="",
+                                         amount=amount, currency=currency, offer_id=offer_id))
+    choice = await ctx.confirm_slot([{"label": f"{hotel} — {amount} {currency}",
+                                      "start": "", "end": ""}])
+    if choice != 1:
+        _trace.emit(_trace.EvBookHotel(provider=provider, offer_id=offer_id, amount=amount,
+            currency=currency, hotel=hotel, booking_id="", confirmed=False))
+        return _terminal_error("hotel booking not confirmed by human", store)
+
+    try:
+        policy.issue_action_grant(state, tool="book_hotel", fields={"amount": amount})
+    except IronFlowViolation as exc:
+        return _terminal_error(str(exc), store)
+    policy.before_action("book_hotel", "amount", LVal(amount, Label.T_pub()), Role.ROUTING)
+
+    g      = dict(guest)
+    holder = {"firstName": g.get("given_name", ""), "lastName": g.get("family_name", ""),
+              "email": g.get("email", "")}
+    # Only one guest profile is configurable ([passenger]) — same limitation as
+    # book_flight's single passenger. What we CAN fix without a multi-guest config
+    # feature is the occupant COUNT: submit one entry per confirmed adult (all
+    # sharing the one configured identity) instead of silently booking 1 guest
+    # against an N-adult prebook.
+    guests = [
+        {"occupancyNumber": i, "firstName": g.get("given_name", ""),
+         "lastName": g.get("family_name", ""), "email": g.get("email", ""), "remarks": ""}
+        for i in range(1, adults + 1)
+    ]
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+        bk_resp = await client.post(f"{_LITEAPI_BASE}/rates/book", headers=headers,
+            json={"prebookId": prebook_id, "holder": holder, "guests": guests,
+                  "payment": {"method": "WALLET"}})
+    if bk_resp.status_code >= 400:
+        _trace.emit(_trace.EvBookHotel(provider=provider, offer_id=offer_id, amount=amount,
+            currency=currency, hotel=hotel, booking_id="", confirmed=False))
+        return _provider_error(bk_resp, "LiteAPI booking", store)
+    bk         = bk_resp.json().get("data", {})
+    booking_id = str(bk.get("bookingId", ""))
+    hotel_name = str((bk.get("hotel") or {}).get("name", "") or hotel)
+
+    # LiteAPI's /rates/book request has no price field — it cannot enforce the
+    # grant-endorsed `amount` server-side. The booking has already happened by
+    # this point (irreversible), so a mismatch cannot be blocked — but it must
+    # be surfaced honestly rather than silently reporting the stale pre-booking
+    # estimate as if it were what was actually charged.
+    charged_amount   = str(bk.get("price", "")) or amount
+    charged_currency = str(bk.get("currency", "")) or currency
+    try:
+        amount_mismatch = (
+            charged_currency != currency or abs(float(charged_amount) - float(amount)) > 0.01
+        )
+    except ValueError:
+        amount_mismatch = True
+
+    _trace.emit(_trace.EvBookHotel(provider=provider, offer_id=offer_id,
+        amount=charged_amount, currency=charged_currency, hotel=hotel_name,
+        booking_id=booking_id, confirmed=True,
+        amount_endorsed=amount, currency_endorsed=currency))
+    final = {"provider": provider, "booking_id": booking_id,
+             "amount": charged_amount, "currency": charged_currency, "hotel": hotel_name,
+             "amount_endorsed": amount, "currency_endorsed": currency,
+             "amount_mismatch": amount_mismatch}
+    if amount_mismatch:
+        final["warning"] = (
+            f"LiteAPI charged {charged_amount} {charged_currency}, which differs from "
+            f"the human-endorsed {amount} {currency} — /rates/book accepts no price "
+            f"field to enforce this server-side; the booking has already been made"
+        )
+    return json.dumps(final), final
+
+
 _HANDLERS: dict[str, _Handler] = {
     "mcp_page_content":    _handle_mcp_page_content,
     "mcp_email_search":    _handle_mcp_email_search,
     "mcp_calendar_search": _handle_mcp_calendar_search,
-    "mcp_flight_search":   _handle_mcp_search,
-    "mcp_hotel_search":    _handle_mcp_search,
+    "mcp_flight_search":   _handle_duffel_flight_search,
+    "mcp_hotel_search":    _handle_liteapi_hotel_search,
     "spawn_processor":     _handle_spawn_processor,
     "send_summary":        _handle_send_summary,
     "send_reply":          _handle_send_reply,
     "schedule_meeting":    _handle_schedule_meeting,
     "modify_emails":       _handle_modify_emails,
+    "book_flight":         _handle_book_flight,
+    "book_hotel":          _handle_book_hotel,
 }
 
 
@@ -1179,6 +1510,8 @@ _DRIVER_ROUTING_FIELDS: dict[str, list[str]] = {
     "send_reply":       ["recipient", "subject"],
     "schedule_meeting": ["attendee", "event_title", "reply_subject"],
     "modify_emails":    ["sender", "action"],
+    "book_flight":      ["provider"],
+    "book_hotel":       ["provider"],
 }
 
 def _release_gate_for(
@@ -1224,6 +1557,10 @@ async def run(
     task: str, plan: dict, store: SlotStore, policy: IronFlow,
     *,
     google_token: str = "",
+    duffel_token: str = "",
+    liteapi_key: str = "",
+    passenger: Mapping[str, str] | None = None,
+    max_booking_amount: str = "",
     anthropic_api_key: str = "",
     confirm_slot: Callable[[list[dict]], Awaitable[int]] = _default_confirm_slot,
     routing: dict | None = None,
@@ -1251,7 +1588,9 @@ async def run(
         )
 
     driver = driver_spec()
-    config = ProviderConfig(google_token=google_token,
+    config = ProviderConfig(google_token=google_token, duffel_token=duffel_token,
+                            liteapi_key=liteapi_key, passenger=passenger,
+                            max_booking_amount=max_booking_amount,
                             anthropic_api_key=anthropic_api_key)
     state  = PlanState(trusted_action_urls=tuple(plan.get("trusted_action_urls", [])))
     ctx    = _StepContext(
@@ -1376,6 +1715,10 @@ async def run_manifest(
     plan: dict,
     *,
     google_token: str = "",
+    duffel_token: str = "",
+    liteapi_key: str = "",
+    passenger: Mapping[str, str] | None = None,
+    max_booking_amount: str = "",
     anthropic_api_key: str = "",
     confirm_slot: Callable[[list[dict]], Awaitable[int]] = _default_confirm_slot,
 ) -> dict:
@@ -1398,6 +1741,8 @@ async def run_manifest(
         policy = IronFlow(store)
         result = await run(task, plan, store, policy,
                            google_token=google_token,
+                           duffel_token=duffel_token, liteapi_key=liteapi_key,
+                           passenger=passenger, max_booking_amount=max_booking_amount,
                            anthropic_api_key=anthropic_api_key, confirm_slot=confirm_slot)
         if result.get("status") != "success" and _world_action_committed(result):
             result = {**result, "do_not_retry": True}
@@ -1430,7 +1775,9 @@ async def run_manifest(
         policy = IronFlow(store)
         sub_result = await run(task, sub, store, policy,
                                google_token=google_token,
-                               anthropic_api_key=anthropic_api_key, confirm_slot=confirm_slot, routing=rb)
+                               duffel_token=duffel_token, liteapi_key=liteapi_key,
+                           passenger=passenger, max_booking_amount=max_booking_amount,
+                           anthropic_api_key=anthropic_api_key, confirm_slot=confirm_slot, routing=rb)
         results.append(sub_result)
         violations.extend(sub_result.get("violations", []))
 

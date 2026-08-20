@@ -380,35 +380,20 @@ _MCP_SPECS: list[MCPSpec] = [
         name           = "mcp_flight_search",
         capability     = Capability.FLIGHT_SEARCH,
         tool_type      = "mcp",
-        domain         = "https://mcp.kiwi.com",
-        mcp_tool       = "search-flight",
-        booking_domain = "https://kiwi.com/",
-        date_fmt       = "%d/%m/%Y",
-        param_map      = {
-            "origin":       "flyFrom",
-            "destination":  "flyTo",
-            "date":         "departureDate",
-            "return_date":  "returnDate",
-            "passengers":   "passengers",
-            "cabin_class":  "cabinClass",
-        },
-        value_maps     = {
-            "cabinClass": {"economy": "M", "premium_economy": "W", "business": "C", "first": "F"},
-        },
+        domain         = "https://api.duffel.com/air",
+        mcp_tool       = "offer_requests",
+        param_map      = {"date": "departure_date"},
     ),
 
     MCPSpec(
         name           = "mcp_hotel_search",
         capability     = Capability.HOTEL_SEARCH,
         tool_type      = "mcp",
-        domain         = "https://mcp.trivago.com/mcp",
-        mcp_tool       = "trivago-accommodation-search",
-        booking_domain = "https://www.trivago.com/",
+        domain         = "https://api.liteapi.travel/v3.0",
+        mcp_tool       = "hotels/rates",
         param_map      = {
-            "city":       "query",
-            "check_in":   "arrival",
-            "check_out":  "departure",
-            "adults":     "adults",
+            "check_in":   "checkin",
+            "check_out":  "checkout",
         },
     ),
 
@@ -470,6 +455,26 @@ _CATALOG_SPECS: list[CatalogSpec] = [
             ArgSpec("sender",     "str", description="verbatim sender name or email from task (Gmail from: filter accepts both)"),
             ArgSpec("action",     "str", description="add_label | remove_label | archive | mark_read | mark_unread | star | unstar"),
             ArgSpec("label_name", "str", required=False, description="verbatim Gmail label name — required for add_label and remove_label only"),
+        ),
+    ),
+
+    CatalogSpec(
+        name        = "book_flight",
+        category    = "terminal_confirmed",
+        description = "Book the flight offer chosen by spawn_processor (Duffel), paid from the operator's prepaid Duffel balance, after human confirmation. provider is (T,pub); the amount is re-validated against Duffel and human-endorsed. Passenger details and the spend ceiling come from operator config, never the task or a slot.",
+        args        = (
+            ArgSpec("provider",   "str", description="booking provider — must be 'duffel'"),
+            ArgSpec("offer_slot", "str", description="slot written by spawn_processor holding the chosen offer as {offer_id, total_amount, total_currency}"),
+        ),
+    ),
+
+    CatalogSpec(
+        name        = "book_hotel",
+        category    = "terminal_confirmed",
+        description = "Book the hotel offer chosen by spawn_processor (LiteAPI), paid from the operator's prepaid LiteAPI wallet, after human confirmation. provider is (T,pub); the amount is re-validated via LiteAPI prebook and human-endorsed. Guest details and the spend ceiling come from operator config, never the task or a slot.",
+        args        = (
+            ArgSpec("provider",   "str", description="booking provider — must be 'liteapi'"),
+            ArgSpec("offer_slot", "str", description="slot written by spawn_processor holding the chosen offer as {offer_id, amount, currency}"),
         ),
     ),
 

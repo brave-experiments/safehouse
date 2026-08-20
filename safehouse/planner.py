@@ -142,6 +142,45 @@ class PipelinePattern:
 _PIPELINE_SHAPES: list[PipelinePattern] = [
 
     PipelinePattern(
+        driver_tool = "book_flight",
+        description = (
+            "BOOK/RESERVE/PURCHASE a flight (not just search or email). "
+            "Search flights, pick the cheapest via spawn_processor, then book_flight — "
+            "paid from the operator's Duffel balance after human confirmation. "
+            "Use this (NOT send_summary) whenever the task says book / reserve / purchase a flight. "
+            "ROUND / RETURN trips: use ONE mcp_flight_search with both date AND return_date — that "
+            "returns a single round-trip offer covering BOTH legs. Do NOT run two one-way searches; "
+            "book_flight books one offer_id, so two one-ways would book only the outbound leg."
+        ),
+        example     = """\
+{"steps": [
+  {"tool": "mcp_flight_search", "args": {
+    "params": {"origin": "<IATA verbatim>", "destination": "<IATA verbatim>", "date": "<verbatim>", "return_date": "<verbatim if round trip, else omit>"}, "slot_id": "flight_offers"}},
+  {"tool": "spawn_processor", "args": {
+    "reads": ["flight_offers"], "out_slot": "best_offer",
+    "instruction": "From the offers JSON, select the single cheapest (each offer already covers all legs). Output ONLY valid JSON: {\"offer_id\": \"<id>\", \"total_amount\": \"<amount>\", \"total_currency\": \"<ccy>\"}"}},
+  {"tool": "book_flight", "args": {"provider": "duffel", "offer_slot": "best_offer"}}
+]}""",
+    ),
+    PipelinePattern(
+        driver_tool = "book_hotel",
+        description = (
+            "BOOK/RESERVE a hotel (not just search). Search hotels, pick the cheapest via "
+            "spawn_processor, then book_hotel — paid from the operator's LiteAPI wallet after "
+            "human confirmation. country_code is the ISO-2 code inferred from the city "
+            "(e.g. Lisbon → PT). Use this (NOT send_summary) whenever the task says book/reserve a hotel."
+        ),
+        example     = """\
+{"steps": [
+  {"tool": "mcp_hotel_search", "args": {
+    "params": {"city": "<city verbatim>", "country_code": "<ISO-2 for the city>", "check_in": "<verbatim>", "check_out": "<verbatim>", "adults": 1}, "slot_id": "hotel_offers"}},
+  {"tool": "spawn_processor", "args": {
+    "reads": ["hotel_offers"], "out_slot": "best_hotel",
+    "instruction": "From the offers JSON, select the single best-value entry and output it VERBATIM as JSON, copying every field of that entry exactly: {\"offer_id\": ..., \"hotel_id\": ..., \"hotel\": ..., \"checkin\": ..., \"checkout\": ..., \"adults\": ..., \"country_code\": ..., \"amount\": ..., \"currency\": ...}"}},
+  {"tool": "book_hotel", "args": {"provider": "liteapi", "offer_slot": "best_hotel"}}
+]}""",
+    ),
+    PipelinePattern(
         driver_tool = "send_summary",
         description = "Fetch content, emails, or search results, synthesise, and email the result to a recipient.",
         example     = """\
@@ -552,6 +591,18 @@ TOOL_SCHEMA: dict[str, ToolContract] = {
         email_fields    = ("attendee",),
         slot_refs       = ("slots_slot",),
         max_email_list  = 10,
+        is_driver_tool  = True,
+    ),
+    "book_flight": ToolContract(
+        required        = ("provider", "offer_slot"),
+        slot_refs       = ("offer_slot",),
+        literal_fields  = {"provider": frozenset({"duffel"})},
+        is_driver_tool  = True,
+    ),
+    "book_hotel": ToolContract(
+        required        = ("provider", "offer_slot"),
+        slot_refs       = ("offer_slot",),
+        literal_fields  = {"provider": frozenset({"liteapi"})},
         is_driver_tool  = True,
     ),
     "modify_emails": ToolContract(

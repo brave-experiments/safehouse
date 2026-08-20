@@ -66,6 +66,10 @@ class RunConfig:
     interactive:    bool              # default sys.stdin.isatty(); --non-interactive forces False
     timeout_s:      float | None      # --timeout SECONDS; None = no ceiling
     anthropic_api_key: str | None     # resolved: env > config file
+    duffel_token:      str | None     # resolved: env > config file (Duffel flights)
+    liteapi_key:       str | None     # resolved: env > config file (LiteAPI hotels)
+    passenger:         dict | None    # trusted passenger/guest profile from config
+    max_booking_amount: str | None    # operator spend ceiling
     google_token:      str | None     # resolved: env > config file
 
     @classmethod
@@ -196,6 +200,10 @@ class RunConfig:
             interactive  = interactive,
             timeout_s    = args.timeout_s if args.timeout_s is not None else settings.timeout,
             anthropic_api_key = settings.anthropic_api_key,
+            duffel_token      = settings.duffel_token,
+            liteapi_key       = settings.liteapi_key,
+            passenger         = settings.passenger,
+            max_booking_amount = settings.max_booking_amount,
             google_token      = settings.google_token,
         )
 

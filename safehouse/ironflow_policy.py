@@ -58,6 +58,8 @@ if TYPE_CHECKING:
 # they require a single-use ActionGrant issued after human confirmation.
 _GRANT_REQUIRED: frozenset[tuple[str, str]] = frozenset({
     ("schedule_meeting", "start_time"),
+    ("book_flight",      "amount"),
+    ("book_hotel",       "amount"),
     ("schedule_meeting", "end_time"),
 })
 

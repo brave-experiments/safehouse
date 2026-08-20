@@ -161,13 +161,14 @@ def test_map_to_concrete_strips_llm_trusted_action_urls() -> None:
 
 
 def test_map_to_concrete_hotel_param_rename() -> None:
-    """trivago param_map: city→query, check_in→arrival, check_out→departure."""
+    """LiteAPI param_map: check_in→checkin, check_out→checkout; city/country_code pass through."""
     abstract = {
         "steps": [
             {"tool": "mcp_hotel_search", "args": {
                 "capability": "HOTEL_SEARCH",
                 "params": {
                     "city": "Lisbon",
+                    "country_code": "PT",
                     "check_in": "2026-08-01",
                     "check_out": "2026-08-04",
                 },
@@ -178,9 +179,11 @@ def test_map_to_concrete_hotel_param_rename() -> None:
     }
     result = _map_to_concrete(abstract, DEFAULT_REGISTRY)
     sp = result["steps"][0]["args"]["search_params"]
-    assert sp.get("query") == "Lisbon",  "city should be renamed to query"
-    assert sp.get("arrival") == "2026-08-01", "check_in should be renamed to arrival"
-    assert "city" not in sp,  "old param name must be gone"
+    assert sp.get("city") == "Lisbon",         "city passes through unchanged"
+    assert sp.get("country_code") == "PT",     "country_code passes through unchanged"
+    assert sp.get("checkin") == "2026-08-01",  "check_in should be renamed to checkin"
+    assert sp.get("checkout") == "2026-08-04", "check_out should be renamed to checkout"
+    assert "check_in" not in sp,  "old param name must be gone"
 
 
 def test_map_to_concrete_strips_system_prompt_from_mcp() -> None:

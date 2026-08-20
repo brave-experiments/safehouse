@@ -7,7 +7,6 @@ Three sections, matching the architecture:
     run_mcp_page_content     — HTTP fetch + HTML denoising → (U,pub) slot
     run_mcp_email_search     — Gmail REST API → (U,priv) slot
     run_mcp_calendar_search  — Google Calendar REST API → (U,priv) slot
-    run_mcp_search           — MCP call + deterministic URL extract → (U,pub) slot
 
   TIER 2 — PROCESSOR SUB-AGENTS (isolated SDK call, no tools, reads slots only):
     run_processor   — synthesise / transform (used by spawn_processor)
@@ -26,12 +25,11 @@ from __future__ import annotations
 import asyncio
 import base64
 import html as _html
-import contextlib
 import json
 import re
 import shutil
 import sys
-from urllib.parse import urlparse, urljoin, quote
+from urllib.parse import urljoin, quote
 
 import anthropic
 import httpx
@@ -42,18 +40,6 @@ from .permissions import AgentSpec
 from .ironflow_policy import IronFlow, IronFlowViolation
 from . import trace as _trace
 
-try:
-    from mcp import ClientSession
-    from mcp.client.streamable_http import streamablehttp_client
-    _MCP_AVAILABLE = True
-    import logging as _logging
-    # Suppress benign "Session termination failed: 501" from MCP session cleanup.
-    # Logger-level suppression is async-safe; concurrent MCP calls share the logger.
-    _logging.getLogger("mcp").setLevel(_logging.CRITICAL)
-    _logging.getLogger("mcp.client.streamable_http").setLevel(_logging.CRITICAL)
-    _logging.getLogger("httpx").setLevel(_logging.WARNING)
-except ImportError:
-    _MCP_AVAILABLE = False
 
 
 class ProviderAuthError(RuntimeError):
@@ -652,269 +638,220 @@ async def run_mcp_calendar_search(
     writer.write(content)
 
 
-# ── run_mcp_search helpers ────────────────────────────────────────────
+# ── Duffel flights REST ───────────────────────────────────────────────
+_LITEAPI_VERSION = "v3.0"
+_DUFFEL_VERSION = "v2"
 
-_URL_FIELDS = (
-    "deepLink", "deep_link", "booking_url", "booking_link",
-    "Accommodation URL", "link", "url",
-)
-_CONTEXT_FIELDS = (
-    # Kiwi flight fields
-    "price", "totalPrice", "total_price", "fare", "amount",
-    "flyFrom", "flyTo", "cityFrom", "cityTo", "origin", "destination",
-    "route", "duration", "airlines",
-    # trivago hotel fields
-    "name", "hotel_name", "property_name",
-    "Accommodation Name", "Price Per Stay", "Price Per Night",
-    "Hotel Rating", "Review Rating", "Review Count",
-    "Distance To City Center", "Address", "Top Amenities",
-)
-
-
-def _extract_booking_urls(mcp_text: str, trusted_action_urls: list[str]) -> tuple[list[dict], str]:
-    """
-    Deterministic extraction of booking URLs from an MCP response.
-    Never calls an LLM — injection-safe.
-
-    Strategy 1a (top-level JSON): walks known container keys, extracts one URL
-    per result object and captures context fields (price, name, route) so the
-    downstream processor can correlate each URL with the option it ranks.
-
-    Strategy 1b (embedded JSON): when the MCP response is mixed text + JSON
-    fragments (e.g. trivago); scans for embedded objects containing list-valued
-    keys and applies the same URL extraction.
-
-    Strategy 2 (regex fallback): when no parseable JSON is found; extracts raw
-    URLs from the text with no context available.
-
-    Returns (results, strategy) where strategy is "json" | "regex" | "none".
-    results is a list of {"url": str, "context": dict}, deduplicated, in response order.
-    Empty list if no trusted-domain URLs are found.
-
-    trusted excludes entries where netloc is empty — an unparseable trusted URL must
-    never match a malformed candidate URL that also produces netloc="".
-    """
-    # Trust requires both matching scheme AND host (case-insensitive).
-    # A netloc-only check would allow http://kiwi.com to match a trust list
-    # containing only https://kiwi.com — a scheme-downgrade bypass.
-    trusted: set[tuple[str, str]] = {
-        (p.scheme, p.netloc.lower())
-        for u in trusted_action_urls
-        if (p := urlparse(u)).netloc
+def _duffel_auth_headers(duffel_token: str = "") -> dict[str, str]:
+    """Bearer + version headers for the Duffel API. Token is operator-supplied; never logged."""
+    return {
+        "Authorization":  f"Bearer {duffel_token}",
+        "Duffel-Version":  _DUFFEL_VERSION,
+        "Content-Type":    "application/json",
+        "Accept":          "application/json",
     }
-    results: list[dict] = []
-    seen: set[str] = set()
 
-    def _scan(candidates: list[object]) -> None:
-        for obj in candidates:
-            if not isinstance(obj, dict):
-                continue
-            for field in _URL_FIELDS:
-                val = obj.get(field, "")
-                if isinstance(val, str) and val.startswith("http"):
-                    p = urlparse(val)
-                    if (p.scheme, p.netloc.lower()) in trusted and val not in seen:
-                        seen.add(val)
-                        results.append({
-                            "url":     val,
-                            "context": {k: obj[k] for k in _CONTEXT_FIELDS if k in obj},
-                        })
-                        break  # one URL per result object
-
-    # Strategy 1a: top-level array (Kiwi) or dict with known container keys.
-    # Only extracted sub-lists are scanned — not the envelope dict itself —
-    # to avoid an envelope-level self-link consuming the one-URL-per-object slot.
-    # If no known key matches, scan ALL list values in the dict — different MCP
-    # servers use different envelope keys ("itineraries", "data", "offers", …).
-    try:
-        data = json.loads(mcp_text)
-        if isinstance(data, list):
-            _scan(data)
-        elif isinstance(data, dict):
-            candidates: list = []
-            for key in ("flights", "results", "hotels", "accommodations", "items", "output",
-                        "data", "itineraries", "offers", "content"):
-                v = data.get(key)
-                if isinstance(v, list):
-                    candidates.extend(v)
-                elif isinstance(v, str):
-                    with contextlib.suppress(json.JSONDecodeError):
-                        inner = json.loads(v)
-                        if isinstance(inner, list):
-                            candidates.extend(inner)
-            if not candidates:  # unknown envelope key — scan any list containing dicts
-                for v in data.values():
-                    if isinstance(v, list) and any(isinstance(x, dict) for x in v):
-                        candidates.extend(v)
-            _scan(candidates)
-    except (json.JSONDecodeError, AttributeError):
-        pass
-
-    if results:
-        return results, "json"
-
-    # Strategy 1b: scan for embedded JSON arrays OR objects using raw_decode.
-    # Handles MCP responses that mix plain-text with a JSON body — e.g.:
-    #   "Here are the results:\n[{\"deepLink\": \"https://kiwi.com/u/...\", ...}]"
-    # Strategy 1a's json.loads fails on the text prefix; raw_decode finds the
-    # '[' or '{' start and decodes from there. Always prefer the earlier start
-    # character so an array at position 20 is not missed in favour of a '{'
-    # at position 21 (which would be inside the array, not the array itself).
-    _decoder = json.JSONDecoder()
-    pos = 0
-    while pos < len(mcp_text):
-        obj_pos = mcp_text.find("{", pos)
-        arr_pos = mcp_text.find("[", pos)
-        if obj_pos == -1 and arr_pos == -1:
-            break
-        if obj_pos == -1:
-            start = arr_pos
-        elif arr_pos == -1:
-            start = obj_pos
-        else:
-            start = min(obj_pos, arr_pos)
-        try:
-            parsed, end = _decoder.raw_decode(mcp_text, start)
-            pos = end
-            if isinstance(parsed, list):
-                _scan(parsed)
-            elif isinstance(parsed, dict):
-                for key in ("output", "results", "hotels", "accommodations",
-                            "flights", "items", "data", "itineraries"):
-                    v = parsed.get(key)
-                    if isinstance(v, str):
-                        with contextlib.suppress(json.JSONDecodeError):
-                            inner = json.loads(v)
-                            if isinstance(inner, list):
-                                _scan(inner)
-                    elif isinstance(v, list):
-                        _scan(v)
-            if results:
-                return results, "json"
-        except json.JSONDecodeError:
-            pos = start + 1
-
-    # Strategy 2: regex fallback — URL only, no context.
-    # Decode \uXXXX escape sequences that some MCP servers (e.g. trivago) emit
-    # as literal text rather than proper JSON unicode escapes.
-    _UESCAPE = re.compile(r'\\u([0-9a-fA-F]{4})')
-    for url in re.findall(r'https?://[^\s\'"<>]+', mcp_text):
-        url = url.rstrip(".,;)")
-        url = _UESCAPE.sub(lambda m: chr(int(m.group(1), 16)), url)
-        p = urlparse(url)
-        if (p.scheme, p.netloc.lower()) in trusted and url not in seen:
-            seen.add(url)
-            results.append({"url": url, "context": {}})
-
-    return results, ("regex" if results else "none")
-
-
-def _unwrap_exc(exc: BaseException) -> BaseException:
-    """Recursively unwrap ExceptionGroup until a concrete exception is reached."""
-    while isinstance(exc, BaseExceptionGroup) and exc.exceptions:
-        exc = exc.exceptions[0]
-    return exc
-
-
-# ── run_mcp_search ─────────────────────────────────────────────────────
-
-async def run_mcp_search(
-    spec:                AgentSpec,
-    domain:              str,
-    mcp_tool:            str,
-    search_params:       dict,
-    writer:              SlotWriter,
-    policy:              IronFlow,
-    trusted_action_urls: list[str] | None = None,
-    location_tool:       str | None = None,
+async def run_duffel_flight_search(
+    spec:          AgentSpec,
+    base_url:      str,
+    search_params: dict,
+    writer:        SlotWriter,
+    policy:        IronFlow,
+    *,
+    duffel_token:  str = "",
+    limit:         int = 10,
 ) -> None:
     """
-    Tier 1 Data Sub-Agent (MCP): operator code only — no LLM.
+    Tier 1 Data Sub-Agent (Duffel REST): operator code only — no LLM.
 
-    Step 0 — Optional location pre-lookup (e.g. trivago-search-suggestions).
-              Resolves a city name to a numeric id/ns — deterministic, not injectable.
-    Step 1 — Operator code calls the MCP server via ClientSession.call_tool().
-    Step 2 — Operator code extracts booking URLs deterministically
-              via _extract_booking_urls() (JSON parse → regex fallback, no LLM).
-    Step 3 — Structured results (BOOKING_URLS_JSON + BOOKING_URL) written to
-              the slot in MCP response order. Ranking is delegated to a downstream
-              spawn_processor step — LLM processing stays outside the fetcher tier.
+    POST {base_url}/offer_requests?return_offers=true → offers, then write the
+    top-`limit` cheapest as a JSON array to a (U,pub) slot. Each entry carries
+    what spawn_processor needs to pick and book_flight needs to re-validate. Ranking is delegated to the downstream spawn_processor step.
 
-    Security: URL provenance is the MCP server (operator-declared infrastructure),
-    then domain-validated again by the Tier 3 driver tool before any booking fires.
+    Auth: duffel_token (operator-supplied; injected by the driver, never reaching
+    an LLM sub-agent or a slot).
     """
-    if not _MCP_AVAILABLE:
-        raise RuntimeError("mcp package required: pip install 'mcp[cli]'")
-
-    _trace.emit(_trace.EvFetch(agent_id=spec.id, url=domain, mcp_tool=mcp_tool, shallow=False))
-    policy.before_network(spec, domain)
-
-    params = dict(search_params)
+    if not duffel_token:
+        raise RuntimeError(
+            "Duffel flight search requires DUFFEL_ACCESS_TOKEN (none provided)."
+        )
+    origin      = str(search_params.get("origin", "")).strip()
+    destination = str(search_params.get("destination", "")).strip()
+    depart      = str(search_params.get("departure_date", "")).strip()
+    if not (origin and destination and depart):
+        raise RuntimeError(
+            "duffel flight search requires origin, destination, departure_date "
+            f"(got {search_params!r})"
+        )
     try:
-        async with streamablehttp_client(domain) as (read, write, _):
-            async with ClientSession(read, write) as session:
-                await session.initialize()
+        adults = max(1, int(search_params.get("passengers", 1) or 1))
+    except (TypeError, ValueError):
+        adults = 1
+    cabin  = str(search_params.get("cabin_class", "economy")).strip() or "economy"
+    return_date = str(search_params.get("return_date", "")).strip()
 
-                if location_tool and "location_query" in params:
-                    loc_query = params.pop("location_query")
-                    loc_result = await session.call_tool(
-                        location_tool, arguments={"query": loc_query}
-                    )
-                    loc_text = "\n".join(
-                        c.text for c in loc_result.content if hasattr(c, "text")
-                    )
-                    id_m = re.search(r'ID:(\d+)', loc_text)
-                    ns_m = re.search(r'NS:(\d+)', loc_text)
-                    if id_m and ns_m:
-                        params["id"] = int(id_m.group(1))
-                        params["ns"] = int(ns_m.group(1))
-                    else:
-                        raise RuntimeError(
-                            f"location pre-lookup '{location_tool}' returned no ID/NS"
-                        )
+    # One slice = one-way; two slices (outbound + return) = a single round-trip
+    # offer request → Duffel returns offers that cover BOTH legs at one total.
+    slices = [{"origin": origin, "destination": destination, "departure_date": depart}]
+    if return_date:
+        slices.append({"origin": destination, "destination": origin, "departure_date": return_date})
 
-                result   = await session.call_tool(mcp_tool, arguments=params)
-                mcp_text = "\n".join(
-                    c.text for c in result.content if hasattr(c, "text")
-                )
-    except Exception as exc:
-        # Unwrap ExceptionGroup raised by anyio TaskGroup inside streamablehttp_client.
-        inner = _unwrap_exc(exc)
-        if isinstance(inner, RuntimeError):
-            raise inner from exc
-        raise RuntimeError(f"MCP call failed for slot '{writer.slot_id}': {inner}") from exc
+    body = {"data": {
+        "slices":      slices,
+        "passengers":  [{"type": "adult"} for _ in range(adults)],
+        "cabin_class": cabin,
+    }}
 
-    # Step 2: extract booking URLs deterministically
-    booking_entries, extraction_strategy = _extract_booking_urls(mcp_text, trusted_action_urls or [])
-    _trace.emit(_trace.EvBookingUrlsExtracted(
-        agent_id=spec.id, slot_id=writer.slot_id,
-        count=len(booking_entries), strategy=extraction_strategy,
-        urls=[e["url"] for e in booking_entries],
-    ))
+    url = f"{base_url}/offer_requests?return_offers=true"
+    policy.before_network(spec, url)
+    _trace.emit(_trace.EvFetch(agent_id=spec.id, url=url, mcp_tool="offer_requests", shallow=False))
 
-    # Step 3: write structured results in MCP response order.
-    # Ranking is intentionally delegated to a downstream spawn_processor step
-    # so that LLM-based processing stays outside the deterministic fetcher tier.
-    # If no URLs were extracted, fall back to truncated raw text so the processor
-    # is not handed an empty slot.
-    # When the regex fallback ran (all contexts are empty), also include the raw
-    # MCP text — the processor needs pricing and routing data to rank options,
-    # and that data is only available in the original response at this point.
-    header = (
-        f"BOOKING_URLS_JSON: {json.dumps(booking_entries)}\n"
-        f"BOOKING_URL: {booking_entries[0]['url']}\n"
-    ) if booking_entries else ""
-    has_context = booking_entries and any(e.get("context") for e in booking_entries)
-    if not booking_entries:
-        content = " ".join(mcp_text.split()[:_MAX_WEB_WORDS])
-    elif has_context:
-        content = header
-    else:
-        raw_excerpt = " ".join(mcp_text.split()[:_MAX_WEB_WORDS])
-        content = header + f"\nRAW_MCP_RESPONSE:\n{raw_excerpt}"
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(url, headers=_duffel_auth_headers(duffel_token), json=body)
+        _require_ok(resp, "Duffel offer_requests")
+        try:
+            offers = resp.json().get("data", {}).get("offers", [])
+        except json.JSONDecodeError:
+            raise RuntimeError(
+                f"Duffel returned non-JSON body (status {resp.status_code}): {resp.text[:200]}"
+            )
 
-    writer.write(content)
+    def _price(o: dict) -> float:
+        try:
+            return float(o.get("total_amount", "inf"))
+        except (TypeError, ValueError):
+            return float("inf")
 
+    trimmed: list[dict] = []
+    for o in sorted(offers, key=_price)[: max(1, limit)]:
+        slices = o.get("slices") or []
+        legs = []
+        for sl in slices:
+            s = sl.get("segments") or []
+            if s:
+                legs.append(f'{s[0]["origin"]["iata_code"]}->{s[-1]["destination"]["iata_code"]}')
+        first_seg = (slices[0].get("segments") or [{}])[0] if slices else {}
+        last_seg  = (slices[-1].get("segments") or [{}])[-1] if slices else {}
+        trimmed.append({
+            "offer_id":       o.get("id", ""),
+            "total_amount":   o.get("total_amount", ""),   # covers ALL legs of the offer
+            "total_currency": o.get("total_currency", ""),
+            "owner":          (o.get("owner") or {}).get("name", ""),
+            "route":          " / ".join(legs),
+            "round_trip":     len(slices) > 1,
+            "departs":        first_seg.get("departing_at", ""),
+            "returns":        last_seg.get("arriving_at", "") if len(slices) > 1 else "",
+            "expires_at":     o.get("expires_at", ""),
+        })
+
+    writer.write(json.dumps(trimmed, indent=2) if trimmed else "(no flight offers found)")
+
+def _liteapi_headers(liteapi_key: str = "") -> dict[str, str]:
+    """API-key + content headers for LiteAPI. Key is operator-supplied; never logged."""
+    return {
+        "X-API-Key":    liteapi_key,
+        "Content-Type": "application/json",
+        "Accept":       "application/json",
+    }
+
+async def run_liteapi_hotel_search(
+    spec:          AgentSpec,
+    base_url:      str,
+    search_params: dict,
+    writer:        SlotWriter,
+    policy:        IronFlow,
+    *,
+    liteapi_key:   str = "",
+    limit:         int = 30,
+) -> None:
+    """
+    Tier 1 Data Sub-Agent (LiteAPI REST): operator code only — no LLM.
+
+    Resolve city → hotelIds+names+stars (GET /data/hotels), then POST
+    /hotels/rates, and write the top-`limit` cheapest as a JSON array to a
+    (U,pub) slot. `limit` defaults to the full /data/hotels lookup cap (30) so
+    that non-price constraints in the processor's instruction (e.g. a minimum
+    star rating) are evaluated against the whole fetched pool, not just the
+    cheapest slice. Each entry carries what spawn_processor needs to pick and
+    book_hotel needs to re-search before prebook.
+
+    Auth: liteapi_key (operator-supplied; injected by the driver, never a slot).
+    """
+    if not liteapi_key:
+        raise RuntimeError("LiteAPI hotel search requires LITEAPI_SANDBOX_KEY (none provided).")
+    city    = str(search_params.get("city", "")).strip()
+    country = str(search_params.get("country_code", "")).strip()
+    checkin = str(search_params.get("checkin", "")).strip()
+    checkout= str(search_params.get("checkout", "")).strip()
+    if not (city and country and checkin and checkout):
+        raise RuntimeError(
+            "LiteAPI hotel search requires city, country_code, checkin, checkout "
+            f"(got {search_params!r})"
+        )
+    try:
+        adults = max(1, int(search_params.get("adults", 1) or 1))
+    except (TypeError, ValueError):
+        adults = 1
+    headers = _liteapi_headers(liteapi_key)
+
+    hotels_url = (f"{base_url}/data/hotels?countryCode={quote(country)}"
+                  f"&cityName={quote(city)}&limit=30")
+    policy.before_network(spec, hotels_url)
+    _trace.emit(_trace.EvFetch(agent_id=spec.id, url=hotels_url, mcp_tool="data/hotels", shallow=False))
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        hresp = await client.get(hotels_url, headers=headers)
+        _require_ok(hresp, "LiteAPI hotels lookup")
+        hotel_meta = hresp.json().get("data", [])
+        names = {h.get("id"): h.get("name", "") for h in hotel_meta}
+        star_ratings = {h.get("id"): h.get("stars") for h in hotel_meta}
+
+    if not names:
+        writer.write("(no hotels found)")
+        return
+
+    rates_url = f"{base_url}/hotels/rates"
+    policy.before_network(spec, rates_url)
+    _trace.emit(_trace.EvFetch(agent_id=spec.id, url=rates_url, mcp_tool="hotels/rates", shallow=False))
+    body = {"hotelIds": list(names.keys()), "checkin": checkin, "checkout": checkout,
+            "occupancies": [{"adults": adults}], "currency": "GBP", "guestNationality": country}
+    async with httpx.AsyncClient(timeout=45.0) as client:
+        rresp = await client.post(rates_url, headers=headers, json=body)
+        _require_ok(rresp, "LiteAPI rates")
+        hotels = rresp.json().get("data", [])
+
+    def _cheapest(hotel: dict):
+        best = None
+        for rt in hotel.get("roomTypes", []):
+            for r in rt.get("rates", []):
+                tot = (r.get("retailRate") or {}).get("total") or []
+                if not tot:
+                    continue
+                amt = tot[0].get("amount")
+                if amt is None:
+                    continue
+                cand = {"offer_id": rt.get("offerId", ""), "amount": amt,
+                        "currency": tot[0].get("currency", ""), "board": r.get("boardName", "")}
+                if best is None or float(amt) < float(best["amount"]):
+                    best = cand
+        return best
+
+    picks = []
+    for h in hotels:
+        c = _cheapest(h)
+        if not c:
+            continue
+        c["hotel"] = names.get(h.get("hotelId"), h.get("hotelId", ""))
+        c["hotel_id"] = h.get("hotelId", "")
+        c["star_rating"] = star_ratings.get(h.get("hotelId"))
+        # Carry the search context so book_hotel can re-search this hotel for a
+        # FRESH offer just before prebook (LiteAPI rate offers expire quickly).
+        c["checkin"] = checkin
+        c["checkout"] = checkout
+        c["adults"] = adults
+        c["country_code"] = country
+        picks.append(c)
+    picks.sort(key=lambda x: float(x["amount"]))
+    writer.write(json.dumps(picks[: max(1, limit)], indent=2) if picks else "(no hotel offers found)")
 
 # ══════════════════════════════════════════════════════════════════════
 # TIER 2 — PROCESSOR SUB-AGENTS
