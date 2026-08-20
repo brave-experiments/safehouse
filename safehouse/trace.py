@@ -38,7 +38,7 @@ class EvPlanStep:
 @dataclass
 class EvAgentSpawned:
     """A sub-agent was created and authorised to run."""
-    kind:        str          # "mcp_page_content" | "mcp_search" | "mcp_email_search" | "processor"
+    kind:        str          # fetcher kind or "processor"
     agent_id:    str
     trust:       str          # "T" | "U"
     permissions: list[str]    # human-readable permission list
@@ -443,6 +443,7 @@ Event = (
     EvGate | EvEmailSent | EvActionFired |
     EvRoutingLocked | EvDeclassify | EvReplyActionFired |
     EvMeetingOptionsReady | EvMeetingConfirmation | EvActionGranted | EvMeetingScheduled |
+    EvBookingProposed | EvBookFlight | EvBookHotel |
     EvCalendarEventCreated |
     EvGithubIssueSelected | EvGithubPrSelected |
     EvGithubCommentProposed | EvGithubCommentAdded |

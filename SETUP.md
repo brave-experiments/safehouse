@@ -5,8 +5,7 @@ SafeHouse is a prompt-injection-resistant agent pipeline. This guide covers inst
 ## Prerequisites
 
 - **Python 3.12 or newer** with `venv` available
-- **An Anthropic API key**
-- **Claude Code CLI** (`claude`) — required for Tier 2 processor sub-agents. Install via `npm install -g @anthropic-ai/claude-code` or see [Claude Code docs](https://docs.anthropic.com/en/docs/claude-code/overview). Run `claude --version` to verify.
+- **An Anthropic API key** — the planner and the Tier 2 processor both call the Anthropic API in-process. There is no Claude Code CLI / `claude` binary to install.
 - **A Google account**, for tasks that read Gmail or Google Calendar, or send email
 
 ## Installation
@@ -109,11 +108,16 @@ export DEMO_RECIPIENT=you@example.com
 ```
 
 
-| Variable              | Required by                          | Notes                                                                         |
-| --------------------- | ------------------------------------ | ----------------------------------------------------------------------------- |
-| `ANTHROPIC_API_KEY`   | All tasks                            | —                                                                             |
-| `GOOGLE_ACCESS_TOKEN` | All tasks that use Gmail or Calendar | From the OAuth Playground; expires after ~1 hour                              |
-| `DEMO_RECIPIENT`      | Tasks that email their output        | Optional — overridden by `--recipient`; prompted at runtime if neither is set |
+| Variable                         | Required by                                      | Notes                                                                              |
+| -------------------------------- | ------------------------------------------------ | ---------------------------------------------------------------------------------- |
+| `ANTHROPIC_API_KEY`              | All tasks                                        | Planner and in-process Tier 2 processor                                            |
+| `GOOGLE_ACCESS_TOKEN`            | Tasks that use Gmail or Calendar                 | From the OAuth Playground; expires after ~1 hour                                   |
+| `DEMO_RECIPIENT`                 | Tasks that email their output                    | Optional — overridden by `--recipient`; prompted at runtime if neither is set      |
+| `DUFFEL_ACCESS_TOKEN`            | Flight search / `book_flight`                    | Duffel → Developers → Access tokens                                                |
+| `LITEAPI_SANDBOX_KEY`            | Hotel search / `book_hotel`                      | liteapi.travel dashboard → API Keys                                                |
+| `GITHUB_TOKEN`                   | GitHub issue/PR read, comment, or review         | PAT; `public_repo` or `repo`. Prefer `safehouse configure`                         |
+| `SAFEHOUSE_MIN_GITHUB_INTEGRITY` | Optional GitHub provenance floor                 | `merged` > `approved` > `unapproved` > `none` > `blocked`; unset disables the gate |
+| `SAFEHOUSE_MAX_BOOKING`          | Optional booking spend ceiling                   | e.g. `300 GBP`                                                                     |
 
 
 
@@ -141,7 +145,7 @@ safehouse --task "Fetch these two articles and email a briefing to you@example.c
 ```
 
 **Trip planning** — search flights and hotels, email the best options.
-Needs: `ANTHROPIC_API_KEY`, `GOOGLE_ACCESS_TOKEN`, `DEMO_RECIPIENT`
+Needs: `ANTHROPIC_API_KEY`, `GOOGLE_ACCESS_TOKEN`, `DEMO_RECIPIENT`, `DUFFEL_ACCESS_TOKEN`, `LITEAPI_SANDBOX_KEY`
 
 ```bash
 safehouse --task "Find flights LHR→LIS on 2026-08-01, hotel 3 nights, email the best combination"
@@ -180,6 +184,13 @@ Needs: `ANTHROPIC_API_KEY`, `GOOGLE_ACCESS_TOKEN`
 
 ```bash
 safehouse --task "Read the latest meeting request from sender@example.com and schedule a 30-minute meeting next week."
+```
+
+**GitHub comment** — read an issue, draft a reply, post it after confirmation.
+Needs: `ANTHROPIC_API_KEY`, `GITHUB_TOKEN`
+
+```bash
+safehouse --task "Comment on issue 42 in owner/repo summarising the discussion"
 ```
 
 **Travel audit** — read past and future calendar events, summarise total time away from home.
@@ -256,7 +267,7 @@ Exit codes are stable and script-safe:
 | `3`   | Planning failed — the planner rejected the task                                                                                                                |
 | `4`   | Policy violation — an IronFlow safety gate blocked the run. Worth monitoring separately from generic failures                                                  |
 | `5`   | Confirmation required — a headless run reached a step that needs human approval                                                                                |
-| `6`   | Credential error — the Google token could not be resolved (token_command failed, or the OAuth refresh token expired/was revoked). Re-run `safehouse configure` |
+| `6`   | Credential error — a provider rejected the credential (Google token_command/oauth failed, or a 401/403 mid-run). Re-run `safehouse configure` |
 | `130` | Interrupted (Ctrl-C)                                                                                                                                           |
 
 
