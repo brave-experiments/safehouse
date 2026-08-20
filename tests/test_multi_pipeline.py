@@ -251,7 +251,7 @@ def test_send_reply_carries_email_thread_id(monkeypatch):
             "subject": "Hello from Alice",
         }
 
-    async def _fake_processor(reads, reader, writer, *, system_prompt="", agent_id="", timeout=300):
+    async def _fake_processor(reads, reader, writer, *, system_prompt="", agent_id="", timeout=300, api_key=None):
         writer.write("Dear Alice, thank you for your email.")
 
     sent_args: list[dict] = []
@@ -334,7 +334,7 @@ def test_send_reply_thread_id_isolated_per_pipeline(monkeypatch):
             "subject": f"Subject {suffix}",
         }
 
-    async def _fake_processor(reads, reader, writer, *, system_prompt="", agent_id="", timeout=300):
+    async def _fake_processor(reads, reader, writer, *, system_prompt="", agent_id="", timeout=300, api_key=None):
         writer.write("reply body")
 
     sent_per_pipeline: list[str] = []
@@ -381,7 +381,7 @@ def test_schedule_meeting_carries_email_thread_headers(monkeypatch):
     async def _fake_cal(spec, filter_p, writer, policy, *, google_token=""):
         writer.write("No events")
 
-    async def _fake_processor(reads, reader, writer, *, system_prompt="", agent_id="", timeout=300):
+    async def _fake_processor(reads, reader, writer, *, system_prompt="", agent_id="", timeout=300, api_key=None):
         import json as _json
         writer.write(_json.dumps({
             "proposed_slots": [{

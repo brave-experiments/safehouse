@@ -239,6 +239,7 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
     driver_kwargs = {
         "confirm_slot": confirmer.confirm_slot,
         "google_token": google_token,
+        "anthropic_api_key": cfg.anthropic_api_key or "",
     }
 
     coro = driver_run_manifest(cfg.task, plan, **driver_kwargs)

@@ -59,7 +59,9 @@ All output from `safehouse/` goes through `trace.emit()`. `print()` belongs only
 A driver tool absent from `_DRIVER_ROUTING_FIELDS` gets an empty routing-key list — the routing lock is **silently skipped**. A tool absent from `DRIVER_RELEASE` cannot precommit sources/transform. Both are security regressions. `test_registry_drift.py` catches them.
 
 ### 6 — Credential isolation
-Credentials are resolved in the CLI layer and passed into core as explicit parameters. They must never appear in a slot, label, task string, trace event payload, or any Tier 1/2 sub-agent input or environment. The Tier-2 `claude -p` sub-agent runs with an allowlisted env (`runner._subagent_env`) — adding a credential to that allowlist is a regression.
+Credentials are resolved in the CLI layer and passed into core as explicit parameters. They must never appear in a slot, label, task string, trace event payload, or any Tier 1/2 sub-agent input.
+
+The Tier-2 processor runs **in-process via the Anthropic SDK** (`runner._llm_processor`), not as a subprocess. Isolation is by omission: no `tools` argument is passed, so the model has nothing to call, and nothing is read from disk — no settings file, no `CLAUDE.md`/auto-memory, no hooks, no MCP servers. Its own credential is the `api_key` parameter, never an environment variable. Re-introducing a subprocess here is a regression: it reloads all of that from user *and* project scope, a configured hook executes regardless of any tool restriction, and the binary is PATH-shimmable. `tests/test_subagent_isolation.py` asserts this on the AST — `runner.py` must not import `subprocess` or call any spawn primitive.
 
 ### 7 — Policy identity is per pipeline run
 Construct one fresh `IronFlow(store)` per pipeline. `declassify_slot()` must receive the exact
