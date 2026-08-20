@@ -45,7 +45,8 @@ class ExitCode(IntEnum):
     PLANNING_FAILED       = 3
     POLICY_VIOLATION      = 4   # IronFlow violation: distinct, monitorable outcome
     CONFIRMATION_REQUIRED = 5
-    CREDENTIAL_ERROR      = 6   # Google credential resolution failed (bad command, expired refresh)
+    CREDENTIAL_ERROR      = 6   # credential unusable: Google resolution failed, or a
+                                # provider returned 401/403 mid-run (expired/under-scoped)
     INTERRUPTED           = 130
 
 
@@ -67,6 +68,8 @@ def _to_run_result(driver_result: dict, session: Session, elapsed: float) -> Run
     Policy violations (violations list non-empty) map to POLICY_VIOLATION
     rather than generic PIPELINE_ERROR — a fired IronFlow gate is a distinct,
     monitorable outcome for an IPI-resistance pipeline.
+
+    credential_error maps to CREDENTIAL_ERROR — see runner.ProviderAuthError.
     """
     status = driver_result.get("status", "error")
     if status == "success":
@@ -74,6 +77,8 @@ def _to_run_result(driver_result: dict, session: Session, elapsed: float) -> Run
     violations = driver_result.get("violations", [])
     if violations:
         return RunResult(ExitCode.POLICY_VIOLATION, status, driver_result, session, elapsed)
+    if driver_result.get("credential_error"):
+        return RunResult(ExitCode.CREDENTIAL_ERROR, status, driver_result, session, elapsed)
     return RunResult(ExitCode.PIPELINE_ERROR, status, driver_result, session, elapsed)
 
 

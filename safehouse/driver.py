@@ -117,7 +117,18 @@ class ProviderConfig:
 
 
 class GmailSendError(RuntimeError):
-    """Raised when a Gmail REST API call returns a non-2xx response."""
+    """Raised when a Gmail REST API call returns a non-2xx response.
+
+    Carries the HTTP status so callers can distinguish a rejected credential
+    (401/403 — operator-fixable) from a genuine failure. Kept as its own type
+    rather than raising ProviderAuthError because several handlers catch it to
+    attach do-not-retry context (partial sends, an already-created event) that
+    an escaping exception would lose.
+    """
+
+    def __init__(self, message: str, status: int = 0) -> None:
+        super().__init__(message)
+        self.status = status
 
 
 class GmailClient:
@@ -498,12 +509,28 @@ async def _gmail_send(
     _trace.emit(_trace.EvEmailSent(from_addr="me", to=to, message_id=msg_id))
 
 
-def _pipeline_error(reason: str, policy: IronFlow, store: SlotStore) -> dict:
+def _auth_extra(status: int) -> dict:
+    """See ProviderAuthError."""
+    return {"credential_error": True} if status in (401, 403) else {}
+
+
+def _provider_error(resp, what: str, store: SlotStore, **extra: object) -> tuple[str, dict]:
+    """Non-raising twin of runner._require_ok.
+
+    Driver tools must return (json_str, dict) on every path (invariant #1), and
+    callers attach do-not-retry context an exception would lose.
+    """
+    msg = f"{what} failed (status {resp.status_code}): {resp.text[:200]}"
+    return _terminal_error(msg, store, **_auth_extra(resp.status_code), **extra)
+
+
+def _pipeline_error(reason: str, policy: IronFlow, store: SlotStore,
+                    **extra: object) -> dict:
     violations = policy.violations()
     inventory  = store.inventory()
     _trace.emit(_trace.EvPipelineEnd(status="error", violations=violations, inventory=inventory))
     return {"status": "error", "reason": reason,
-            "slot_inventory": inventory, "violations": violations}
+            "slot_inventory": inventory, "violations": violations, **extra}
 
 
 def _terminal_error(msg: str, store: SlotStore, **extra: object) -> tuple[str, dict]:
