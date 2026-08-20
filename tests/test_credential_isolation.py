@@ -146,6 +146,28 @@ def test_neither_model_call_site_accepts_a_missing_key(monkeypatch):
     with pytest.raises(RuntimeError, match="explicit API key"):
         _get_client(None)
 
+def test_core_never_builds_an_unguarded_slot_store():
+    """SlotStore's `secrets` argument defaults to None so unit tests need not carry a
+    registry they have no credentials for. That makes the guard one forgotten keyword
+    away from absent in production, and the absence would be invisible.
+
+    Asserted on the AST: every SlotStore(...) constructed inside safehouse/ must pass
+    an argument. The 97 test call sites are deliberately out of scope — they have no
+    credentials to leak, and requiring the parameter there would spread a security
+    concern across unrelated tests without testing anything.
+    """
+    offenders = []
+    for path, tree in _sources(CORE):
+        for node in ast.walk(tree):
+            if (isinstance(node, ast.Call)
+                    and getattr(node.func, "id", "") == "SlotStore"
+                    and not node.args and not node.keywords):
+                offenders.append(f"{path.relative_to(REPO)}:{node.lineno}")
+    assert not offenders, (
+        "SlotStore built without a SecretRegistry in core — the credential guard "
+        "silently does nothing for these stores (CLAUDE.md invariant #6):\n  "
+        + "\n  ".join(offenders))
+
 
 if __name__ == "__main__":
     raise SystemExit(pytest.main([__file__, "-v"]))

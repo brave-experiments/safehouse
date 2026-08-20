@@ -23,6 +23,7 @@ Facets are for runner code only.
 from __future__ import annotations
 
 from .labels import Label, LVal
+from .secrets import SecretLeak, SecretRegistry
 from . import trace as _trace
 
 
@@ -31,11 +32,16 @@ class SlotStore:
     Session-scoped, write-once store. DRIVER-PRIVILEGED: only driver.run()
     constructs this; sub-agent code receives SlotReader / SlotWriter facets.
     Thread-safe for reads; writes are sequential (one sub-agent per slot).
+
+    `secrets` is the run's credential registry; write() refuses any content
+    containing one. Omitting it disables the check, which is correct for unit
+    tests that have no credentials to leak.
     """
 
-    def __init__(self) -> None:
+    def __init__(self, secrets: SecretRegistry | None = None) -> None:
         # slot_id -> None (created, unwritten) | LVal (written, immutable)
         self._slots: dict[str, LVal | None] = {}
+        self._secrets = secrets
 
     # ── Lifecycle (driver only) ───────────────────────────────────────
 
@@ -54,6 +60,19 @@ class SlotStore:
         self._require(slot_id)
         if self._slots[slot_id] is not None:
             raise RuntimeError(f"Write-once violation: slot '{slot_id}' already written.")
+        # Checked before the write lands, so a refused write leaves the slot
+        # unwritten and the pipeline fails at the boundary rather than one step later.
+        if self._secrets:
+            leaked = self._secrets.find(value)
+            if leaked is not None:
+                raise SecretLeak(
+                    f"Slot '{slot_id}': content contains the {leaked} credential. "
+                    f"Refusing the write — slot content is read by the Tier-2 "
+                    f"processor and can be released to the world by a Tier-3 action "
+                    f"(CLAUDE.md invariant #6). Most likely a provider echoed the "
+                    f"rejected credential in an error body and the fetcher wrote "
+                    f"that body into its output slot; project the response instead."
+                )
         self._slots[slot_id] = LVal(value, label)
 
     # ── Access ────────────────────────────────────────────────────────
