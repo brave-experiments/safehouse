@@ -70,6 +70,10 @@ def load_raw(path: Path | None = None) -> dict:
 class Settings:
     """Env+file-resolved credentials and run defaults. CLI flags override these later."""
     anthropic_api_key:       str | None   = None
+    duffel_token:            str | None   = None
+    liteapi_key:             str | None   = None
+    passenger:               dict | None  = None
+    max_booking_amount:      str | None   = None   # "<amount> <currency>", e.g. "300 GBP"
     google_token:            str | None   = None
     google_auth:             str          = "static"
     google_token_command:    str | None   = None
@@ -93,6 +97,10 @@ def load_settings(path: Path | None = None, env: dict | None = None) -> Settings
         token_command = google.get("token_command")
     return Settings(
         anthropic_api_key       = env.get("ANTHROPIC_API_KEY", "").strip() or data.get("anthropic", {}).get("api_key"),
+        max_booking_amount      = env.get("SAFEHOUSE_MAX_BOOKING", "").strip() or defaults.get("max_booking_amount"),
+        passenger               = (data.get("passenger") or None),
+        liteapi_key             = env.get("LITEAPI_SANDBOX_KEY", "").strip() or data.get("liteapi", {}).get("api_key"),
+        duffel_token            = env.get("DUFFEL_ACCESS_TOKEN", "").strip() or data.get("duffel", {}).get("access_token"),
         google_token            = google_token,
         google_auth             = google_auth,
         google_token_command    = token_command,

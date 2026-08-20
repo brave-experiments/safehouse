@@ -181,18 +181,3 @@ class TestRunnerDiscipline:
         assert "_ds.save(" not in self._src, \
             "runner.py must not call _ds.save() — data_slots has been eliminated"
 
-    def test_run_mcp_search_no_bare_slot_id(self):
-        """run_mcp_search no longer takes slot_id; verify no stale references remain."""
-        import ast
-        tree = ast.parse(self._src)
-        for node in ast.walk(tree):
-            if isinstance(node, ast.AsyncFunctionDef) and node.name == "run_mcp_search":
-                params = {a.arg for a in node.args.args}
-                assert "slot_id" not in params, \
-                    "run_mcp_search must not have slot_id parameter"
-                for child in ast.walk(node):
-                    if isinstance(child, ast.Name) and child.id == "slot_id":
-                        raise AssertionError(
-                            f"run_mcp_search references bare 'slot_id' at line {child.lineno} "
-                            f"— use writer.slot_id instead"
-                        )

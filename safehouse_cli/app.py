@@ -241,9 +241,35 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
         return RunResult(ExitCode.OK, "dry_run", {"plan": plan}, session, elapsed)
 
     # ── Execution ──────────────────────────────────────────────────────
+    duffel_token = cfg.duffel_token or ""
+    if "mcp_flight_search" in tools and not duffel_token:
+        elapsed = time.monotonic() - t0
+        sink.close()
+        return RunResult(
+            ExitCode.CONFIG_ERROR, "error",
+            {"reason": "DUFFEL_ACCESS_TOKEN is not set.  Export it (or add [duffel].access_token "
+                       "to config); create a token at Duffel → Developers → Access tokens."},
+            session, elapsed,
+        )
+
+    liteapi_key = cfg.liteapi_key or ""
+    if "mcp_hotel_search" in tools and not liteapi_key:
+        elapsed = time.monotonic() - t0
+        sink.close()
+        return RunResult(
+            ExitCode.CONFIG_ERROR, "error",
+            {"reason": "LITEAPI_SANDBOX_KEY is not set.  Export it (or add [liteapi].api_key "
+                       "to config); sign up free at liteapi.travel → dashboard → API Keys."},
+            session, elapsed,
+        )
+
     driver_kwargs = {
         "confirm_slot": confirmer.confirm_slot,
         "google_token": google_token,
+        "duffel_token": duffel_token,
+        "liteapi_key": liteapi_key,
+        "passenger": cfg.passenger,
+        "max_booking_amount": cfg.max_booking_amount or "",
         "anthropic_api_key": cfg.anthropic_api_key or "",
     }
 

@@ -45,7 +45,89 @@ DRIVER_RELEASE: dict[str, ReleaseGate] = {
     "send_reply":       ReleaseGate(("body_slot",), "opaque"),
     "schedule_meeting": ReleaseGate(("slots_slot",), "structured:meeting_proposal"),
     "modify_emails":    ReleaseGate(()),
+    # book_flight releases the processor's (U,pub) offer pick through a structured
+    # transform that validates the offer_id (fail-closed) before any provider call.
+    # The amount is re-fetched from the provider; passenger PII is a trusted driver param.
+    "book_flight":      ReleaseGate(("offer_slot",), "structured:flight_offer"),
+    "book_hotel":       ReleaseGate(("offer_slot",), "structured:hotel_offer"),
 }
+
+
+def _loads_object(raw: object) -> dict:
+    """Parse a JSON object from possibly-fenced LLM output.
+
+    Processors sometimes wrap their JSON in a ```json … ``` fence or add prose
+    around it. Parse strictly first; on failure, extract the first-brace..last-brace
+    span. Raises ReleaseTransformError if no JSON object can be recovered.
+    """
+    text = str(raw).strip()
+    # Include the head of the content in failures. Without it the operator sees
+    # only "no JSON object found", which hides the actual cause — a Tier-1 empty
+    # result sentinel ("(no flight offers found)") or a processor that refused and
+    # explained itself in prose both surface identically otherwise.
+    head = (text[:120] + "…") if len(text) > 120 else text
+    try:
+        obj = json.loads(text)
+    except json.JSONDecodeError:
+        i, j = text.find("{"), text.rfind("}")
+        if i == -1 or j <= i:
+            raise ReleaseTransformError(
+                f"no JSON object found in released content (begins: {head!r})")
+        try:
+            obj = json.loads(text[i:j + 1])
+        except json.JSONDecodeError as exc:
+            raise ReleaseTransformError(
+                f"released content is not valid JSON (begins: {head!r})") from exc
+    if not isinstance(obj, dict):
+        raise ReleaseTransformError("released content must be a JSON object")
+    return obj
+
+
+def _flight_offer(lval: LVal) -> LVal:
+    """Validate the processor's chosen offer: {offer_id, total_amount, total_currency}.
+    Fail closed if offer_id is missing — a garbage pick must not reach a booking call."""
+    data = _loads_object(lval.value)
+    offer_id = str(data.get("offer_id", "")).strip()
+    if not offer_id:
+        raise ReleaseTransformError("flight_offer missing 'offer_id'")
+    return LVal(
+        {
+            "offer_id":       offer_id,
+            "total_amount":   str(data.get("total_amount", "")),
+            "total_currency": str(data.get("total_currency", "")),
+        },
+        lval.label,
+    )
+
+def _hotel_offer(lval: LVal) -> LVal:
+    """Validate the processor's chosen hotel offer. Carries the re-search context
+    (hotel_id + dates + occupancy) so book_hotel can obtain a FRESH offer before
+    prebook — LiteAPI rate offers expire fast, so the stale offer_id is only a hint.
+    Fail closed if hotel_id is missing — a garbage pick must not reach a booking call."""
+    data = _loads_object(lval.value)
+    hotel_id = str(data.get("hotel_id", "")).strip()
+    checkin  = str(data.get("checkin", "")).strip()
+    checkout = str(data.get("checkout", "")).strip()
+    if not (hotel_id and checkin and checkout):
+        raise ReleaseTransformError("hotel_offer missing hotel_id / checkin / checkout")
+    try:
+        adults = max(1, int(data.get("adults", 1) or 1))
+    except (TypeError, ValueError):
+        adults = 1
+    return LVal(
+        {
+            "offer_id":     str(data.get("offer_id", "")).strip(),   # stale hint only
+            "hotel_id":     hotel_id,
+            "hotel":        str(data.get("hotel", "")),
+            "checkin":      checkin,
+            "checkout":     checkout,
+            "adults":       adults,
+            "country_code": str(data.get("country_code", "")).strip(),
+            "amount":       str(data.get("amount", "")),
+            "currency":     str(data.get("currency", "")) or "GBP",
+        },
+        lval.label,
+    )
 
 
 def apply_release_transform(transform_id: str, lval: LVal) -> LVal:
@@ -72,6 +154,10 @@ def _opaque(lval: LVal) -> LVal:
 def _structured(schema_id: str, lval: LVal) -> LVal:
     if schema_id == "meeting_proposal":
         return _meeting_proposal(lval)
+    if schema_id == "flight_offer":
+        return _flight_offer(lval)
+    if schema_id == "hotel_offer":
+        return _hotel_offer(lval)
     raise ReleaseTransformError(f"unknown structured schema {schema_id!r}")
 
 
@@ -92,14 +178,7 @@ def _parse_slot_dt(value: object) -> datetime | None:
 
 
 def _meeting_proposal(lval: LVal) -> LVal:
-    try:
-        data = json.loads(str(lval.value))
-    except json.JSONDecodeError as exc:
-        raise ReleaseTransformError(
-            "meeting_proposal must be JSON with 'proposed_slots' and 'reply_body'"
-        ) from exc
-    if not isinstance(data, dict):
-        raise ReleaseTransformError("meeting_proposal JSON must be an object")
+    data = _loads_object(lval.value)
 
     raw_slots = data.get("proposed_slots")
     if not isinstance(raw_slots, list):

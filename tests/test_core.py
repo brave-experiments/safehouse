@@ -814,34 +814,8 @@ class TestRunnerAuditFixes:
 
     # ── Security 5 — scheme-aware URL trust in _extract_booking_urls ──
 
-    def test_http_url_blocked_against_https_trust_list(self):
-        """http:// must not match a trust list that contains only https://."""
-        from safehouse.runner import _extract_booking_urls
-        results, _ = _extract_booking_urls(
-            '{"flights": [{"deepLink": "http://kiwi.com/u/abc123"}]}',
-            ["https://kiwi.com/"],
-        )
-        assert results == [], "http:// must not pass an https-only trust list"
 
-    def test_https_url_passes_https_trust_list(self):
-        from safehouse.runner import _extract_booking_urls
-        results, strategy = _extract_booking_urls(
-            '{"flights": [{"deepLink": "https://kiwi.com/u/abc123"}]}',
-            ["https://kiwi.com/"],
-        )
-        assert len(results) == 1
-        assert results[0]["url"] == "https://kiwi.com/u/abc123"
 
-    def test_host_case_insensitive_in_trust_check(self):
-        """Uppercase host in extracted URL should match lowercase trust list."""
-        from safehouse.runner import _extract_booking_urls
-        results, _ = _extract_booking_urls(
-            '[{"deepLink": "https://KIWI.COM/u/abc"}]',
-            ["https://kiwi.com/"],
-        )
-        assert len(results) == 1
-
-    # ── Security 6 — assert replaced by explicit raise in run_processor ─
 
     def test_processor_writable_slot_check_survives_optimize(self):
         """The invariant check must use 'if/raise', not 'assert' (stripped by -O)."""
@@ -920,10 +894,7 @@ class TestProviderAuthClassification:
         assert "credential_error" not in d2
 
     def test_cli_maps_credential_error_to_its_own_exit_code(self):
-        """The point of the classification: a supervisor can tell "refresh the
-        token" (exit 6) from "this task cannot succeed" (exit 1). Without this the
-        two helpers above would set a flag nothing acts on.
-        """
+        """Without this the two helpers above would set a flag nothing acts on."""
         from safehouse_cli.app import ExitCode, _to_run_result
         cred = {"status": "error", "reason": "x", "credential_error": True, "violations": []}
         assert _to_run_result(cred, None, 0.0).exit_code == ExitCode.CREDENTIAL_ERROR
@@ -938,6 +909,171 @@ class TestProviderAuthClassification:
                 "credential_error": True, "violations": ["[Confinement] ..."]}
         assert _to_run_result(both, None, 0.0).exit_code == ExitCode.POLICY_VIOLATION
 
+
+class TestSpendCeiling:
+    """_check_spend_ceiling must not compare across currencies (Security review finding)."""
+
+    def test_no_ceiling_configured(self):
+        from safehouse.driver import _check_spend_ceiling
+        assert _check_spend_ceiling("", "9999", "GBP", "fare") is None
+
+    def test_under_ceiling_same_currency(self):
+        from safehouse.driver import _check_spend_ceiling
+        assert _check_spend_ceiling("300 GBP", "150.00", "GBP", "fare") is None
+
+    def test_over_ceiling_same_currency_rejected(self):
+        from safehouse.driver import _check_spend_ceiling
+        err = _check_spend_ceiling("300 GBP", "301.00", "GBP", "fare")
+        assert err is not None and "exceeds ceiling" in err
+
+    def test_currency_case_insensitive(self):
+        from safehouse.driver import _check_spend_ceiling
+        assert _check_spend_ceiling("300 gbp", "150.00", "GBP", "fare") is None
+
+    def test_bare_number_ceiling_rejected_not_silently_compared(self):
+        """A ceiling with no currency must not fall back to comparing raw numbers."""
+        from safehouse.driver import _check_spend_ceiling
+        err = _check_spend_ceiling("300", "1", "JPY", "fare")
+        assert err is not None and "currency" in err
+
+    def test_mismatched_currency_fails_closed(self):
+        """A ceiling of 300 GBP must not silently pass a 299 JPY fare."""
+        from safehouse.driver import _check_spend_ceiling
+        err = _check_spend_ceiling("300 GBP", "299", "JPY", "fare")
+        assert err is not None and "cannot safely compare" in err
+
+    def test_malformed_ceiling_amount(self):
+        from safehouse.driver import _check_spend_ceiling
+        err = _check_spend_ceiling("abc GBP", "150.00", "GBP", "fare")
+        assert err is not None and "unparseable" in err.lower()
+
+    def test_malformed_provider_amount_blames_amount_not_ceiling(self):
+        """A malformed ceiling and a well-formed amount must not blame the amount."""
+        from safehouse.driver import _check_spend_ceiling
+        err = _check_spend_ceiling("not-a-number GBP", "150.00", "GBP", "fare")
+        assert err is not None and "max_booking_amount" in err
+class TestSpendCeilingIsWired:
+    """The ceiling helper is unit-tested above. These assert the booking handlers
+    actually CALL it — deleting the call site left the whole suite green, so the
+    unit was covered and the wiring was not."""
+
+    OFFER = {"data": {"total_amount": "500.00", "total_currency": "GBP",
+                      "owner": {"name": "TestAir"},
+                      "slices": [{"segments": [{"origin": {"iata_code": "LHR"},
+                                                "destination": {"iata_code": "BCN"}}]}]}}
+
+    class _Resp:
+        def __init__(self, payload, status=200):
+            self._p, self.status_code, self.text = payload, status, ""
+        def json(self):
+            return self._p
+
+    def _client(self, posted):
+        outer = self
+        class _C:
+            def __init__(self, *a, **k): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def get(self, url, headers=None, params=None):
+                return outer._Resp(outer.OFFER)
+            async def post(self, url, headers=None, json=None):
+                posted.append(url)
+                return outer._Resp({"data": {"id": "ord_x"}}, 201)
+        return _C
+
+    def _run(self, monkeypatch, ceiling):
+        import asyncio, json as _json
+        import safehouse.driver as d
+        from safehouse.ironflow_policy import IronFlow
+        from safehouse.labels import Label, LVal
+        from safehouse.plan_types import PlanState
+        from safehouse.slots import SlotStore
+        from safehouse.permissions import driver_spec
+
+        posted: list[str] = []
+        monkeypatch.setattr(d.httpx, "AsyncClient", self._client(posted))
+
+        store = SlotStore()
+        store.create("offer")
+        store.writer_for("offer", Label.U_pub(), agent_id="p").write(
+            _json.dumps({"offer_id": "off_123", "total_amount": "500.00",
+                         "total_currency": "GBP"}))
+        policy = IronFlow(store)
+        state  = PlanState()
+        state.set_var("_routing", LVal(d._freeze_routing({"provider": "duffel"}),
+                                       Label.T_pub()))
+        policy.precommit_routing(state, sources=frozenset({"offer"}),
+                                 transform="structured:flight_offer")
+        ctx = d._StepContext(
+            store=store, policy=policy, driver=driver_spec(), state=state,
+            config=d.ProviderConfig(google_token="", duffel_token="tok",
+                                    passenger={"given_name": "A", "family_name": "B"},
+                                    max_booking_amount=ceiling),
+            confirm_slot=lambda slots: asyncio.sleep(0, result=1),
+        )
+        _, final = asyncio.run(d._handle_book_flight({"offer_slot": "offer"}, ctx))
+        return final, posted
+
+    def test_a_fare_over_the_ceiling_is_refused_before_any_charge(self, monkeypatch):
+        final, posted = self._run(monkeypatch, "100 GBP")
+        assert final["status"] == "error"
+        assert "ceiling" in final["reason"].lower() or "exceeds" in final["reason"].lower()
+        assert posted == [], "no order may be created once the ceiling refuses the fare"
+
+    RATES = {"data": [{"roomTypes": [{"offerId": "off_fresh", "rates": [
+        {"retailRate": {"total": [{"amount": 500.0, "currency": "GBP"}]}}]}]}]}
+
+    def _hotel_client(self, posted):
+        outer = self
+        class _C:
+            def __init__(self, *a, **k): pass
+            async def __aenter__(self): return self
+            async def __aexit__(self, *a): return False
+            async def get(self, url, headers=None, params=None):
+                return outer._Resp({"data": []})
+            async def post(self, url, headers=None, json=None):
+                posted.append(url)
+                if url.endswith("/hotels/rates"):
+                    return outer._Resp(outer.RATES)
+                return outer._Resp({"data": {"prebookId": "pb_1"}})
+        return _C
+
+    def test_a_rate_over_the_ceiling_is_refused_before_prebook(self, monkeypatch):
+        """book_hotel re-searches for a fresh rate, so the ceiling must gate the
+        FRESH amount — not the stale one the processor picked."""
+        import asyncio, json as _json
+        import safehouse.driver as d
+        from safehouse.ironflow_policy import IronFlow
+        from safehouse.labels import Label, LVal
+        from safehouse.plan_types import PlanState
+        from safehouse.slots import SlotStore
+        from safehouse.permissions import driver_spec
+
+        posted: list[str] = []
+        monkeypatch.setattr(d.httpx, "AsyncClient", self._hotel_client(posted))
+        store = SlotStore(); store.create("offer")
+        store.writer_for("offer", Label.U_pub(), agent_id="p").write(_json.dumps(
+            {"offer_id": "stale", "hotel_id": "h1", "hotel": "H",
+             "checkin": "2026-09-01", "checkout": "2026-09-03", "adults": 1}))
+        policy = IronFlow(store); state = PlanState()
+        state.set_var("_routing", LVal(d._freeze_routing({"provider": "liteapi"}),
+                                       Label.T_pub()))
+        policy.precommit_routing(state, sources=frozenset({"offer"}),
+                                 transform="structured:hotel_offer")
+        ctx = d._StepContext(
+            store=store, policy=policy, driver=driver_spec(), state=state,
+            config=d.ProviderConfig(google_token="", liteapi_key="k",
+                                    passenger={"given_name": "A", "family_name": "B",
+                                               "email": "a@b.c"},
+                                    max_booking_amount="100 GBP"),
+            confirm_slot=lambda slots: asyncio.sleep(0, result=1))
+        _, final = asyncio.run(d._handle_book_hotel({"offer_slot": "offer"}, ctx))
+        assert final["status"] == "error"
+        # prebook is a hold, and it is what returns the authoritative price the
+        # ceiling binds to — so it may fire. /rates/book is the charge and must not.
+        assert any("prebook" in u for u in posted), "prebook yields the price to check"
+        assert not any(u.endswith("/rates/book") for u in posted), \
+            "no booking may be charged once the ceiling refuses the rate"
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v", "--tb=short"])

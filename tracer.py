@@ -31,13 +31,15 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from safehouse.ironflow_policy import PRINCIPLES
 from safehouse.planner import TOOL_SCHEMA
 from safehouse.trace import (
+    EvBookingProposed, EvBookFlight, EvBookHotel,
+    EvCalendarEventCreated,
     Tracer,
     EvPlanPhase1Start, EvPlanChunk, EvPlanPhase2, EvPlanPhase3,
     EvStaticPlan, EvDriverStart, EvPlanStep, EvAgentSpawned,
     EvFetch, EvSlotWritten, EvSlotRead, EvTaint,
     EvGate, EvEmailSent, EvDeclassify, EvPipelineEnd,
     EvActionFired,
-    EvRoutingLocked, EvBookingUrlsExtracted,
+    EvRoutingLocked,
     EvReplyActionFired,
     EvMeetingOptionsReady,
     EvMeetingConfirmation, EvMeetingScheduled, EvActionGranted,
@@ -166,7 +168,6 @@ def print_invariants(checks: list[tuple[str, bool]]) -> None:
     _section("INVARIANT CHECKS")
     for desc, ok in checks:
         print(f"    {'✓' if ok else '✗'}  {desc}")
-
 
 
 def _audit_row(name: str, label_str: str, value: str, note: str = "") -> None:
@@ -747,23 +748,11 @@ def _on_send_summary_fired(t: _DemoTracer, ev: EvActionFired) -> None:
 # IPI defence: booking URLs domain-validated against registry whitelist
 # (trusted_action_urls from MCPSpec.booking_domain) before any fetch occurs.
 
-def _trip_on_booking_urls_extracted(t: _DemoTracer, ev: EvBookingUrlsExtracted) -> None:
-    print(f"  [operator] extract  slot={ev.slot_id!r}  "
-          f"count={ev.count}  strategy={ev.strategy}  (no LLM — deterministic)")
-    prefix  = "             → "
-    max_url = _w() - len(prefix)
-    for u in ev.urls[:5]:
-        display = u if len(u) <= max_url else u[:max_url - 1] + "…"
-        print(f"{prefix}{display}")
-    if ev.count > 5:
-        print(f"             (+ {ev.count - 5} more)")
-
-
 
 def _trip_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
     _banner("POST-EXECUTION AUDIT")
     fe    = t._state.get("final_summary") or {}
-    end   = t._end or {}
+    end   = t._pop_end()
     viols = end.get("violations", [])
 
     print_slot_inventory(result.get("slot_inventory", []))
@@ -785,8 +774,6 @@ def _trip_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
          labels.get("recipient") == "(T,pub)"),
         ("routing fields not from MCP content",
          True),   # structural — routing pre-committed before step 0
-        ("booking URLs domain-validated",
-         True),   # structural — MCP URL extraction validates against booking_domain whitelist
         ("no policy violations",
          len(viols) == 0),
     ]
@@ -810,7 +797,6 @@ def _trip_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
 # IPI defence: inbound email body may contain payloads attempting to inject
 # CC recipients or redirect the reply address.  All routing fields are
 # (T,pub) from the task and immutable; CC/BCC do not exist in the pipeline.
-
 
 
 def _render_reply_action_fired(
@@ -1216,11 +1202,150 @@ def _universal_plan_step(t: _DemoTracer, ev: EvPlanStep) -> None:
         BaseTracer._on_plan_step(t, ev)
 
 
+def _display_offer_id(offer_id: str, head: int = 16, tail: int = 6) -> str:
+    """Duffel offer_ids are short and human-readable; LiteAPI rate offerIds are
+    opaque base64/msgpack blobs hundreds of chars long — truncate those for
+    display so the confirm prompt stays readable regardless of provider."""
+    if len(offer_id) <= head + tail + 3:
+        return offer_id
+    return f"{offer_id[:head]}…{offer_id[-tail:]}"
+
+
+def _booking_on_proposed(t: _DemoTracer, ev: EvBookingProposed) -> None:
+    print(f"  ✈  confirm booking:  {ev.owner}  {ev.route}  —  {ev.amount} {ev.currency}  "
+          f"(offer {_display_offer_id(ev.offer_id)})")
+
+def _booking_on_booked(t: _DemoTracer, ev: EvBookFlight) -> None:
+    t._state.setdefault("bookings", []).append({
+        "provider": ev.provider, "owner": ev.owner, "route": ev.route,
+        "amount": ev.amount, "currency": ev.currency,
+        "order_id": ev.order_id, "pnr": ev.booking_reference, "confirmed": ev.confirmed,
+    })
+    if ev.confirmed:
+        print(f"  ✅ BOOKED via Duffel (balance)  {ev.owner} {ev.route}  "
+              f"{ev.amount} {ev.currency}  →  order {ev.order_id}  PNR {ev.booking_reference}")
+    else:
+        print(f"  ✗  booking not confirmed  ({ev.owner} {ev.route} {ev.amount} {ev.currency})")
+
+def _booking_on_hotel_booked(t: _DemoTracer, ev: EvBookHotel) -> None:
+    t._state.setdefault("bookings", []).append({
+        "provider": ev.provider, "owner": ev.hotel, "route": "",
+        "amount": ev.amount, "currency": ev.currency,
+        "amount_endorsed": ev.amount_endorsed, "currency_endorsed": ev.currency_endorsed,
+        "order_id": ev.booking_id, "pnr": ev.booking_id, "confirmed": ev.confirmed,
+    })
+    if ev.confirmed:
+        print(f"  ✅ BOOKED via LiteAPI (wallet)  {ev.hotel}  "
+              f"{ev.amount} {ev.currency}  →  booking {ev.booking_id}")
+        if ev.amount_endorsed and (ev.amount, ev.currency) != (ev.amount_endorsed, ev.currency_endorsed):
+            print(f"  ⚠  CHARGED AMOUNT DIFFERS FROM HUMAN-ENDORSED AMOUNT: "
+                  f"endorsed {ev.amount_endorsed} {ev.currency_endorsed} → "
+                  f"charged {ev.amount} {ev.currency}  "
+                  f"(/rates/book accepts no price field to enforce this server-side)")
+    else:
+        print(f"  ✗  hotel booking not confirmed  ({ev.hotel} {ev.amount} {ev.currency})")
+
+def _booking_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
+    _banner("POST-EXECUTION AUDIT")
+    end   = t._pop_end()
+    viols = end.get("violations", [])
+    # One book_flight/book_hotel event fires per pipeline, in pipeline order;
+    # audit_fn is likewise called once per pipeline action, in the same order —
+    # pop the oldest so multi-pipeline runs (e.g. flight + hotel) don't all show
+    # the last booking's outcome.
+    bookings = t._state.setdefault("bookings", [])
+    bk       = bookings.pop(0) if bookings else {}
+    print_slot_inventory(result.get("slot_inventory", []))
+    status = end.get("status") or result.get("status")
+
+    _section("BOOKING OUTCOME")
+    _audit_row("provider", "(T,pub)", bk.get("provider") or result.get("provider") or "—",
+               "routing — pre-committed from task/registry; IPI cannot redirect")
+    _audit_row("amount", "(T,pub · grant)",
+               f"{bk.get('amount', result.get('amount','?'))} {bk.get('currency','')}",
+               "re-validated with the provider + single-use human endorsement")
+    _audit_row("payment", "",
+               "Duffel balance" if bk.get("provider") == "duffel" else
+               ("LiteAPI wallet" if bk.get("provider") == "liteapi" else "prepaid balance"),
+               "prepaid balance / wallet — no card in the flow")
+    if bk.get("pnr") or result.get("booking_reference"):
+        _audit_row("booking", "",
+                   f"{bk.get('owner','')} {bk.get('route','')}  PNR "
+                   f"{bk.get('pnr', result.get('booking_reference','—'))}")
+
+    checks = [
+        ("pipeline succeeded",                 status == "success"),
+        ("provider is (T,pub) routing",        True),
+        ("amount grant-endorsed (single-use)", bk.get("confirmed", status == "success")),
+        ("charged amount matches endorsement", not result.get("amount_mismatch", False)),
+        ("no policy violations",               len(viols) == 0),
+    ]
+    print_invariants(checks)
+    print_violations(viols)
+    if result.get("warning"):
+        _section("WARNING")
+        print(f"  {result['warning']}")
+    if status == "error" and result.get("reason"):
+        _section("PIPELINE ERROR")
+        print("  status: error")
+        print(f"  reason: {result.get('reason','(unknown)')}")
+    all_ok = all(ok for _, ok in checks)
+    _banner("ALL CHECKS PASSED" if all_ok else "SOME CHECKS FAILED")
+    print(f"  elapsed: {elapsed:.1f}s")
+
+
+def _calendar_on_event_created(t: _DemoTracer, ev: EvCalendarEventCreated) -> None:
+    # Queued like _booking_on_booked/_booking_on_hotel_booked — a multi-pipeline run
+    # could in principle create more than one personal event; audit pops in order.
+    t._state.setdefault("calendar_events", []).append(vars(ev))
+    _banner("DRIVER  —  FINAL ACTION: create_calendar_event")
+    print(f"  event_title: {ev.event_title!r}")
+    print(f"  when:        {ev.start} → {ev.end}  [(T,pub)]  ← fixed at plan time, no grant needed")
+    if ev.confirmed:
+        print(f"  calendar:    event_id={ev.event_id!r}  link={ev.event_link!r}")
+    else:
+        print(f"  ✗  event not created")
+
+
+def _calendar_event_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
+    if result.get("status") not in ("success", None):
+        _section("PIPELINE ERROR")
+        print(f"  status: {result.get('status')}")
+        print(f"  reason: {result.get('reason', '(unknown)')}")
+        print()
+    _banner("POST-EXECUTION AUDIT")
+
+    events = t._state.setdefault("calendar_events", [])
+    ce     = events.pop(0) if events else {}
+    if ce:
+        _section("ROUTING OUTCOME  (at create_calendar_event)")
+        _audit_row("event_title", "(T,pub)", ce["event_title"],
+                   "from task string — NEVER derived from slot content")
+        _audit_row("start",       "(T,pub)", ce["start"],
+                   "fixed at plan time — no processor/slot in this tool's path")
+        _audit_row("end",         "(T,pub)", ce["end"],
+                   "fixed at plan time — no processor/slot in this tool's path")
+
+    viols  = t._pop_end().get("violations", [])
+    checks = [
+        ("no attendee / no third party notified", "attendee" not in result),
+        ("no policy violations",                   len(viols) == 0),
+        ("pipeline succeeded",                      result.get("status") == "success"),
+    ]
+    print_invariants(checks)
+    print_violations(viols)
+    all_ok = all(ok for _, ok in checks)
+    _banner("ALL CHECKS PASSED" if all_ok else "SOME CHECKS FAILED")
+    print(f"  elapsed: {elapsed:.1f}s")
+
+
 def _universal_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
     """Dispatch to the right audit function based on pipeline type."""
     pipeline = t._state.get("_pipeline", "briefing")
+    if pipeline == "booking":
+        return _booking_audit(t, result, elapsed)
     if pipeline == "trip":
-        _trip_audit(t, result, elapsed)
+        return _trip_audit(t, result, elapsed)
     elif pipeline == "calendar":
         _calendaring_audit(t, result, elapsed)
     elif pipeline == "email":
@@ -1232,7 +1357,10 @@ def _universal_audit(t: _DemoTracer, result: dict, elapsed: float) -> None:
 _UNIVERSAL_SPEC = DemoSpec(
     event_handlers={
         EvActionFired:          _on_send_summary_fired,
-        EvBookingUrlsExtracted: _trip_on_booking_urls_extracted,
+        EvCalendarEventCreated: _calendar_on_event_created,
+        EvBookingProposed:      _booking_on_proposed,
+        EvBookFlight:           _booking_on_booked,
+        EvBookHotel:            _booking_on_hotel_booked,
         EvReplyActionFired:     _email_on_reply_action_fired,
         EvEmailsModified:       _email_on_emails_modified,
         EvMeetingOptionsReady:  _meeting_on_options_ready,
@@ -1257,9 +1385,13 @@ def detect_pipeline(tools: set[str]) -> str:
     Called by safehouse_cli.app after generate_plan() so the harness can select
     the right session prefix and env vars.
     """
+    # Booking first: every booking plan also carries a search tool, so testing
+    # trip first would make "booking" unreachable.
+    if tools & {"book_flight", "book_hotel"}:
+        return "booking"
     if tools & {"mcp_flight_search", "mcp_hotel_search"}:
         return "trip"
-    if tools & {"mcp_calendar_search", "schedule_meeting"}:
+    if tools & {"create_calendar_event", "mcp_calendar_search", "schedule_meeting"}:
         return "calendar"
     if tools & {"mcp_email_search", "send_reply", "modify_emails"}:
         return "email"
@@ -1269,6 +1401,10 @@ def detect_pipeline(tools: set[str]) -> str:
 # Required env vars per detected pipeline.
 # All pipelines now use Gmail (Resend removed), so every pipeline that sends email
 # requires GOOGLE_ACCESS_TOKEN.  Empty list means no vars beyond ANTHROPIC_API_KEY.
+def _duffel_req() -> tuple[str, str]:
+    return ("DUFFEL_ACCESS_TOKEN",
+            "Create a token at Duffel → Developers → Access tokens (test mode = duffel_test_...).")
+
 def _gmail_req(scopes: str) -> tuple[str, str]:
     return ("GOOGLE_ACCESS_TOKEN",
             "Get one from https://developers.google.com/oauthplayground\n"
@@ -1276,7 +1412,8 @@ def _gmail_req(scopes: str) -> tuple[str, str]:
 
 _PIPELINE_ENV: dict[str, list[tuple[str, str]]] = {
     "briefing":  [_gmail_req("gmail.send")],
-    "trip":      [_gmail_req("gmail.send")],
+    "booking":   [_duffel_req()],
+    "trip":      [_gmail_req("gmail.send"), _duffel_req()],
     "email":     [_gmail_req("gmail.modify + gmail.send")],
     "calendar":  [_gmail_req("calendar + gmail.readonly + gmail.send")],
 }

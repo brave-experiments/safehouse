@@ -100,13 +100,6 @@ class EvActionFired:
 
 
 @dataclass
-class EvBookingUrlsExtracted:
-    """Operator code extracted booking URLs from MCP response (no LLM)."""
-    agent_id: str
-    slot_id:  str
-    count:    int
-    strategy: str        # "json" | "regex" | "none"
-    urls:     list[str]  # all trusted-domain URLs found, in MCP response order
 
 @dataclass
 class EvRoutingLocked:
@@ -263,14 +256,69 @@ class EvPlanPhase3:
     plan: dict
 
 
+@dataclass
+class EvBookingProposed:
+    """Re-validated flight offer shown to the human before the booking grant.
+    Emitted just before the confirm prompt so the endorsement is on a visible fare."""
+    owner:    str
+    route:    str
+    amount:   str
+    currency: str
+    offer_id: str
+
+@dataclass
+class EvBookFlight:
+    """Flight order created by book_flight (Duffel), paid from balance."""
+    provider:         str
+    offer_id:         str
+    amount:           str    # re-validated total charged
+    currency:         str
+    owner:            str    # airline
+    route:            str
+    order_id:         str    # Duffel order id; "" if not created
+    booking_reference: str   # PNR; "" if not created
+    confirmed:        bool
+
+@dataclass
+class EvBookHotel:
+    """Hotel booking created by book_hotel (LiteAPI), paid from wallet.
+
+    LiteAPI's /rates/book request has no price field to enforce the grant-endorsed
+    amount server-side, so `amount`/`currency` here are the ACTUAL charge reported
+    by the booking response — not the pre-booking prebook estimate that was
+    endorsed. `amount_endorsed`/`currency_endorsed` (empty unless confirmed) carry
+    that pre-booking value so a divergence is visible rather than silently dropped.
+    """
+    provider:          str
+    offer_id:          str
+    amount:            str
+    currency:          str
+    hotel:             str
+    booking_id:        str    # LiteAPI booking id; "" if not created
+    confirmed:         bool
+    amount_endorsed:   str = ""
+    currency_endorsed: str = ""
+
+
+@dataclass
+class EvCalendarEventCreated:
+    """Personal calendar event created by create_calendar_event — no attendee, no email."""
+    event_title: str
+    start:       str    # ISO 8601, (T,pub) — fixed at plan time, not processor-derived
+    end:         str
+    event_id:    str    # Google Calendar event id; "" if not created
+    event_link:  str
+    confirmed:   bool
+
+
 Event = (
     EvPlanPhase1Start | EvPlanChunk | EvPlanPhase2 | EvPlanPhase3 |
     EvStaticPlan | EvDriverStart | EvPlanStep | EvAgentSpawned |
     EvFetch | EvSlotWritten | EvSlotRead | EvTaint |
     EvGate | EvEmailSent | EvActionFired |
-    EvBookingUrlsExtracted |
     EvRoutingLocked | EvDeclassify | EvReplyActionFired |
     EvMeetingOptionsReady | EvMeetingConfirmation | EvActionGranted | EvMeetingScheduled |
+    EvCalendarEventCreated |
     EvAutoApproved | EvEmailsModified |
     EvPipelineEnd
 )

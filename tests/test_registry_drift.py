@@ -51,6 +51,10 @@ EXPECTED_PIPELINE_BY_TOOL: dict[str, str] = {
     "mcp_hotel_search":    "trip",
     "mcp_calendar_search": "calendar",
     "schedule_meeting":    "calendar",
+    "mcp_flight_search":   "trip",
+    "mcp_hotel_search":    "trip",
+    "book_flight":         "booking",
+    "book_hotel":          "booking",
     "mcp_email_search":    "email",
     "send_reply":          "email",
     "modify_emails":       "email",
@@ -145,6 +149,8 @@ def test_every_driver_tool_has_release_slots() -> None:
         "send_reply":       "opaque",
         "schedule_meeting": "structured:meeting_proposal",
         "modify_emails":    None,
+        "book_flight":      "structured:flight_offer",
+        "book_hotel":       "structured:hotel_offer",
     }
 
 
@@ -158,6 +164,8 @@ def test_driver_routing_fields_match_schema_routing_keys() -> None:
         "send_reply":       ["recipient", "subject"],
         "schedule_meeting": ["attendee", "event_title", "reply_subject"],
         "modify_emails":    ["sender", "action"],
+        "book_flight":      ["provider"],
+        "book_hotel":       ["provider"],
     }
     assert _DRIVER_ROUTING_FIELDS == expected
 
@@ -169,15 +177,19 @@ def test_grant_required_wired_in_schedule_meeting_handler() -> None:
     """
     import inspect
     from safehouse.ironflow_policy import _GRANT_REQUIRED
-    from safehouse.driver import _handle_schedule_meeting
+    from safehouse.driver import _handle_schedule_meeting, _handle_book_flight, _handle_book_hotel
 
-    src = inspect.getsource(_handle_schedule_meeting)
-    assert "issue_action_grant" in src
+    handler_for = {
+        "schedule_meeting": _handle_schedule_meeting,
+        "book_flight":      _handle_book_flight,
+        "book_hotel":       _handle_book_hotel,
+    }
     for tool, field in _GRANT_REQUIRED:
-        assert tool == "schedule_meeting"
-        needle = f'before_action("schedule_meeting", "{field}"'
+        src = inspect.getsource(handler_for[tool])
+        assert "issue_action_grant" in src
+        needle = f'before_action("{tool}", "{field}"'
         assert needle in src, (
-            f"_handle_schedule_meeting must call {needle}... — "
+            f"_handle_{tool} must call {needle}... — "
             f"otherwise _GRANT_REQUIRED is dead configuration"
         )
 
@@ -202,7 +214,9 @@ def test_grant_required_fields_reference_real_driver_tools() -> None:
     assert _GRANT_REQUIRED == frozenset({
         ("schedule_meeting", "start_time"),
         ("schedule_meeting", "end_time"),
-    }), "calendar start/end must remain grant-required (exact human endorsement)"
+        ("book_flight",      "amount"),
+        ("book_hotel",       "amount"),
+    }), "calendar start/end + book_flight/book_hotel amount must remain grant-required (exact human endorsement)"
 
 
 def test_driver_tool_must_terminate_plans() -> None:
@@ -242,11 +256,12 @@ def test_detect_pipeline_is_exhaustive() -> None:
 
 def test_detect_pipeline_precedence_is_stable() -> None:
     """
-    detect_pipeline's branches are ordered: trip > calendar > email > briefing.
+    detect_pipeline's branches are ordered: booking > trip > calendar > email > briefing.
     Mixed tool sets resolve by that precedence. Pin it so a reorder of the
     if-chain is a conscious, test-breaking decision.
     """
-    assert tracer.detect_pipeline(set(TOOL_SCHEMA)) == "trip"
+    assert tracer.detect_pipeline(set(TOOL_SCHEMA)) == "booking"       # book_flight wins
+    assert tracer.detect_pipeline({"mcp_flight_search", "mcp_hotel_search", "send_summary"}) == "trip"
     assert tracer.detect_pipeline(
         {"mcp_calendar_search", "mcp_email_search", "send_summary"}
     ) == "calendar"
