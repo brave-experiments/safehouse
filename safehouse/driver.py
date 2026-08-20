@@ -1478,6 +1478,81 @@ async def _handle_book_hotel(args: dict, ctx: _StepContext) -> tuple[str, dict |
     return json.dumps(final), final
 
 
+async def _handle_create_calendar_event(args: dict, ctx: _StepContext) -> tuple[str, dict | None]:
+    """Driver tool: create a personal Google Calendar event — no attendee, no email sent,
+    no Tier 1/2 fetch. event_title/start/end are (T,pub) routing fields pre-committed from
+    the task string before step 0 — fixed at plan time, never touched by a sub-agent. This
+    is why (unlike schedule_meeting's processor-picked start/end) no ActionGrant is issued:
+    the grant exists to bind a human's confirmation to a value an untrusted process could
+    otherwise substitute, and there is no such process in this tool's path. confirm_slot is
+    still used as a plain "about to write to your real calendar" human check."""
+    store, policy, state = ctx.store, ctx.policy, ctx.state
+
+    routing = _get_routing(state)
+    if routing is None:
+        return _terminal_error(_ROUTING_MISSING, store)
+    event_title = str(routing["event_title"])
+    start       = str(routing["start"])
+    end         = str(routing["end"])
+
+    # Compare as real instants, not strings — start/end may carry different UTC
+    # offsets (e.g. "-05:00" vs "+05:00"), where lexicographic order does not
+    # match chronological order.
+    try:
+        start_dt, end_dt = datetime.fromisoformat(start), datetime.fromisoformat(end)
+    except ValueError as exc:
+        return _terminal_error(f"malformed start/end datetime: {exc}", store)
+    if end_dt <= start_dt:
+        return _terminal_error(f"end ({end}) must be after start ({start})", store)
+
+    policy.before_action("create_calendar_event", "event_title", LVal(event_title, Label.T_pub()), Role.ROUTING)
+    policy.before_action("create_calendar_event", "start", LVal(start, Label.T_pub()), Role.ROUTING)
+    policy.before_action("create_calendar_event", "end", LVal(end, Label.T_pub()), Role.ROUTING)
+
+    google_token = ctx.config.google_token
+    if not google_token:
+        return _terminal_error("GOOGLE_ACCESS_TOKEN is not set", store)
+
+    choice = await ctx.confirm_slot([{"label": event_title, "start": start, "end": end}])
+    if choice != 1:
+        _trace.emit(_trace.EvCalendarEventCreated(
+            event_title=event_title, start=start, end=end,
+            event_id="", event_link="", confirmed=False))
+        return _terminal_error("calendar event not confirmed by human", store)
+
+    async with httpx.AsyncClient(timeout=_HTTP_TIMEOUT) as client:
+        cal_resp = await client.post(
+            f"{_GCAL_EVENTS_BASE}/primary/events",
+            headers=_google_headers(google_token),
+            json={"summary": event_title, "start": {"dateTime": start}, "end": {"dateTime": end}},
+        )
+    if cal_resp.status_code not in (200, 201):
+        _trace.emit(_trace.EvCalendarEventCreated(
+            event_title=event_title, start=start, end=end,
+            event_id="", event_link="", confirmed=False))
+        return _provider_error(cal_resp, "Calendar event create", store)
+    try:
+        ev_data = cal_resp.json()
+    except Exception:
+        return _terminal_error(
+            "Calendar API returned 2xx but response was not JSON — "
+            "event may already exist; do not retry", store, event_id="committed-unparsed")
+    if not isinstance(ev_data, dict):
+        return _terminal_error(
+            "Calendar API returned 2xx with non-object JSON — "
+            "event may already exist; do not retry", store, event_id="committed-unparsed")
+    event_id   = ev_data.get("id", "") or "committed-unparsed"
+    event_link = ev_data.get("htmlLink", "")
+
+    _trace.emit(_trace.EvCalendarEventCreated(
+        event_title=event_title, start=start, end=end,
+        event_id=event_id, event_link=event_link, confirmed=True))
+    state.record_step("CreateCalendarEvent")
+    final = {"status": "success", "event_title": event_title, "start": start, "end": end,
+             "event_id": event_id, "event_link": event_link}
+    return json.dumps(final), final
+
+
 _HANDLERS: dict[str, _Handler] = {
     "mcp_page_content":    _handle_mcp_page_content,
     "mcp_email_search":    _handle_mcp_email_search,
@@ -1491,6 +1566,7 @@ _HANDLERS: dict[str, _Handler] = {
     "modify_emails":       _handle_modify_emails,
     "book_flight":         _handle_book_flight,
     "book_hotel":          _handle_book_hotel,
+    "create_calendar_event": _handle_create_calendar_event,
 }
 
 
@@ -1512,6 +1588,7 @@ _DRIVER_ROUTING_FIELDS: dict[str, list[str]] = {
     "modify_emails":    ["sender", "action"],
     "book_flight":      ["provider"],
     "book_hotel":       ["provider"],
+    "create_calendar_event": ["event_title", "start", "end"],
 }
 
 def _release_gate_for(

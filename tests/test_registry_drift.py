@@ -55,6 +55,7 @@ EXPECTED_PIPELINE_BY_TOOL: dict[str, str] = {
     "mcp_hotel_search":    "trip",
     "book_flight":         "booking",
     "book_hotel":          "booking",
+    "create_calendar_event": "calendar",
     "mcp_email_search":    "email",
     "send_reply":          "email",
     "modify_emails":       "email",
@@ -151,6 +152,7 @@ def test_every_driver_tool_has_release_slots() -> None:
         "modify_emails":    None,
         "book_flight":      "structured:flight_offer",
         "book_hotel":       "structured:hotel_offer",
+        "create_calendar_event": None,
     }
 
 
@@ -166,6 +168,7 @@ def test_driver_routing_fields_match_schema_routing_keys() -> None:
         "modify_emails":    ["sender", "action"],
         "book_flight":      ["provider"],
         "book_hotel":       ["provider"],
+        "create_calendar_event": ["event_title", "start", "end"],
     }
     assert _DRIVER_ROUTING_FIELDS == expected
 

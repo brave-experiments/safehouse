@@ -50,6 +50,8 @@ DRIVER_RELEASE: dict[str, ReleaseGate] = {
     # The amount is re-fetched from the provider; passenger PII is a trusted driver param.
     "book_flight":      ReleaseGate(("offer_slot",), "structured:flight_offer"),
     "book_hotel":       ReleaseGate(("offer_slot",), "structured:hotel_offer"),
+    # No slot content — event_title/start/end are routing fields only.
+    "create_calendar_event": ReleaseGate(()),
 }
 
 
