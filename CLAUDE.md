@@ -25,6 +25,7 @@ python3 -c "from safehouse.planner import build_planner_system_prompt; print(bui
 | `safehouse/planner.py` | Three-phase manifest planner — `TOOL_SCHEMA`; `_PIPELINE_SHAPES`; `_map_to_concrete`; `_validate_plan` |
 | `safehouse/registry.py` | `MCPSpec`; `CatalogSpec`; `ToolRegistry`; `DEFAULT_REGISTRY`; `CAPABILITY_DESCRIPTION` |
 | `safehouse/labels.py` | Label lattice `L = I × C`; `Capability` enum; `CAPABILITY_LABEL`; `taint_all` |
+| `safehouse/secrets.py` | `SecretRegistry`; `SecretLeak` — credential containment at the slot and trace boundaries |
 | `safehouse/plan_types.py` | `PlanState` (trusted vars + step audit trail) |
 | `safehouse/permissions.py` | `AgentSpec`; `fetcher_spec` / `processor_spec` / `driver_spec` factories; capability tokens |
 | `safehouse/trace.py` | Typed event system — all `Ev*` dataclasses; `Event` union; `emit` / `set_tracer` |
@@ -60,6 +61,13 @@ A driver tool absent from `_DRIVER_ROUTING_FIELDS` gets an empty routing-key lis
 
 ### 6 — Credential isolation
 Credentials are resolved in the CLI layer and passed into core as explicit parameters. They must never appear in a slot, label, task string, trace event payload, or any Tier 1/2 sub-agent input.
+
+Containment is enforced, not merely intended. `safehouse/secrets.py` builds a per-run `SecretRegistry` from the credential fields of `ProviderConfig`, registering each value plus the encodings it can hide in (percent-encoded, JSON-escaped, and base64 at all three byte alignments — `send_reply` base64url-encodes whole MIME messages). Two boundaries consume it, deliberately differing:
+
+* **`SlotStore.write()` denies.** Slot content is read by Tier 2 and can be released to the world by Tier 3, so a credential there is an exfiltration path and a bug in our code — not data worth salvaging. The write is refused and the slot stays unwritten.
+* **`trace.emit()` redacts** to `[REDACTED:<name>]`. A trace event is terminal output that does not flow into an action, and it most likely carries a credential exactly when a provider call is already failing; denying would turn a reportable error into a crash and destroy its audit record.
+
+The registry is `__repr__`-suppressed so it cannot leak itself through an f-string or traceback frame, and `SecretLeak` names the credential without quoting its value. `tests/test_secret_containment.py` covers both boundaries and asserts every `ProviderConfig` field is classified secret or non-secret, so adding a credential forces a containment decision.
 
 `safehouse_cli/settings.py` is the **only** module that may read the environment; `safehouse/` must not, so a caller that forgets to thread a key fails loudly instead of silently falling back. Nothing anywhere may *write* a credential into `os.environ` — a process-wide environment is ambient to everything in the process and inherited by anything spawned later, which is precisely the channel explicit parameters exist to remove. `tests/test_credential_isolation.py` sweeps both directories on the AST for either violation.
 

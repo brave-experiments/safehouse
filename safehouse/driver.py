@@ -69,6 +69,7 @@ import httpx
 from .exceptions import ConfirmationRequired
 from .labels import LVal, Label, I, C, taint_all, Capability
 from .slots import SlotStore, SlotWriter
+from .secrets import SecretRegistry
 from .ironflow_policy import IronFlow, FlowField, FlowMode, IronFlowViolation, Role
 from .permissions import AgentSpec, driver_spec, fetcher_spec, processor_spec
 from .runner import run_mcp_page_content, run_mcp_email_search, run_mcp_calendar_search, run_processor, run_duffel_flight_search, run_liteapi_hotel_search, _duffel_auth_headers, _liteapi_headers
@@ -117,6 +118,30 @@ class ProviderConfig:
     passenger:    Mapping[str, str] | None = None   # profile from operator config — never a slot
     max_booking_amount: str = ""                     # "<amount> <currency>", e.g. "300 GBP" — see _check_spend_ceiling
     anthropic_api_key: str = ""                      # Tier-2 processor's own credential
+
+
+# ProviderConfig fields split by whether the value is a credential. Every field
+# must appear in exactly one set, so adding one forces a decision about whether it
+# needs containment rather than defaulting to "no".
+_SECRET_CONFIG_FIELDS = frozenset({
+    "google_token", "duffel_token", "liteapi_key", "anthropic_api_key",
+})
+_NON_SECRET_CONFIG_FIELDS = frozenset({
+    "passenger", "max_booking_amount",
+})
+
+
+def build_secret_registry(*, google_token: str = "", duffel_token: str = "",
+                           liteapi_key: str = "",
+                           anthropic_api_key: str = "") -> SecretRegistry:
+    """Registry for one run. Keyword names are the reportable credential names,
+    and are checked against _SECRET_CONFIG_FIELDS by signature introspection."""
+    return SecretRegistry({
+        "google_token":      google_token,
+        "duffel_token":      duffel_token,
+        "liteapi_key":       liteapi_key,
+        "anthropic_api_key": anthropic_api_key,
+    })
 
 
 class GmailSendError(RuntimeError):
@@ -1813,8 +1838,15 @@ async def run_manifest(
     """
     sub_plans = plan.get("pipelines")
 
+    # One registry for the whole invocation: the credentials are identical across
+    # sub-pipelines, and the trace registry is process-scoped anyway.
+    secrets = build_secret_registry(
+        google_token=google_token, duffel_token=duffel_token,
+        liteapi_key=liteapi_key, anthropic_api_key=anthropic_api_key)
+    _trace.set_secret_registry(secrets)
+
     if sub_plans is None:
-        store  = SlotStore()
+        store  = SlotStore(secrets)
         policy = IronFlow(store)
         result = await run(task, plan, store, policy,
                            google_token=google_token,
@@ -1848,7 +1880,7 @@ async def run_manifest(
     violations: list      = []
 
     for sub, rb in zip(sub_plans, routing_blocks):
-        store  = SlotStore()
+        store  = SlotStore(secrets)
         policy = IronFlow(store)
         sub_result = await run(task, sub, store, policy,
                                google_token=google_token,

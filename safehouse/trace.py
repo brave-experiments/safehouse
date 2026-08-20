@@ -10,7 +10,11 @@ The demo (or any other consumer) renders those events however it wants.
 
 from __future__ import annotations
 from contextvars import ContextVar
+from typing import TYPE_CHECKING
 from dataclasses import dataclass, field
+
+if TYPE_CHECKING:
+    from .secrets import SecretRegistry
 
 # ── Event types ───────────────────────────────────────────────────────
 
@@ -352,7 +356,20 @@ def set_tracer(t: Tracer) -> None:
     _current.set(t)
 
 
+_secrets: ContextVar["SecretRegistry | None"] = ContextVar("secret_registry", default=None)
+
+
+def set_secret_registry(registry: "SecretRegistry | None") -> None:
+    """Install the run's credential registry so emit() can redact payloads."""
+    _secrets.set(registry)
+
+
 def emit(event: Event) -> None:
+    registry = _secrets.get()
+    # repr() of an event is small (payloads carry metadata, not slot bodies), so
+    # this single scan is the fast path: only a positive hit pays for a rebuild.
+    if registry and registry.find(repr(event)) is not None:
+        event = registry.scrub(event)
     _current.get().on_event(event)
 
 

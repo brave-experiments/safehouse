@@ -21,9 +21,9 @@ import time
 from dataclasses import dataclass
 from enum import IntEnum
 
-from safehouse.driver import run_manifest as driver_run_manifest
+from safehouse.driver import run_manifest as driver_run_manifest, build_secret_registry
 from safehouse.planner import generate_plan, PlanValidationError, _MISSING_RECIPIENT_SIGNAL
-from safehouse.trace import emit, set_tracer, EvStaticPlan, MultiTracer
+from safehouse.trace import emit, set_tracer, set_secret_registry, EvStaticPlan, MultiTracer
 
 from .config import RunConfig
 from .credentials import CredentialError, GoogleTokenProvider
@@ -273,6 +273,15 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
         "anthropic_api_key": cfg.anthropic_api_key or "",
     }
 
+    # Installed here, in the outer context, so it is inherited by the driver task
+    # *and* covers what this layer prints after the run returns — notably a result
+    # "reason" carrying provider error text. run_manifest installs it again for
+    # callers that bypass the CLI.
+    secrets = build_secret_registry(
+        google_token=google_token, duffel_token=duffel_token,
+        liteapi_key=liteapi_key, anthropic_api_key=cfg.anthropic_api_key or "")
+    set_secret_registry(secrets)
+
     coro = driver_run_manifest(cfg.task, plan, **driver_kwargs)
     try:
         result = (
@@ -285,7 +294,7 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
         sink.close()
         return RunResult(
             ExitCode.CONFIRMATION_REQUIRED, "error",
-            {"reason": str(exc)}, session, elapsed,
+            {"reason": secrets.redact(str(exc))}, session, elapsed,
         )
     except asyncio.TimeoutError:
         elapsed = time.monotonic() - t0
@@ -302,6 +311,9 @@ async def run_task(cfg: RunConfig, confirmer: Confirmer,
         )
 
     elapsed = time.monotonic() - t0
+    # The driver's "reason" fields carry provider error text verbatim, and this
+    # dict is printed, JSON-serialized to stdout, and written to the transcript.
+    result = secrets.scrub(result)
 
     # ── Audit hook ────────────────────────────────────────────────────
     # For multi-pipeline runs, audit each pipeline independently.
