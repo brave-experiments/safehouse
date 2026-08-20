@@ -134,8 +134,39 @@ def run_configure(argv: list[str]) -> int:
     else:
         defaults["timeout"] = None
 
+    # ── Duffel travel booking (flights; hotels via Stays) ──────────────
+    print("\n  Duffel travel API — flight/hotel search + booking (paid from your Duffel balance):")
+    print("    Create a token at Duffel → Developers → Access tokens (test mode = duffel_test_...)")
+    duffel = data.get("duffel", {})
+    duffel["access_token"] = _prompt("Duffel access token", duffel.get("access_token"), secret=True)
+
+    print("\n  LiteAPI — hotel search + booking (sign up free at liteapi.travel → dashboard → API Keys):")
+    liteapi = data.get("liteapi", {})
+    liteapi["api_key"] = _prompt("LiteAPI key (sandbox sand_… or production)", liteapi.get("api_key"), secret=True)
+
+    defaults["max_booking_amount"] = _prompt(
+        "Max booking amount — hard spend ceiling for book_* tools, "
+        "as '<amount> <currency>' (e.g. '300 GBP')",
+        defaults.get("max_booking_amount"))
+
+    # Update into the loaded dict so any hand-added sections/keys are preserved.
+    print("\n  Passenger profile — used for flight booking; stays on your machine, never sent to the LLM:")
+    passenger = data.get("passenger", {})
+    for field, label in (
+        ("title",        "Title (mr/ms/mrs/miss)"),
+        ("given_name",   "Given name"),
+        ("family_name",  "Family name"),
+        ("born_on",      "Date of birth (YYYY-MM-DD)"),
+        ("gender",       "Gender (m/f)"),
+        ("email",        "Email"),
+        ("phone_number", "Phone (+E.164, e.g. +442080160509)"),
+    ):
+        passenger[field] = _prompt(label, passenger.get(field))
+    passenger = {k: v for k, v in passenger.items() if v}   # drop unset → clean [passenger]
+
     # Update into the loaded dict so any hand-added sections/keys are preserved.
     data["anthropic"], data["google"], data["defaults"] = anthropic, google, defaults
+    data["duffel"], data["liteapi"], data["passenger"] = duffel, liteapi, passenger
     _settings.write_config(data, path)
     print(f"\nSaved {path}")
     return 0
