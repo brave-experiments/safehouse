@@ -488,7 +488,7 @@ Reason through these internally — do not output this reasoning, only the final
        subject/reply_subject may be inferred from task context (e.g. "Summarise my invoices" → "Invoice Summary").
        event_title: use a title that appears in the task; if the task names none, use a short
        generic title such as "Meeting" or "30-minute meeting". NEVER invent a person's name by
-       splitting or guessing from an email local-part (e.g. ashahinshamsabadi@… → not "Asha …").
+       splitting or guessing from an email local-part (e.g. alexanderson@… → not "Alex Anderson").
        Include routing fields as args on the Tier 3 driver tool step.
        If OPERATOR DEFAULTS contains a recipient, use it — it carries (T,pub) trust.
        Missing recipient with no OPERATOR DEFAULT → output {"error": "missing routing field: recipient"}.

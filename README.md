@@ -286,6 +286,5 @@ results/                Runtime transcripts and JSONL (gitignored)
 
 ## Documentation
 
-- [Specification](https://docs.google.com/document/d/1BPfTHklw9Fu4x0efExJeOwSPQNFTspWyYy0bFiedjfY/edit?usp=sharing) — full design specification
 - [SETUP.md](SETUP.md) — installation, Google OAuth, CLI reference, exit codes
 - [CLAUDE.md](CLAUDE.md) — development invariants, hard rules, and per-tool checklists
