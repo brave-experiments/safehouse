@@ -74,32 +74,32 @@ def test_precheck_rejects_non_dict_sub_plan():
 
 def test_validate_plan_runs_per_sub_plan():
     plan = {"pipelines": [
-        _reply_pipeline("a@corp.com", "a"),
-        _reply_pipeline("b@corp.com", "b"),
+        _reply_pipeline("a@example.com", "a"),
+        _reply_pipeline("b@example.com", "b"),
     ]}
     mapped = _map_sub_plans(plan, DEFAULT_REGISTRY)
     # Both sub-plans valid — should not raise
     for sub in mapped["pipelines"]:
-        _validate_plan(sub, task="reply to a@corp.com and b@corp.com")
+        _validate_plan(sub, task="reply to a@example.com and b@example.com")
 
 
 def test_validate_plan_catches_invalid_sub_plan():
     # Pipeline 2 has an injected recipient not in the task — AXIOM must reject it.
     plan = {"pipelines": [
-        _reply_pipeline("a@corp.com", "a"),
+        _reply_pipeline("a@example.com", "a"),
         _reply_pipeline("injected@evil.com", "b"),   # not in task
     ]}
     mapped = _map_sub_plans(plan, DEFAULT_REGISTRY)
     with pytest.raises(PlanValidationError, match="AXIOM"):
         for sub in mapped["pipelines"]:
-            _validate_plan(sub, task="reply to a@corp.com")
+            _validate_plan(sub, task="reply to a@example.com")
 
 
 def test_send_reply_rejects_q_only_email_search():
     """filter.q='from:…' is not enough — send_reply requires named filter.from."""
     plan = {"steps": [
         {"tool": "mcp_email_search", "args": {
-            "filter": {"q": "from:alice@corp.com", "limit": 1},
+            "filter": {"q": "from:alice@example.com", "limit": 1},
             "slot_id": "email", "capability": "EMAIL_READ",
             "api_url": "https://gmail.googleapis.com/gmail/v1",
         }},
@@ -107,23 +107,23 @@ def test_send_reply_rejects_q_only_email_search():
             "reads": ["email"], "out_slot": "reply", "instruction": "Write a reply.",
         }},
         {"tool": "send_reply", "args": {
-            "recipient": "bob@corp.com", "subject": "Re: x", "body_slot": "reply",
+            "recipient": "bob@example.com", "subject": "Re: x", "body_slot": "reply",
         }},
     ]}
     with pytest.raises(PlanValidationError, match="filter.from"):
-        _validate_plan(plan, task="reply to alice@corp.com and bob@corp.com")
+        _validate_plan(plan, task="reply to alice@example.com and bob@example.com")
 
 
 def test_send_reply_rejects_multiple_email_searches():
     """Two fetches in one send_reply plan make thread_id provenance ambiguous."""
     plan = {"steps": [
         {"tool": "mcp_email_search", "args": {
-            "filter": {"from": "alice@corp.com", "limit": 1},
+            "filter": {"from": "alice@example.com", "limit": 1},
             "slot_id": "e1", "capability": "EMAIL_READ",
             "api_url": "https://gmail.googleapis.com/gmail/v1",
         }},
         {"tool": "mcp_email_search", "args": {
-            "filter": {"from": "bob@corp.com", "limit": 1},
+            "filter": {"from": "bob@example.com", "limit": 1},
             "slot_id": "e2", "capability": "EMAIL_READ",
             "api_url": "https://gmail.googleapis.com/gmail/v1",
         }},
@@ -131,17 +131,17 @@ def test_send_reply_rejects_multiple_email_searches():
             "reads": ["e1", "e2"], "out_slot": "reply", "instruction": "Write a reply.",
         }},
         {"tool": "send_reply", "args": {
-            "recipient": "bob@corp.com", "subject": "Re: x", "body_slot": "reply",
+            "recipient": "bob@example.com", "subject": "Re: x", "body_slot": "reply",
         }},
     ]}
     with pytest.raises(PlanValidationError, match="at most one mcp_email_search"):
-        _validate_plan(plan, task="reply to alice@corp.com and bob@corp.com")
+        _validate_plan(plan, task="reply to alice@example.com and bob@example.com")
 
 
 def test_send_reply_rejects_from_recipient_mismatch():
     plan = {"steps": [
         {"tool": "mcp_email_search", "args": {
-            "filter": {"from": "alice@corp.com", "limit": 1},
+            "filter": {"from": "alice@example.com", "limit": 1},
             "slot_id": "email", "capability": "EMAIL_READ",
             "api_url": "https://gmail.googleapis.com/gmail/v1",
         }},
@@ -149,11 +149,11 @@ def test_send_reply_rejects_from_recipient_mismatch():
             "reads": ["email"], "out_slot": "reply", "instruction": "Write a reply.",
         }},
         {"tool": "send_reply", "args": {
-            "recipient": "bob@corp.com", "subject": "Re: x", "body_slot": "reply",
+            "recipient": "bob@example.com", "subject": "Re: x", "body_slot": "reply",
         }},
     ]}
     with pytest.raises(PlanValidationError, match="does not include") as info:
-        _validate_plan(plan, task="reply to alice@corp.com and bob@corp.com")
+        _validate_plan(plan, task="reply to alice@example.com and bob@example.com")
     # Structural — must not open ask_recipient recovery in run_task.
     assert info.value.field is None
 
@@ -162,7 +162,7 @@ def test_send_reply_structural_errors_are_not_recipient_recoverable():
     """Multi-search / missing filter.from must use field=None (hard planning failure)."""
     q_only = {"steps": [
         {"tool": "mcp_email_search", "args": {
-            "filter": {"q": "from:alice@corp.com", "limit": 1},
+            "filter": {"q": "from:alice@example.com", "limit": 1},
             "slot_id": "email", "capability": "EMAIL_READ",
             "api_url": "https://gmail.googleapis.com/gmail/v1",
         }},
@@ -170,21 +170,21 @@ def test_send_reply_structural_errors_are_not_recipient_recoverable():
             "reads": ["email"], "out_slot": "reply", "instruction": "x",
         }},
         {"tool": "send_reply", "args": {
-            "recipient": "alice@corp.com", "subject": "Re", "body_slot": "reply",
+            "recipient": "alice@example.com", "subject": "Re", "body_slot": "reply",
         }},
     ]}
     with pytest.raises(PlanValidationError) as info:
-        _validate_plan(q_only, task="reply to alice@corp.com")
+        _validate_plan(q_only, task="reply to alice@example.com")
     assert info.value.field is None
 
     multi = {"steps": [
         {"tool": "mcp_email_search", "args": {
-            "filter": {"from": "alice@corp.com", "limit": 1},
+            "filter": {"from": "alice@example.com", "limit": 1},
             "slot_id": "e1", "capability": "EMAIL_READ",
             "api_url": "https://gmail.googleapis.com/gmail/v1",
         }},
         {"tool": "mcp_email_search", "args": {
-            "filter": {"from": "bob@corp.com", "limit": 1},
+            "filter": {"from": "bob@example.com", "limit": 1},
             "slot_id": "e2", "capability": "EMAIL_READ",
             "api_url": "https://gmail.googleapis.com/gmail/v1",
         }},
@@ -192,11 +192,11 @@ def test_send_reply_structural_errors_are_not_recipient_recoverable():
             "reads": ["e1", "e2"], "out_slot": "reply", "instruction": "x",
         }},
         {"tool": "send_reply", "args": {
-            "recipient": "bob@corp.com", "subject": "Re", "body_slot": "reply",
+            "recipient": "bob@example.com", "subject": "Re", "body_slot": "reply",
         }},
     ]}
     with pytest.raises(PlanValidationError) as info:
-        _validate_plan(multi, task="reply to alice@corp.com and bob@corp.com")
+        _validate_plan(multi, task="reply to alice@example.com and bob@example.com")
     assert info.value.field is None
 
 
@@ -212,10 +212,10 @@ class _ListTracer(Tracer):
 def test_pipeline_state_isolation():
     """Pipeline 2's routing must not be contaminated by pipeline 1's state."""
     plan_1 = {"steps": [{"tool": "send_reply", "args": {
-        "recipient": "a@corp.com", "subject": "Re: a", "body_slot": "body_a",
+        "recipient": "a@example.com", "subject": "Re: a", "body_slot": "body_a",
     }}]}
     plan_2 = {"steps": [{"tool": "send_reply", "args": {
-        "recipient": "b@corp.com", "subject": "Re: b", "body_slot": "body_b",
+        "recipient": "b@example.com", "subject": "Re: b", "body_slot": "body_b",
     }}]}
 
     tr = _ListTracer()
@@ -229,8 +229,8 @@ def test_pipeline_state_isolation():
 
     locked = [e for e in tr.events if isinstance(e, _trace.EvRoutingLocked)]
     recipients = [e.routing.get("recipient") for e in locked]
-    assert recipients.count("a@corp.com") == 1
-    assert recipients.count("b@corp.com") == 1
+    assert recipients.count("a@example.com") == 1
+    assert recipients.count("b@example.com") == 1
 
 
 # ── Thread-ID propagation ─────────────────────────────────────────────
@@ -243,7 +243,7 @@ def test_send_reply_carries_email_thread_id(monkeypatch):
     from safehouse.labels import Label
 
     async def _fake_email_search(spec, filter_p, writer, policy, *, google_token=""):
-        writer.write("From: alice@corp.com\nBody: Hello")
+        writer.write("From: alice@example.com\nBody: Hello")
         return {
             "thread_id": "tid_pipeline_a",
             "message_id": "<msg-a@mail.example>",
@@ -264,7 +264,7 @@ def test_send_reply_carries_email_thread_id(monkeypatch):
     monkeypatch.setattr(driver_mod, "run_processor", _fake_processor)
     monkeypatch.setattr(driver_mod.GmailClient, "send", _fake_client_send)
 
-    plan = _reply_pipeline("alice@corp.com", "a")
+    plan = _reply_pipeline("alice@example.com", "a")
     store = SlotStore()
     tracer = _ListTracer()
     _trace.set_tracer(tracer)
@@ -350,7 +350,7 @@ def test_send_reply_thread_id_isolated_per_pipeline(monkeypatch):
     tr = _ListTracer()
     _trace.set_tracer(tr)
     try:
-        for suffix, sender in [("a", "alice@corp.com"), ("b", "bob@corp.com")]:
+        for suffix, sender in [("a", "alice@example.com"), ("b", "bob@example.com")]:
             plan = _reply_pipeline(sender, suffix)
             store = SlotStore()
             asyncio.run(driver_run(
@@ -370,7 +370,7 @@ def test_schedule_meeting_carries_email_thread_headers(monkeypatch):
     (body_slot=slots_slot → _thread_source → In-Reply-To / matching Subject).
     """
     async def _fake_email_search(spec, filter_p, writer, policy, *, google_token=""):
-        writer.write("From: alice@corp.com\nPlease schedule a meeting.")
+        writer.write("From: alice@example.com\nPlease schedule a meeting.")
         return {
             "thread_id": "tid_meet",
             "message_id": "<meet-req@mail.example>",
@@ -419,7 +419,7 @@ def test_schedule_meeting_carries_email_thread_headers(monkeypatch):
 
     plan = {"steps": [
         {"tool": "mcp_email_search", "args": {
-            "filter": {"from": "alice@corp.com", "limit": 1},
+            "filter": {"from": "alice@example.com", "limit": 1},
             "slot_id": "email_content", "capability": "EMAIL_READ",
             "api_url": "https://gmail.googleapis.com/gmail/v1",
         }},
@@ -433,7 +433,7 @@ def test_schedule_meeting_carries_email_thread_headers(monkeypatch):
             "out_slot": "meeting_proposal", "instruction": "Propose slots.",
         }},
         {"tool": "schedule_meeting", "args": {
-            "attendee": "alice@corp.com", "event_title": "Sync",
+            "attendee": "alice@example.com", "event_title": "Sync",
             "reply_subject": "Re: invented", "slots_slot": "meeting_proposal",
         }},
     ]}
@@ -443,7 +443,7 @@ def test_schedule_meeting_carries_email_thread_headers(monkeypatch):
 
     store = SlotStore()
     result = asyncio.run(driver_run(
-        "schedule with alice@corp.com", plan, store, IronFlow(store),
+        "schedule with alice@example.com", plan, store, IronFlow(store),
         google_token="fake-token", confirm_slot=_confirm_one,
     ))
     assert result.get("status") == "success", result
@@ -456,7 +456,7 @@ def test_schedule_meeting_carries_email_thread_headers(monkeypatch):
 def test_schedule_meeting_rejects_email_limit_gt_one():
     plan = {"steps": [
         {"tool": "mcp_email_search", "args": {
-            "filter": {"from": "alice@corp.com", "limit": 5},
+            "filter": {"from": "alice@example.com", "limit": 5},
             "slot_id": "email", "capability": "EMAIL_READ",
             "api_url": "https://gmail.googleapis.com/gmail/v1",
         }},
@@ -469,12 +469,12 @@ def test_schedule_meeting_rejects_email_limit_gt_one():
             "reads": ["email", "cal"], "out_slot": "prop", "instruction": "x",
         }},
         {"tool": "schedule_meeting", "args": {
-            "attendee": "alice@corp.com", "event_title": "Sync",
+            "attendee": "alice@example.com", "event_title": "Sync",
             "reply_subject": "Re", "slots_slot": "prop",
         }},
     ]}
     with pytest.raises(PlanValidationError, match="limit must be 1"):
-        _validate_plan(plan, task="schedule with alice@corp.com")
+        _validate_plan(plan, task="schedule with alice@example.com")
 
 
 def test_run_manifest_partial_sets_do_not_retry(monkeypatch):
@@ -492,10 +492,10 @@ def test_run_manifest_partial_sets_do_not_retry(monkeypatch):
     monkeypatch.setattr(driver_mod, "run", _fake_run)
     plan = {"pipelines": [
         {"steps": [{"tool": "send_summary", "args": {
-            "recipient": "a@corp.com", "subject": "S1", "body_slot": "b1",
+            "recipient": "a@example.com", "subject": "S1", "body_slot": "b1",
         }}]},
         {"steps": [{"tool": "send_summary", "args": {
-            "recipient": "b@corp.com", "subject": "S2", "body_slot": "b2",
+            "recipient": "b@example.com", "subject": "S2", "body_slot": "b2",
         }}]},
     ]}
     result = asyncio.run(run_manifest("t", plan))
@@ -511,15 +511,15 @@ def test_run_manifest_do_not_retry_on_partial_send_without_success(monkeypatch):
     async def _fake_run(task, plan, store, policy, **kw):
         return {
             "status": "error",
-            "reason": "send failed for bob@corp.com",
-            "sent": ["alice@corp.com"],
+            "reason": "send failed for bob@example.com",
+            "sent": ["alice@example.com"],
             "violations": [],
         }
 
     monkeypatch.setattr(driver_mod, "run", _fake_run)
     plan = {"pipelines": [
         {"steps": [{"tool": "send_summary", "args": {
-            "recipient": ["alice@corp.com", "bob@corp.com"],
+            "recipient": ["alice@example.com", "bob@example.com"],
             "subject": "S", "body_slot": "b", "delivery": "separate",
         }}]},
     ]}
@@ -542,7 +542,7 @@ def test_run_manifest_single_plan_do_not_retry_on_event_id(monkeypatch):
 
     monkeypatch.setattr(driver_mod, "run", _fake_run)
     plan = {"steps": [{"tool": "schedule_meeting", "args": {
-        "attendee": "a@corp.com", "event_title": "Sync",
+        "attendee": "a@example.com", "event_title": "Sync",
         "reply_subject": "Re", "slots_slot": "s",
     }}]}
     result = asyncio.run(run_manifest("t", plan))
@@ -558,7 +558,7 @@ def test_schedule_meeting_gmail_fail_after_calendar_includes_event_id(monkeypatc
     store = SlotStore()
     state = PlanState()
     state.set_var("_routing", LVal({
-        "attendee": "alice@corp.com",
+        "attendee": "alice@example.com",
         "event_title": "Sync",
         "reply_subject": "Re: Sync",
     }, Label.T_pub()))
@@ -615,10 +615,10 @@ def test_schedule_meeting_gmail_fail_after_calendar_includes_event_id(monkeypatc
 def _pipelines_plan():
     return {"pipelines": [
         {"steps": [{"tool": "send_summary", "args": {
-            "recipient": "a@corp.com", "subject": "S1", "body_slot": "b1",
+            "recipient": "a@example.com", "subject": "S1", "body_slot": "b1",
         }}]},
         {"steps": [{"tool": "send_summary", "args": {
-            "recipient": "b@corp.com", "subject": "S2", "body_slot": "b2",
+            "recipient": "b@example.com", "subject": "S2", "body_slot": "b2",
         }}]},
     ]}
 
@@ -716,11 +716,11 @@ def test_precheck_allows_distinct_content_same_recipient():
     plan = {"pipelines": [
         {"steps": [
             {"tool": "mcp_page_content", "args": {"url": "https://a.com", "capability": "WEB_FETCH", "slot_id": "c1"}},
-            {"tool": "send_summary", "args": {"recipient": "alice@corp.com", "subject": "Page A", "body_slot": "c1"}},
+            {"tool": "send_summary", "args": {"recipient": "alice@example.com", "subject": "Page A", "body_slot": "c1"}},
         ]},
         {"steps": [
             {"tool": "mcp_page_content", "args": {"url": "https://b.com", "capability": "WEB_FETCH", "slot_id": "c2"}},
-            {"tool": "send_summary", "args": {"recipient": "alice@corp.com", "subject": "Page B", "body_slot": "c2"}},
+            {"tool": "send_summary", "args": {"recipient": "alice@example.com", "subject": "Page B", "body_slot": "c2"}},
         ]},
     ]}
     _precheck_shape(plan)   # must not raise
@@ -730,7 +730,7 @@ def test_precheck_rejects_truly_identical_pipelines():
     """Pipelines with identical steps (same URL, same recipient) are duplicate."""
     sub = {"steps": [
         {"tool": "mcp_page_content", "args": {"url": "https://a.com", "capability": "WEB_FETCH", "slot_id": "c"}},
-        {"tool": "send_summary", "args": {"recipient": "alice@corp.com", "subject": "S", "body_slot": "c"}},
+        {"tool": "send_summary", "args": {"recipient": "alice@example.com", "subject": "S", "body_slot": "c"}},
     ]}
     with pytest.raises(ValueError, match="duplicate"):
         _precheck_shape({"pipelines": [sub, sub]})
@@ -811,10 +811,10 @@ def test_routing_locked_emitted_before_driver_start():
     try:
         plan = {"pipelines": [
             {"steps": [{"tool": "send_summary", "args": {
-                "recipient": "a@corp.com", "subject": "S1", "body_slot": "b1",
+                "recipient": "a@example.com", "subject": "S1", "body_slot": "b1",
             }}]},
             {"steps": [{"tool": "send_summary", "args": {
-                "recipient": "b@corp.com", "subject": "S2", "body_slot": "b2",
+                "recipient": "b@example.com", "subject": "S2", "body_slot": "b2",
             }}]},
         ]}
         asyncio.run(run_manifest("t", plan))
@@ -835,10 +835,10 @@ def test_routing_snapshot_survives_mutation_while_prior_pipeline_awaits(monkeypa
     """Pipeline 2 must execute the same frozen route recorded before pipeline 1."""
     from safehouse.driver import run_manifest
 
-    recipient_b = ["b@corp.com"]
+    recipient_b = ["b@example.com"]
     plan = {"pipelines": [
         {"steps": [{"tool": "send_summary", "args": {
-            "recipient": ["a@corp.com"], "subject": "S1", "body_slot": "b1",
+            "recipient": ["a@example.com"], "subject": "S1", "body_slot": "b1",
         }}]},
         {"steps": [{"tool": "send_summary", "args": {
             "recipient": recipient_b, "subject": "S2", "body_slot": "b2",
@@ -877,5 +877,5 @@ def test_routing_snapshot_survives_mutation_while_prior_pipeline_awaits(monkeypa
         event for event in tracer.events
         if isinstance(event, _trace.EvRoutingLocked) and event.pipeline == 1
     ]
-    assert locked[0].routing["recipient"] == ("b@corp.com",)
-    assert seen_routes[1]["recipient"] == ("b@corp.com",)
+    assert locked[0].routing["recipient"] == ("b@example.com",)
+    assert seen_routes[1]["recipient"] == ("b@example.com",)

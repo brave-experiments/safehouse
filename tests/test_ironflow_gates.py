@@ -209,7 +209,7 @@ class TestDeclassifyDoesNotPollutAudit:
         """Routing-only tools (modify_emails) precommit with no release slots."""
         policy = IronFlow(SlotStore())
         state = PlanState()
-        state.set_var("_routing", LVal({"sender": "a@corp.com", "action": "archive"}, T_pub))
+        state.set_var("_routing", LVal({"sender": "a@example.com", "action": "archive"}, T_pub))
         policy.precommit_routing(state, sources=set())
         assert policy._sources == frozenset()
         assert policy.release_transform() is None
@@ -224,7 +224,7 @@ class TestDeclassifyDoesNotPollutAudit:
     def test_precommit_rejects_transform_when_sources_empty(self):
         policy = IronFlow(SlotStore())
         state = PlanState()
-        state.set_var("_routing", LVal({"sender": "a@corp.com", "action": "archive"}, T_pub))
+        state.set_var("_routing", LVal({"sender": "a@example.com", "action": "archive"}, T_pub))
         with pytest.raises(IronFlowViolation, match="transform=None"):
             policy.precommit_routing(state, sources=set(), transform="opaque")
 
@@ -256,7 +256,7 @@ class TestRoutingIntegrityGate:
         policy = IronFlow(SlotStore())
         with pytest.raises(IronFlowViolation, match="IPI BLOCKED") as exc_info:
             policy.before_action("send_summary", "recipient",
-                                 LVal("x@corp.com", U_pub), Role.ROUTING)
+                                 LVal("x@example.com", U_pub), Role.ROUTING)
         assert exc_info.value.principle is Principle.INTEGRITY_GATE
 
     def test_U_priv_routing_raises_integrity_gate(self):
@@ -264,13 +264,13 @@ class TestRoutingIntegrityGate:
         policy = IronFlow(SlotStore())
         with pytest.raises(IronFlowViolation, match="IPI BLOCKED") as exc_info:
             policy.before_action("send_summary", "recipient",
-                                 LVal("x@corp.com", U_priv), Role.ROUTING)
+                                 LVal("x@example.com", U_priv), Role.ROUTING)
         assert exc_info.value.principle is Principle.INTEGRITY_GATE
 
     def test_T_pub_routing_passes(self):
         policy = IronFlow(SlotStore())
         policy.before_action("send_summary", "recipient",
-                             LVal("alice@corp.com", T_pub), Role.ROUTING)
+                             LVal("alice@example.com", T_pub), Role.ROUTING)
         assert policy.clean()
 
 
@@ -283,7 +283,7 @@ class TestRoutingConfidentialityGate:
         with pytest.raises(IronFlowViolation,
                            match="ROUTING CONFIDENTIALITY") as exc_info:
             policy.before_action("send_summary", "recipient",
-                                 LVal("alice@corp.com", T_priv), Role.ROUTING)
+                                 LVal("alice@example.com", T_priv), Role.ROUTING)
         assert exc_info.value.principle is Principle.CONFINEMENT
 
     def test_T_priv_routing_emits_failed_gate(self):
@@ -292,7 +292,7 @@ class TestRoutingConfidentialityGate:
         policy = IronFlow(SlotStore())
         with pytest.raises(IronFlowViolation, match="ROUTING CONFIDENTIALITY"):
             policy.before_action("send_summary", "recipient",
-                                 LVal("alice@corp.com", T_priv), Role.ROUTING)
+                                 LVal("alice@example.com", T_priv), Role.ROUTING)
         failed = [e for e in tracer.gate_events() if not e.passed]
         assert any("ROUTING CONFIDENTIALITY" in (e.blocked or "") for e in failed)
 
@@ -301,7 +301,7 @@ class TestRoutingConfidentialityGate:
         policy = IronFlow(SlotStore())
         with pytest.raises(IronFlowViolation, match="ROUTING CONFIDENTIALITY"):
             policy.before_action("send_summary", "recipient",
-                                 LVal("alice@corp.com", T_priv), "ROUTING")
+                                 LVal("alice@example.com", T_priv), "ROUTING")
 
 
 # ── T5 — CONTENT with priv → CONFINEMENT / "EXFILTRATION BLOCKED" ─────────────

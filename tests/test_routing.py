@@ -67,7 +67,7 @@ def test_routing_lock_emitted_before_any_step() -> None:
     _trace.set_tracer(tracer)
     try:
         plan = {"steps": [{"tool": "send_summary", "args": {
-            "recipient": "alice@corp.com",
+            "recipient": "alice@example.com",
             "subject": "Weekly digest",
             "body_slot": "body",
         }}]}
@@ -79,7 +79,7 @@ def test_routing_lock_emitted_before_any_step() -> None:
     locked = [e for e in tracer.events if isinstance(e, _trace.EvRoutingLocked)]
     assert len(locked) == 1, "expected exactly one EvRoutingLocked"
     assert locked[0].driver_tool == "send_summary"
-    assert locked[0].routing["recipient"] == "alice@corp.com"
+    assert locked[0].routing["recipient"] == "alice@example.com"
     assert locked[0].routing["subject"] == "Weekly digest"
 
     # EvRoutingLocked must arrive before the first EvPlanStep

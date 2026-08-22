@@ -252,7 +252,7 @@ def test_schedule_meeting_auto_approve_creates_event(monkeypatch) -> None:
     store = SlotStore()
     state = PlanState()
     state.set_var("_routing", LVal({
-        "attendee":      "alice@corp.com",
+        "attendee":      "alice@example.com",
         "reply_subject": "Meeting",
         "event_title":   "Sync",
     }, Label.T_pub()))

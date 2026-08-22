@@ -61,20 +61,20 @@ def _reply_plan(recipient):
 # ── AXIOM: every element must appear verbatim in the task ──────────────
 
 def test_recipient_list_all_verbatim_passes():
-    _validate_plan(_plan(["alice@corp.com", "bob@corp.com"]),
-                   task="email a briefing to alice@corp.com and bob@corp.com")
+    _validate_plan(_plan(["alice@example.com", "bob@example.com"]),
+                   task="email a briefing to alice@example.com and bob@example.com")
 
 
 def test_recipient_list_one_not_in_task_rejected():
     with pytest.raises(PlanValidationError, match="AXIOM"):
-        _validate_plan(_plan(["alice@corp.com", "attacker@evil.com"]),
-                       task="email a briefing to alice@corp.com")
+        _validate_plan(_plan(["alice@example.com", "attacker@evil.com"]),
+                       task="email a briefing to alice@example.com")
 
 
 def test_recipient_list_invalid_email_rejected():
     with pytest.raises(PlanValidationError, match="valid email"):
-        _validate_plan(_plan(["alice@corp.com", "not-an-email"]),
-                       task="email alice@corp.com and not-an-email")
+        _validate_plan(_plan(["alice@example.com", "not-an-email"]),
+                       task="email alice@example.com and not-an-email")
 
 
 def test_recipient_empty_list_rejected():
@@ -83,7 +83,7 @@ def test_recipient_empty_list_rejected():
 
 
 def test_recipient_single_string_backward_compat():
-    _validate_plan(_plan("alice@corp.com"), task="email alice@corp.com")
+    _validate_plan(_plan("alice@example.com"), task="email alice@example.com")
 
 
 def test_recipient_list_boundary_collision_rejected():
@@ -95,25 +95,25 @@ def test_recipient_list_boundary_collision_rejected():
 
 def test_send_reply_rejects_multiple_recipients():
     with pytest.raises(PlanValidationError, match="at most 1"):
-        _validate_plan(_reply_plan(["a@corp.com", "b@corp.com"]),
-                       task="reply to a@corp.com and b@corp.com")
+        _validate_plan(_reply_plan(["a@example.com", "b@example.com"]),
+                       task="reply to a@example.com and b@example.com")
 
 
 def test_send_reply_single_recipient_ok():
-    _validate_plan(_reply_plan("a@corp.com"), task="reply to a@corp.com")
+    _validate_plan(_reply_plan("a@example.com"), task="reply to a@example.com")
 
 
 # ── F4: comma in an address is rejected (would split on the wire) ─────
 
 def test_comma_in_address_rejected():
     with pytest.raises(PlanValidationError, match="valid email"):
-        _validate_plan(_plan("alice,bob@corp.com"), task="email alice,bob@corp.com")
+        _validate_plan(_plan("alice,bob@example.com"), task="email alice,bob@example.com")
 
 
 # ── F5: sentence-final period after an address is fine; boundary holds ─
 
 def test_trailing_period_passes_axiom():
-    _validate_plan(_plan("alice@corp.com"), task="please email alice@corp.com.")
+    _validate_plan(_plan("alice@example.com"), task="please email alice@example.com.")
 
 
 def test_boundary_still_rejects_substring():
@@ -150,8 +150,8 @@ def test_addr_header_joins():
 def test_audit_scan_handles_list_and_tuple():
     assert not _tracermod._addrs_clean(["x@attacker.com"])
     assert not _tracermod._addrs_clean(("x@attacker.com",))
-    assert _tracermod._addrs_clean(["a@corp.com", "b@corp.com"])
-    assert _tracermod._addrs_clean("a@corp.com")
+    assert _tracermod._addrs_clean(["a@example.com", "b@example.com"])
+    assert _tracermod._addrs_clean("a@example.com")
 
 
 # ── routing lock captures the list as an immutable (T,pub) tuple ──────
@@ -168,7 +168,7 @@ def test_routing_lock_captures_recipient_list_as_tuple():
     tr = _ListTracer()
     _trace.set_tracer(tr)
     try:
-        recips = ["alice@corp.com", "bob@corp.com"]
+        recips = ["alice@example.com", "bob@example.com"]
         plan = {"steps": [{"tool": "send_summary", "args": {
             "recipient": recips, "subject": "Digest", "body_slot": "body",
         }}]}
@@ -179,7 +179,7 @@ def test_routing_lock_captures_recipient_list_as_tuple():
         _trace.set_tracer(Tracer())
     locked = [e for e in tr.events if isinstance(e, _trace.EvRoutingLocked)]
     assert len(locked) == 1
-    assert locked[0].routing["recipient"] == ("alice@corp.com", "bob@corp.com")   # tuple, immutable
+    assert locked[0].routing["recipient"] == ("alice@example.com", "bob@example.com")   # tuple, immutable
     assert "attacker@evil.com" not in locked[0].routing["recipient"]
 
 
@@ -221,7 +221,7 @@ def test_schedule_meeting_multi_attendee_e2e(monkeypatch):
     store = SlotStore()
     state = PlanState()
     state.set_var("_routing", LVal({                       # attendee locked as a tuple by run()
-        "attendee": ("alice@corp.com", "bob@corp.com"),
+        "attendee": ("alice@example.com", "bob@example.com"),
         "reply_subject": "Meeting", "event_title": "Sync",
     }, Label.T_pub()))
     store.create("slots")
@@ -245,24 +245,24 @@ def test_schedule_meeting_multi_attendee_e2e(monkeypatch):
     _, final = asyncio.run(_handle_schedule_meeting({"slots_slot": "slots"}, ctx))
 
     assert final["status"] == "success"
-    assert cal["attendees"] == [{"email": "alice@corp.com"}, {"email": "bob@corp.com"}]   # per-attendee
-    assert sent["to"] == "alice@corp.com, bob@corp.com"                                    # joined To:
+    assert cal["attendees"] == [{"email": "alice@example.com"}, {"email": "bob@example.com"}]   # per-attendee
+    assert sent["to"] == "alice@example.com, bob@example.com"                                    # joined To:
     assert sent["body_slot"] == "slots"   # thread into meeting-request email via slots_slot
 
 
 # ── "separate emails" delivery mode ───────────────────────────────────
 
 def test_delivery_separate_validates():
-    p = _plan(["a@corp.com", "b@corp.com"])
+    p = _plan(["a@example.com", "b@example.com"])
     p["steps"][-1]["args"]["delivery"] = "separate"
-    _validate_plan(p, task="email a@corp.com and b@corp.com separately")
+    _validate_plan(p, task="email a@example.com and b@example.com separately")
 
 
 def test_delivery_mode_must_be_valid():
-    p = _plan("a@corp.com")
+    p = _plan("a@example.com")
     p["steps"][-1]["args"]["delivery"] = "bogus"
     with pytest.raises(PlanValidationError, match="delivery"):
-        _validate_plan(p, task="email a@corp.com")
+        _validate_plan(p, task="email a@example.com")
 
 
 def _summary_ctx(recipients):
@@ -285,10 +285,10 @@ def test_send_summary_separate_one_per_recipient(monkeypatch):
         tos.append(to)
     monkeypatch.setattr(driver_mod, "_gmail_send", _fake)
 
-    ctx = _summary_ctx(("alice@corp.com", "bob@corp.com"))
+    ctx = _summary_ctx(("alice@example.com", "bob@example.com"))
     _, final = asyncio.run(_handle_send_summary({"body_slot": "body", "delivery": "separate"}, ctx))
     assert final["status"] == "success"
-    assert tos == ["alice@corp.com", "bob@corp.com"]        # one send each, no cross-visibility
+    assert tos == ["alice@example.com", "bob@example.com"]        # one send each, no cross-visibility
 
 
 def test_send_summary_combined_single_send(monkeypatch):
@@ -298,24 +298,24 @@ def test_send_summary_combined_single_send(monkeypatch):
         tos.append(to)
     monkeypatch.setattr(driver_mod, "_gmail_send", _fake)
 
-    ctx = _summary_ctx(("alice@corp.com", "bob@corp.com"))
+    ctx = _summary_ctx(("alice@example.com", "bob@example.com"))
     _, final = asyncio.run(_handle_send_summary({"body_slot": "body"}, ctx))   # no separate
-    assert tos == ["alice@corp.com, bob@corp.com"]          # one combined message
+    assert tos == ["alice@example.com, bob@example.com"]          # one combined message
 
 
 def test_send_summary_separate_partial_failure_reports(monkeypatch):
     async def _fake(to, subject, body, token, state):
-        if to == "bob@corp.com":
+        if to == "bob@example.com":
             raise GmailSendError("boom")
     monkeypatch.setattr(driver_mod, "_gmail_send", _fake)
 
-    ctx = _summary_ctx(("alice@corp.com", "bob@corp.com"))
+    ctx = _summary_ctx(("alice@example.com", "bob@example.com"))
     _, final = asyncio.run(_handle_send_summary({"body_slot": "body", "delivery": "separate"}, ctx))
     assert final["status"] == "error"
-    assert "Already sent to ['alice@corp.com']" in final["reason"]
+    assert "Already sent to ['alice@example.com']" in final["reason"]
     assert "Do not retry" in final["reason"]
-    assert final["sent"] == ["alice@corp.com"]       # structured, not just prose
-    assert final["unsent"] == ["bob@corp.com"]
+    assert final["sent"] == ["alice@example.com"]       # structured, not just prose
+    assert final["unsent"] == ["bob@example.com"]
 
 
 def test_missing_recipient_signal_pinned_in_prompt():
@@ -341,7 +341,7 @@ def test_modify_emails_sender_string_ok():
 # ── F2: address cap enforced on send_summary / schedule_meeting ───────
 
 def test_send_summary_over_cap_rejected():
-    addrs = [f"u{i}@corp.com" for i in range(26)]
+    addrs = [f"u{i}@example.com" for i in range(26)]
     task  = "email " + " and ".join(addrs)
     p = _plan(addrs)
     with pytest.raises(PlanValidationError, match="at most 25"):
@@ -349,7 +349,7 @@ def test_send_summary_over_cap_rejected():
 
 
 def test_send_summary_at_cap_ok():
-    addrs = [f"u{i}@corp.com" for i in range(25)]
+    addrs = [f"u{i}@example.com" for i in range(25)]
     task  = "email " + " and ".join(addrs)
     _validate_plan(_plan(addrs), task=task)
 
@@ -366,7 +366,7 @@ def test_send_reply_passes_thread_true(monkeypatch):
 
     store = SlotStore()
     state = PlanState()
-    state.set_var("_routing", LVal({"recipient": "a@corp.com", "subject": "Re: hi"}, Label.T_pub()))
+    state.set_var("_routing", LVal({"recipient": "a@example.com", "subject": "Re: hi"}, Label.T_pub()))
     store.create("body")
     store.write("body", "reply text", Label.U_pub())
     ctx = _StepContext(store=store, policy=_precommitted_policy(store, state, sources={"body"},
@@ -403,7 +403,7 @@ def test_schedule_meeting_passes_body_slot_for_threading(monkeypatch):
     store = SlotStore()
     state = PlanState()
     state.set_var("_routing", LVal({
-        "attendee": "alice@corp.com", "reply_subject": "Re: Meeting",
+        "attendee": "alice@example.com", "reply_subject": "Re: Meeting",
         "event_title": "Sync",
     }, Label.T_pub()))
     store.create("meeting_proposal")
@@ -435,7 +435,7 @@ def test_send_summary_passes_thread_false(monkeypatch):
         calls["body_slot"] = body_slot
     monkeypatch.setattr(driver_mod, "_gmail_send", _fake)
 
-    ctx = _summary_ctx(("a@corp.com",))
+    ctx = _summary_ctx(("a@example.com",))
     asyncio.run(_handle_send_summary({"body_slot": "body"}, ctx))
     assert calls["body_slot"] == ""
 
@@ -450,24 +450,24 @@ def test_separate_mode_emits_one_action_fired_per_group(monkeypatch):
     tr = _ListTracer()
     _trace.set_tracer(tr)
     try:
-        ctx = _summary_ctx(("a@corp.com", "b@corp.com", "c@corp.com"))
+        ctx = _summary_ctx(("a@example.com", "b@example.com", "c@example.com"))
         asyncio.run(_handle_send_summary({"body_slot": "body", "delivery": "separate"}, ctx))
     finally:
         _trace.set_tracer(Tracer())
 
     fired = [e for e in tr.events if isinstance(e, _trace.EvActionFired)]
     assert len(fired) == 3                    # one per group — trace reconciles with egress
-    assert [e.recipient for e in fired] == ["a@corp.com", "b@corp.com", "c@corp.com"]
+    assert [e.recipient for e in fired] == ["a@example.com", "b@example.com", "c@example.com"]
 
 
 # ── F7: casefolded dedup in _addr_list + duplicate rejection ──────────
 
 def test_addr_list_casefolded_dedup():
-    result = _addr_list(["Alice@Corp.com", "alice@corp.com", "BOB@corp.com"])
-    assert result == ["Alice@Corp.com", "BOB@corp.com"]   # first occurrence kept, lower-dup dropped
+    result = _addr_list(["Alice@Example.com", "alice@example.com", "BOB@example.com"])
+    assert result == ["Alice@Example.com", "BOB@example.com"]   # first occurrence kept, lower-dup dropped
 
 
 def test_validate_plan_rejects_case_duplicate():
     with pytest.raises(PlanValidationError, match="duplicate"):
-        _validate_plan(_plan(["alice@corp.com", "Alice@Corp.com"]),
-                       task="email alice@corp.com and Alice@Corp.com")
+        _validate_plan(_plan(["alice@example.com", "Alice@Example.com"]),
+                       task="email alice@example.com and Alice@Example.com")

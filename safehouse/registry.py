@@ -158,8 +158,8 @@ class MCPSpec:
 # Describes the two usage patterns for mcp_email_search; mcp_calendar_search overrides this.
 _DEFAULT_FILTER_DESCRIPTION = (
     "Use q (Gmail search syntax) as the primary filter field — it is fully general. "
-    "Examples: q='from:alice@corp.com' (received from), q='to:alice@corp.com' (sent to), "
-    "q='from:alice@corp.com in:sent' (your sent mail to alice), "
+    "Examples: q='from:alice@example.com' (received from), q='to:alice@example.com' (sent to), "
+    "q='from:alice@example.com in:sent' (your sent mail to alice), "
     "q='subject:invoice has:attachment'. "
     "Set limit=1 for the latest message; limit=5–10 to surface candidates for a processor. "
     "Named shorthand fields (from, subject_contains, is_unread, has_attachment, "

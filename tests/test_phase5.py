@@ -87,7 +87,7 @@ def test_missing_routing_field_returns_pipeline_error() -> None:
     store = SlotStore()
     # send_summary needs "recipient" and "subject"; omit "subject"
     plan = {"steps": [{"tool": "send_summary", "args": {
-        "recipient": "alice@corp.com",
+        "recipient": "alice@example.com",
         "body_slot": "body",
         # "subject" intentionally missing
     }}]}
@@ -102,7 +102,7 @@ def test_send_summary_no_credentials_is_terminal() -> None:
     store = SlotStore()
     state = PlanState()
     state.set_var("_routing", LVal(
-        {"recipient": "alice@corp.com", "subject": "Hi"},
+        {"recipient": "alice@example.com", "subject": "Hi"},
         Label.T_pub(),
     ))
     store.create("body")
@@ -121,7 +121,7 @@ def test_send_summary_empty_released_body_is_terminal() -> None:
     store = SlotStore()
     state = PlanState()
     state.set_var("_routing", LVal(
-        {"recipient": "alice@corp.com", "subject": "Hi"},
+        {"recipient": "alice@example.com", "subject": "Hi"},
         Label.T_pub(),
     ))
     store.create("body")
@@ -140,7 +140,7 @@ def test_send_reply_no_token_is_terminal() -> None:
     store = SlotStore()
     state = PlanState()
     state.set_var("_routing", LVal(
-        {"recipient": "alice@corp.com", "subject": "Re: Hi"},
+        {"recipient": "alice@example.com", "subject": "Re: Hi"},
         Label.T_pub(),
     ))
     store.create("body")
@@ -177,7 +177,7 @@ def test_spawn_processor_unwritten_slot_is_terminal() -> None:
 def _meeting_plan_state(store: SlotStore) -> PlanState:
     state = PlanState()
     state.set_var("_routing", LVal({
-        "attendee":      "alice@corp.com",
+        "attendee":      "alice@example.com",
         "reply_subject": "Meeting",
         "event_title":   "Sync",
     }, Label.T_pub()))
@@ -268,7 +268,7 @@ def test_schedule_meeting_choice_one_approved(monkeypatch) -> None:
     assert final is not None
     assert final.get("status") == "success"
     assert final.get("event_id") == "evt123"
-    assert sent[0]["to"] == "alice@corp.com"
+    assert sent[0]["to"] == "alice@example.com"
     assert sent[0]["body_slot"] == "slots"
     granted = [e for e in cap.events if isinstance(e, EvActionGranted)]
     assert len(granted) == 1
@@ -326,7 +326,7 @@ def test_schedule_meeting_labelless_slot_completes() -> None:
     store = SlotStore()
     state = PlanState()
     state.set_var("_routing", LVal({
-        "attendee":      "alice@corp.com",
+        "attendee":      "alice@example.com",
         "reply_subject": "Meeting",
         "event_title":   "Sync",
     }, Label.T_pub()))
@@ -357,7 +357,7 @@ def test_schedule_meeting_declined_without_reply_body_is_terminal() -> None:
     store = SlotStore()
     state = PlanState()
     state.set_var("_routing", LVal({
-        "attendee":      "alice@corp.com",
+        "attendee":      "alice@example.com",
         "reply_subject": "Meeting",
         "event_title":   "Sync",
     }, Label.T_pub()))
@@ -496,7 +496,7 @@ def test_gmail_send_keeps_gated_subject_not_fetched(monkeypatch) -> None:
     }, Label.T_pub()))
 
     asyncio.run(_gmail_send(
-        "alice@corp.com", "Re: Locked From Task", "body", "tok", state,
+        "alice@example.com", "Re: Locked From Task", "body", "tok", state,
         body_slot="email",
     ))
     assert captured["subject"] == "Re: Locked From Task"

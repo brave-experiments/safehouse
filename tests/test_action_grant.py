@@ -40,7 +40,7 @@ def _precommitted() -> tuple[IronFlow, PlanState]:
     state = PlanState()
     state.set_var(
         "_routing",
-        LVal({"attendee": "a@corp.com", "reply_subject": "Re", "event_title": "Sync"}, T_pub),
+        LVal({"attendee": "a@example.com", "reply_subject": "Re", "event_title": "Sync"}, T_pub),
     )
     policy.precommit_routing(
         state,
@@ -165,7 +165,7 @@ def test_options_display_shows_endorsed_times(capsys) -> None:
     from safehouse.trace import EvMeetingOptionsReady
 
     ev = EvMeetingOptionsReady(
-        attendee="a@corp.com", event_title="Sync",
+        attendee="a@example.com", event_title="Sync",
         proposed_slots=[{
             "label": "Mon Sep 7, 10-11am",             # untrusted, misleading
             "start": "2026-09-09T03:00:00",            # what actually gets booked

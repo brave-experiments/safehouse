@@ -100,7 +100,7 @@ class RunConfig:
             epilog=(
                 "Examples:\n"
                 '  safehouse "fetch these articles and email me a briefing: <url>"\n'
-                '  safehouse --dry-run "reply to the latest email from alice@corp.com"\n'
+                '  safehouse --dry-run "reply to the latest email from alice@example.com"\n'
                 '  safehouse --non-interactive --approve deny --json "..."   # CI form\n'
                 "  echo \"...\" | safehouse run -                            # task from stdin\n"
                 "\n"
