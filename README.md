@@ -289,3 +289,4 @@ results/                Runtime transcripts and JSONL (gitignored)
 
 - [SETUP.md](SETUP.md) — installation, Google OAuth, CLI reference, exit codes
 - [CLAUDE.md](CLAUDE.md) — development invariants, hard rules, and per-tool checklists
+- [docs/credit.md](docs/credit.md) — idea, prototype, and production lineage
