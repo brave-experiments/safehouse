@@ -83,6 +83,7 @@ TASK STRING (only trusted input)
   Operator code, no LLM       In-process Anthropic SDK, no tools
   Web / email / calendar /    No network, no tools, no memory
   flight / hotel fetch        Reads declared slots only
+  GitHub issue / PR read
   → labelled slots
          │                        │
          └──────────┬─────────────┘
