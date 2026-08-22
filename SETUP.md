@@ -113,14 +113,17 @@ export DEMO_RECIPIENT=you@example.com
 | `ANTHROPIC_API_KEY`              | All tasks                                        | Planner and in-process Tier 2 processor                                            |
 | `GOOGLE_ACCESS_TOKEN`            | Tasks that use Gmail or Calendar                 | From the OAuth Playground; expires after ~1 hour                                   |
 | `DEMO_RECIPIENT`                 | Tasks that email their output                    | Optional — overridden by `--recipient`; prompted at runtime if neither is set      |
-| `DUFFEL_ACCESS_TOKEN`            | Flight search / `book_flight`                    | Duffel → Developers → Access tokens                                                |
-| `LITEAPI_SANDBOX_KEY`            | Hotel search / `book_hotel`                      | liteapi.travel dashboard → API Keys                                                |
+| `DUFFEL_ACCESS_TOKEN`            | Flight search / `book_flight`                    | Duffel → Developers → Access tokens. Use a **test-mode** token (`duffel_test_…`)   |
+| `LITEAPI_SANDBOX_KEY`            | Hotel search / `book_hotel`                      | liteapi.travel dashboard → API Keys. Use a **sandbox** key (`sand_…`)              |
 | `GITHUB_TOKEN`                   | GitHub issue/PR read, comment, or review         | PAT; `public_repo` or `repo`. Prefer `safehouse configure`                         |
 | `SAFEHOUSE_MIN_GITHUB_INTEGRITY` | Optional GitHub provenance floor                 | `merged` > `approved` > `unapproved` > `none` > `blocked`; unset disables the gate |
 | `SAFEHOUSE_MAX_BOOKING`          | Optional booking spend ceiling                   | e.g. `300 GBP`                                                                     |
 
-
-
+> **`book_flight` and `book_hotel` make real bookings.** They call the live Duffel and
+> LiteAPI endpoints, so a production credential means a real reservation against a real
+> payment method. Nothing verifies that a key is test-mode, and the spend ceiling is only
+> enforced when set. SafeHouse is a research prototype: the booking tools exist to
+> exercise the enforcement model end to end, not as a production booking client.
 
 ## Usage
 
